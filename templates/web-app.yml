@@ -202,12 +202,21 @@ stages:
                         azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                         scriptType: bash
                         scriptLocation: inlineScript
+                        # Eine frisch angelegte Function App antwortet einige Minuten mit 503,
+                        # bis die Storage-Rollen ihrer Identität wirken. Daher mehrere Versuche.
                         inlineScript: |
                           set -euo pipefail
-                          az functionapp deployment source config-zip \
-                            --resource-group "$(tf_resource_group_name)" \
-                            --name "$(tf_function_app_name)" \
-                            --src "$(Pipeline.Workspace)/api/api.zip"
+                          for attempt in 1 2 3 4; do
+                            if az functionapp deployment source config-zip \
+                              --resource-group "$(tf_resource_group_name)" \
+                              --name "$(tf_function_app_name)" \
+                              --src "$(Pipeline.Workspace)/api/api.zip"; then
+                              exit 0
+                            fi
+                            echo "##vso[task.logissue type=warning]Deploy-Versuch $attempt fehlgeschlagen, nächster Versuch in 30 Sekunden."
+                            sleep 30
+                          done
+                          exit 1
 
                     - task: AzureCLI@2
                       displayName: Frontend vorbereiten
