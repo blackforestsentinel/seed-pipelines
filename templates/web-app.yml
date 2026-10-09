@@ -1,0 +1,243 @@
+# Sentinel Seed: Pipeline für Web-Apps aus Static Web App und Azure Function.
+#
+# Projekte binden das Template per extends ein (siehe README). Ablauf je Umgebung:
+# Build und Tests → terraform plan → Freigabe (Check am Environment) → terraform apply
+# → Deploy Function und Static Web App → Smoke-Test.
+
+parameters:
+  # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
+  # Azure-DevOps-Environments (<project>-<umgebung>) und der State-Keys.
+  - name: project
+    type: string
+
+  # Azure-Resource-Manager-Service-Connection mit Workload Identity Federation.
+  # Kann je Umgebung überschrieben werden (environments[].serviceConnection).
+  - name: serviceConnection
+    type: string
+
+  # Ablage des Terraform-States: resourceGroup, storageAccount, container.
+  - name: terraformState
+    type: object
+
+  # Umgebungen in Deploy-Reihenfolge, z. B. [{name: dev}, {name: prod}].
+  - name: environments
+    type: object
+    default:
+      - name: dev
+
+  - name: vmImage
+    type: string
+    default: ubuntu-24.04
+
+  - name: nodeVersion
+    type: string
+    default: '24.x'
+
+  - name: terraformVersion
+    type: string
+    default: '1.15.3'
+
+  - name: apiProject
+    type: string
+    default: api/Api/Api.csproj
+
+  - name: apiSolution
+    type: string
+    default: api/Api.slnx
+
+  - name: frontendPath
+    type: string
+    default: frontend
+
+  - name: infraPath
+    type: string
+    default: infra
+
+stages:
+  - stage: build
+    displayName: Build und Tests
+    jobs:
+      - job: api
+        displayName: API
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            displayName: .NET SDK laut global.json
+            inputs:
+              useGlobalJson: true
+          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release
+            displayName: dotnet test
+          - script: >
+              dotnet publish ${{ parameters.apiProject }}
+              --configuration Release
+              --output $(Build.ArtifactStagingDirectory)/api
+              -p:InformationalVersion=$(Build.BuildNumber)
+            displayName: dotnet publish
+          - task: ArchiveFiles@2
+            displayName: Paket packen
+            inputs:
+              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/api
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/api.zip
+          - publish: $(Build.ArtifactStagingDirectory)/api.zip
+            artifact: api
+            displayName: Artefakt api
+
+      - job: web
+        displayName: Frontend
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - checkout: self
+          - task: UseNode@1
+            displayName: Node ${{ parameters.nodeVersion }}
+            inputs:
+              version: ${{ parameters.nodeVersion }}
+          - script: npm ci
+            displayName: npm ci
+            workingDirectory: ${{ parameters.frontendPath }}
+          - script: npm test
+            displayName: npm test
+            workingDirectory: ${{ parameters.frontendPath }}
+          - script: npm run build
+            displayName: npm run build
+            workingDirectory: ${{ parameters.frontendPath }}
+          - publish: ${{ parameters.frontendPath }}/dist
+            artifact: web
+            displayName: Artefakt web
+
+      - job: infra
+        displayName: Infrastruktur prüfen
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              actual="$(grep -E '^project:' project.yaml | awk '{print $2}' | tr -d "\"'")"
+              if [ "$actual" != "${{ parameters.project }}" ]; then
+                echo "##vso[task.logissue type=error]project.yaml nennt '$actual', die Pipeline '${{ parameters.project }}'."
+                exit 1
+              fi
+            displayName: project.yaml abgleichen
+          - template: steps/terraform-install.yml
+            parameters:
+              version: ${{ parameters.terraformVersion }}
+          - bash: |
+              set -euo pipefail
+              terraform fmt -check -recursive
+              terraform init -backend=false -input=false
+              terraform validate
+            displayName: terraform fmt und validate
+            workingDirectory: ${{ parameters.infraPath }}
+
+  - ${{ each env in parameters.environments }}:
+      - stage: plan_${{ env.name }}
+        displayName: Plan ${{ env.name }}
+        jobs:
+          - job: plan
+            displayName: terraform plan
+            pool:
+              vmImage: ${{ parameters.vmImage }}
+            steps:
+              - checkout: self
+              - template: steps/terraform-install.yml
+                parameters:
+                  version: ${{ parameters.terraformVersion }}
+              - template: steps/terraform.yml
+                parameters:
+                  displayName: terraform plan
+                  serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                  workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
+                  terraformState: ${{ parameters.terraformState }}
+                  stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
+                  script: |
+                    terraform plan -var "environment=${{ env.name }}" -out=tfplan
+              - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
+                artifact: tfplan_${{ env.name }}
+                displayName: Plan als Artefakt
+
+      - stage: deploy_${{ env.name }}
+        displayName: Deploy ${{ env.name }}
+        jobs:
+          - deployment: deploy
+            displayName: Apply, Deploy, Smoke-Test
+            pool:
+              vmImage: ${{ parameters.vmImage }}
+            # Freigaben hängen als Check am Environment, nicht in der Pipeline.
+            environment: ${{ parameters.project }}-${{ env.name }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - download: current
+                      artifact: api
+                    - download: current
+                      artifact: web
+                    - download: current
+                      artifact: tfplan_${{ env.name }}
+                    - template: steps/terraform-install.yml
+                      parameters:
+                        version: ${{ parameters.terraformVersion }}
+                    - template: steps/terraform.yml
+                      parameters:
+                        displayName: terraform apply
+                        serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
+                        terraformState: ${{ parameters.terraformState }}
+                        stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
+                        script: |
+                          terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan"
+                          for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
+                            echo "##vso[task.setvariable variable=tf_${name}]$(terraform output -raw "$name")"
+                          done
+
+                    - task: AzureCLI@2
+                      displayName: Function deployen
+                      inputs:
+                        azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          az functionapp deployment source config-zip \
+                            --resource-group "$(tf_resource_group_name)" \
+                            --name "$(tf_function_app_name)" \
+                            --src "$(Pipeline.Workspace)/api/api.zip"
+
+                    - task: AzureCLI@2
+                      displayName: Frontend vorbereiten
+                      inputs:
+                        azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(tf_function_app_url)" > "$(Pipeline.Workspace)/web/config.json"
+                          token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" --query properties.apiKey -o tsv)"
+                          echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
+
+                    - task: AzureStaticWebApp@0
+                      displayName: Static Web App deployen
+                      inputs:
+                        cwd: $(Pipeline.Workspace)/web
+                        app_location: /
+                        skip_app_build: true
+                        skip_api_build: true
+                        azure_static_web_apps_api_token: $(swa_token)
+
+                    - bash: |
+                        set -euo pipefail
+                        echo "API: $(tf_function_app_url)/api/health"
+                        curl --fail --silent --show-error --retry 12 --retry-delay 10 --retry-all-errors \
+                          "$(tf_function_app_url)/api/health"
+                        echo
+                        echo "Frontend: $(tf_static_web_app_url)"
+                        curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
+                          -o /dev/null "$(tf_static_web_app_url)/"
+                        curl --fail --silent --show-error "$(tf_static_web_app_url)/config.json"
+                      displayName: Smoke-Test
