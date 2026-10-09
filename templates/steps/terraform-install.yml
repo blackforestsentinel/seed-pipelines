@@ -1,0 +1,19 @@
+# Installiert eine feste Terraform-Version auf Linux-Agents.
+parameters:
+  - name: version
+    type: string
+
+steps:
+  - bash: |
+      set -euo pipefail
+      if command -v terraform >/dev/null && terraform version -json | grep -q '"terraform_version": *"${{ parameters.version }}"'; then
+        echo "Terraform ${{ parameters.version }} ist bereits installiert."
+        exit 0
+      fi
+      dir="$(Agent.ToolsDirectory)/terraform/${{ parameters.version }}"
+      mkdir -p "$dir"
+      curl -fsSL -o /tmp/terraform.zip \
+        "https://releases.hashicorp.com/terraform/${{ parameters.version }}/terraform_${{ parameters.version }}_linux_amd64.zip"
+      unzip -o -q /tmp/terraform.zip -d "$dir"
+      echo "##vso[task.prependpath]$dir"
+    displayName: Terraform ${{ parameters.version }} installieren
