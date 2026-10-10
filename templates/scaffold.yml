@@ -5,8 +5,10 @@
 # Berechtigungen. Grundlage ist das Terraform-Modul seed-terraform//ado-project; der
 # State liegt unter scaffold/<name>.tfstate, ein erneuter Lauf ändert nur, was fehlt.
 #
-# Die Deployment-Identität braucht dafür Zugang zur Organisation und Projektadmin-Rechte
-# (Tenant-Onboarding, onboarding/Initialize-SeedTenant.ps1).
+# Anmeldung bei Azure DevOps mit dem Job-Token des Build-Service ("<Projekt> Build Service");
+# seine Rechte vergibt das Tenant-Onboarding (onboarding/Initialize-SeedTenant.ps1). Die
+# Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des neuen
+# Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
 
 parameters:
   - name: name
@@ -88,7 +90,8 @@ stages:
               module "project" {
                 source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
 
-                ado_project               = var.project.ado_project
+                ado_project                   = var.project.ado_project
+                authorize_service_connections = false
                 name                      = var.project.name
                 features                  = var.project.features
                 environments              = var.project.environments
@@ -143,22 +146,21 @@ stages:
               stateKey: scaffold/${{ parameters.name }}.tfstate
               script: |
                 export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
+                # Job-Token des Build-Service; hat beim Provider Vorrang vor OIDC.
+                export AZDO_PERSONAL_ACCESS_TOKEN="$(System.AccessToken)"
                 terraform apply -auto-approve
                 echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
                 echo "Repo: $(terraform output -raw repository_web_url)"
 
           - ${{ if parameters.startFirstRun }}:
-              - task: AzureCLI@2
+              - bash: |
+                  set -euo pipefail
+                  url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1"
+                  curl --fail --silent --show-error -X POST \
+                    -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" \
+                    --data '{}' "$url" \
+                    | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
+                  echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Service Connection (Permit) und danach auf die Freigabe der Infrastruktur."
                 displayName: Ersten Lauf starten
-                inputs:
-                  azureSubscription: ${{ parameters.serviceConnection }}
-                  scriptType: bash
-                  scriptLocation: inlineScript
-                  inlineScript: |
-                    set -euo pipefail
-                    token="$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)"
-                    curl --fail --silent --show-error -X POST \
-                      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
-                      --data '{}' \
-                      "$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1" \
-                      | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
+                env:
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
