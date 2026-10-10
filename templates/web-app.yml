@@ -7,6 +7,7 @@
 #                 dann terraform apply des geprüften Plans
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test
 #                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
+# Mit frontend: false (Projekt ohne Frontend) entfallen alle Schritte der Static Web App.
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -29,6 +30,12 @@ parameters:
     type: object
     default:
       - name: dev
+
+  # Projekt mit Frontend (Static Web App). false passt zu hosting.staticWebApp: none in
+  # project.yaml: kein Frontend-Build, kein config.json, kein SWA-Deploy, Smoke-Test nur API.
+  - name: frontend
+    type: boolean
+    default: true
 
   - name: vmImage
     type: string
@@ -91,28 +98,29 @@ stages:
             artifact: api
             displayName: Artefakt api
 
-      - job: web
-        displayName: Frontend
-        pool:
-          vmImage: ${{ parameters.vmImage }}
-        steps:
-          - checkout: self
-          - task: UseNode@1
-            displayName: Node ${{ parameters.nodeVersion }}
-            inputs:
-              version: ${{ parameters.nodeVersion }}
-          - script: npm ci
-            displayName: npm ci
-            workingDirectory: ${{ parameters.frontendPath }}
-          - script: npm test
-            displayName: npm test
-            workingDirectory: ${{ parameters.frontendPath }}
-          - script: npm run build
-            displayName: npm run build
-            workingDirectory: ${{ parameters.frontendPath }}
-          - publish: ${{ parameters.frontendPath }}/dist
-            artifact: web
-            displayName: Artefakt web
+      - ${{ if parameters.frontend }}:
+          - job: web
+            displayName: Frontend
+            pool:
+              vmImage: ${{ parameters.vmImage }}
+            steps:
+              - checkout: self
+              - task: UseNode@1
+                displayName: Node ${{ parameters.nodeVersion }}
+                inputs:
+                  version: ${{ parameters.nodeVersion }}
+              - script: npm ci
+                displayName: npm ci
+                workingDirectory: ${{ parameters.frontendPath }}
+              - script: npm test
+                displayName: npm test
+                workingDirectory: ${{ parameters.frontendPath }}
+              - script: npm run build
+                displayName: npm run build
+                workingDirectory: ${{ parameters.frontendPath }}
+              - publish: ${{ parameters.frontendPath }}/dist
+                artifact: web
+                displayName: Artefakt web
 
       - job: infra
         displayName: Infrastruktur prüfen
@@ -125,6 +133,16 @@ stages:
               actual="$(grep -E '^project:' project.yaml | awk '{print $2}' | tr -d "\"'")"
               if [ "$actual" != "${{ parameters.project }}" ]; then
                 echo "##vso[task.logissue type=error]project.yaml nennt '$actual', die Pipeline '${{ parameters.project }}'."
+                exit 1
+              fi
+              # hosting.staticWebApp: none gehört zu frontend: false und umgekehrt.
+              static_web_app="$(awk '/^[[:space:]]+staticWebApp:/ { gsub(/["\047]/, "", $2); print tolower($2) }' project.yaml)"
+              if [ "$static_web_app" = none ] && [ "${{ lower(parameters.frontend) }}" = true ]; then
+                echo "##vso[task.logissue type=error]project.yaml hat hosting.staticWebApp: none, die Pipeline aber nicht frontend: false."
+                exit 1
+              fi
+              if [ "$static_web_app" != none ] && [ "${{ lower(parameters.frontend) }}" = false ]; then
+                echo "##vso[task.logissue type=error]Die Pipeline hat frontend: false, project.yaml aber nicht hosting.staticWebApp: none."
                 exit 1
               fi
             displayName: project.yaml abgleichen
@@ -170,6 +188,20 @@ stages:
                       2) changes=true ;;
                       *) exit "$code" ;;
                     esac
+                    # Ein Plan, der nur Ressourcen im State verschiebt (moved-Blöcke nach einem
+                    # Modul-Update), ändert keine Infrastruktur und braucht keine Freigabe.
+                    # Terraform wiederholt die Verschiebung bei jedem Plan; gespeichert wird sie
+                    # mit dem nächsten Apply.
+                    if [ "$changes" = true ] && terraform show -json tfplan | python3 -c '
+                    import json, sys
+                    plan = json.load(sys.stdin)
+                    changed = [r for r in plan.get("resource_changes", []) if r["change"]["actions"] != ["no-op"] or r["change"].get("importing")]
+                    changed += [o for o in (plan.get("output_changes") or {}).values() if o["actions"] != ["no-op"]]
+                    sys.exit(1 if changed or plan.get("deferred_changes") else 0)
+                    '; then
+                      changes=false
+                      echo "Der Plan verschiebt nur Ressourcen im State; an der Infrastruktur ändert sich nichts."
+                    fi
                     echo "Infrastruktur-Änderungen: $changes"
                     echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
               - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
@@ -232,15 +264,19 @@ stages:
                     - checkout: self
                     - download: current
                       artifact: api
-                    - download: current
-                      artifact: web
+                    - ${{ if parameters.frontend }}:
+                        - download: current
+                          artifact: web
                     - template: steps/terraform-install.yml
                       parameters:
                         version: ${{ parameters.terraformVersion }}
                     # Liest nur Outputs aus dem State, ändert nichts an der Infrastruktur.
                     - template: steps/terraform.yml
                       parameters:
-                        displayName: Outputs und config.json
+                        ${{ if parameters.frontend }}:
+                          displayName: Outputs, config.json und CSP
+                        ${{ else }}:
+                          displayName: Outputs
                         serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                         workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
                         terraformState: ${{ parameters.terraformState }}
@@ -249,15 +285,29 @@ stages:
                           for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
                             echo "##vso[task.setvariable variable=tf_${name}]$(terraform output -raw "$name")"
                           done
-                          # Laufzeitkonfiguration des Frontends: Output frontend_config, sonst nur die API-URL
-                          config="$(Pipeline.Workspace)/web/config.json"
-                          if terraform output -json frontend_config > "$config.tmp" 2>/dev/null; then
-                            mv "$config.tmp" "$config"
-                          else
-                            rm -f "$config.tmp"
-                            printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(terraform output -raw function_app_url)" > "$config"
+                          if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                            if [ -z "$(terraform output -raw static_web_app_name)" ]; then
+                              echo "##vso[task.logissue type=error]Keine Static Web App im Terraform-Output. Für ein Projekt ohne Frontend frontend: false setzen."
+                              exit 1
+                            fi
+                            web="$(Pipeline.Workspace)/web"
+                            # Laufzeitkonfiguration des Frontends: Output frontend_config, sonst nur die API-URL
+                            config="$web/config.json"
+                            if terraform output -json frontend_config > "$config.tmp" 2>/dev/null; then
+                              mv "$config.tmp" "$config"
+                            else
+                              rm -f "$config.tmp"
+                              printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(terraform output -raw function_app_url)" > "$config"
+                            fi
+                            cat "$config"
+                            # Content-Security-Policy: Platzhalter __API_ORIGIN__ in connect-src durch den
+                            # Ursprung der Function ersetzen. Bleibt er stehen, blockiert die CSP die API.
+                            api_origin="$(terraform output -raw function_app_url | sed -E 's#^(https?://[^/]+).*$#\1#')"
+                            if [ -f "$web/staticwebapp.config.json" ]; then
+                              sed -i "s#__API_ORIGIN__#$api_origin#g" "$web/staticwebapp.config.json"
+                              grep -o '"Content-Security-Policy": *"[^"]*"' "$web/staticwebapp.config.json" || true
+                            fi
                           fi
-                          cat "$config"
 
                     # Eine frisch angelegte Function App antwortet einige Minuten mit 503,
                     # bis die Storage-Rollen ihrer Identität wirken. Daher mehrere Versuche.
@@ -282,25 +332,36 @@ stages:
                           done
                           exit 1
 
-                    - task: AzureCLI@2
-                      displayName: Deployment-Token der Static Web App
-                      inputs:
-                        azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
-                        scriptType: bash
-                        scriptLocation: inlineScript
-                        inlineScript: |
-                          set -euo pipefail
-                          token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" --query properties.apiKey -o tsv)"
-                          echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
+                    - ${{ if parameters.frontend }}:
+                        - task: AzureCLI@2
+                          displayName: Static Web App, Token und eigene Domains
+                          inputs:
+                            azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                            scriptType: bash
+                            scriptLocation: inlineScript
+                            inlineScript: |
+                              set -euo pipefail
+                              token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" --query properties.apiKey -o tsv)"
+                              echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
+                              # Eigene Domains, die Azure noch nicht validiert hat: nötige DNS-Einträge als
+                              # Warnung. Nur zur Information, der Deploy hängt nicht davon ab.
+                              host="$(tf_static_web_app_url)"
+                              host="${host#https://}"
+                              az staticwebapp hostname list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" \
+                                --query "[?status!='Ready'].[domainName, status, validationToken || '-']" -o tsv |
+                                while IFS=$'\t' read -r domain status validation; do
+                                  echo "##vso[task.logissue type=warning]Eigene Domain $domain ist noch nicht bereit (Status $status). DNS: TXT _dnsauth.$domain = $validation, dazu CNAME $domain -> $host (Apex-Domain: ALIAS oder ANAME)."
+                                done ||
+                                echo "##vso[task.logissue type=warning]Status der eigenen Domains nicht abrufbar."
 
-                    - task: AzureStaticWebApp@0
-                      displayName: Static Web App deployen
-                      inputs:
-                        cwd: $(Pipeline.Workspace)/web
-                        app_location: /
-                        skip_app_build: true
-                        skip_api_build: true
-                        azure_static_web_apps_api_token: $(swa_token)
+                        - task: AzureStaticWebApp@0
+                          displayName: Static Web App deployen
+                          inputs:
+                            cwd: $(Pipeline.Workspace)/web
+                            app_location: /
+                            skip_app_build: true
+                            skip_api_build: true
+                            azure_static_web_apps_api_token: $(swa_token)
 
                     - bash: |
                         set -euo pipefail
@@ -308,8 +369,32 @@ stages:
                         curl --fail --silent --show-error --retry 12 --retry-delay 10 --retry-all-errors \
                           "$(tf_function_app_url)/api/health"
                         echo
-                        echo "Frontend: $(tf_static_web_app_url)"
-                        curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
-                          -o /dev/null "$(tf_static_web_app_url)/"
-                        curl --fail --silent --show-error "$(tf_static_web_app_url)/config.json"
-                      displayName: Smoke-Test
+                      displayName: Smoke-Test API
+
+                    - ${{ if parameters.frontend }}:
+                        - bash: |
+                            set -euo pipefail
+                            url="$(tf_static_web_app_url)"
+                            echo "Frontend: $url"
+                            curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
+                              -o /dev/null "$url/"
+                            curl --fail --silent --show-error "$url/config.json"
+                            echo
+                            # Security-Header aus staticwebapp.config.json: CSP vorhanden, Platzhalter
+                            # ersetzt. Die neue Konfiguration greift unter Umständen erst nach einigen Sekunden.
+                            csp=""
+                            for attempt in 1 2 3 4 5 6; do
+                              csp="$(curl --fail --silent --show-error -D - -o /dev/null "$url/" | tr -d '\r' | grep -i '^content-security-policy:' || true)"
+                              if [ -n "$csp" ] && ! grep -q '__API_ORIGIN__' <<< "$csp"; then
+                                echo "$csp"
+                                exit 0
+                              fi
+                              sleep 10
+                            done
+                            if [ -z "$csp" ]; then
+                              echo "##vso[task.logissue type=error]Das Frontend liefert keinen Content-Security-Policy-Header. globalHeaders in frontend/public/staticwebapp.config.json aus seed-template übernehmen."
+                            else
+                              echo "##vso[task.logissue type=error]Die Content-Security-Policy enthält noch den Platzhalter __API_ORIGIN__: $csp"
+                            fi
+                            exit 1
+                          displayName: Smoke-Test Frontend
