@@ -15,7 +15,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.4.0
+      ref: refs/tags/v0.5.0
       endpoint: github-blackforestsentinel
 
 extends:
@@ -113,7 +113,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 [`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal pro Kunde alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
-git clone --branch v0.4.0 https://github.com/blackforestsentinel/seed-pipelines.git
+git clone --branch v0.5.0 https://github.com/blackforestsentinel/seed-pipelines.git
 cd seed-pipelines
 ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
   -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
@@ -133,7 +133,7 @@ Danach einmalig einen PAT anlegen und als geheime Variable `SeedScaffoldPat` an 
 
 ## templates/scaffold.yml: neues Projekt anlegen
 
-Die Pipeline `seed-scaffold` (Vorlage: [`scaffold/azure-pipelines.yml`](scaffold/azure-pipelines.yml)) fragt beim Start Name, `sso`, Frontend, Umgebungen und Freigebende ab und legt über das Terraform-Modul `seed-terraform//ado-project` an:
+Die Pipeline `seed-scaffold` (Vorlage: [`scaffold/azure-pipelines.yml`](scaffold/azure-pipelines.yml)) fragt beim Start Name, `sso`, `mcp`, `storage`, Frontend, Umgebungen und Freigebende ab und legt über das Terraform-Modul `seed-terraform//ado-project` an:
 
 - Repo aus `seed-template` mit `project.yaml` und `azure-pipelines.yml` (ohne Frontend: `hosting.staticWebApp: none` und `frontend: false`)
 - Environments `<name>-<env>` (Freigabe für Infrastruktur) und `<name>-<env>-app`

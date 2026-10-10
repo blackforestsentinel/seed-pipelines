@@ -20,6 +20,14 @@ parameters:
   - name: sso
     type: boolean
     default: false
+  # MCP-Server für KI-Werkzeuge, setzt sso voraus.
+  - name: mcp
+    type: boolean
+    default: false
+  # Eigener Storage Account mit Tabellen, Queues und Containern (Beispiel: Tabelle und Queue jobs).
+  - name: storage
+    type: boolean
+    default: false
   # Projekt mit Frontend (Static Web App); false: nur API.
   - name: frontend
     type: boolean
@@ -47,10 +55,10 @@ parameters:
     default: true
   - name: terraformModuleVersion
     type: string
-    default: v0.5.0
+    default: v0.6.0
   - name: pipelinesVersion
     type: string
-    default: v0.4.0
+    default: v0.5.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
@@ -70,6 +78,12 @@ stages:
           clean: all
         steps:
           - checkout: none
+          # Vor allem anderen, damit kein halbes Projekt entsteht.
+          - ${{ if and(parameters.mcp, not(parameters.sso)) }}:
+              - bash: |
+                  echo "##vso[task.logissue type=error]mcp setzt sso voraus: Die MCP-Anmeldung läuft über die App-Registrierung des Features sso."
+                  exit 1
+                displayName: Features prüfen
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
@@ -126,7 +140,7 @@ stages:
                 "project": {
                   "ado_project": "$(System.TeamProject)",
                   "name": ${{ convertToJson(parameters.name) }},
-                  "features": { "sso": ${{ lower(parameters.sso) }} },
+                  "features": { "sso": ${{ lower(parameters.sso) }}, "mcp": ${{ lower(parameters.mcp) }}, "storage": ${{ lower(parameters.storage) }} },
                   "frontend": ${{ lower(parameters.frontend) }},
                   "environments": ${{ convertToJson(parameters.environments) }},
                   "approvers": ${{ convertToJson(parameters.approvers) }},
