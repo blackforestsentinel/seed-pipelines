@@ -1,10 +1,10 @@
 #requires -Version 7
 <#
 .SYNOPSIS
-    Sentinel Seed: Tenant-Onboarding, einmal pro Kunde (Tenant und Azure-DevOps-Projekt).
+    Sentinel Seed: Tenant-Onboarding, einmal je Subscription und Azure-DevOps-Projekt.
 
 .DESCRIPTION
-    Richtet alles ein, was Seed-Projekte in einem Tenant brauchen. Jeder Schritt prüft
+    Richtet alles ein, was Seed-Projekte in einer Subscription brauchen. Jeder Schritt prüft
     zuerst und legt nur an, was fehlt; das Skript lässt sich also gefahrlos wiederholen.
 
       1. Deployment-Identität: App-Registrierung mit Service Principal, ohne Secret
@@ -19,19 +19,36 @@
       5. Azure DevOps: Service Connection per Workload Identity Federation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
+         (entfällt mit -SkipScaffold)
       8. Azure DevOps: GitHub-Service-Connection für alle Pipelines
 
-    Danach einmalig: PAT für seed-scaffold anlegen und als geheime Variable SeedScaffoldPat
-    an der Pipeline seed-scaffold hinterlegen (Scopes: Code read/write/manage, Build
-    read/execute, Environment read/manage, Graph read, Project and Team read, Pipeline
-    Resources use/manage). Das Job-Token der Pipeline darf keine Repos anlegen, solange
-    "Protect access to repositories in YAML pipelines" an ist. Die Person hinter dem PAT
-    braucht "Edit policies" an den Repos (Branch-Policy der PR-Validierung). Die Azure-Service-
-    Connection gibt beim ersten Lauf jedes neuen Projekts eine Administratorin oder ein
-    Administrator frei.
+    Weitere Subscription im selben Tenant: Skript erneut ausführen, mit eigener -IdentityName
+    und eigener -ServiceConnectionName. Die Rolle "Sentinel Seed Lock Contributor" ist im
+    Tenant eindeutig benannt; das Skript sucht sie in allen sichtbaren Subscriptions und
+    ergänzt die neue Subscription in ihren assignableScopes. Andere Identitäten fasst es nicht an.
+
+    Danach einmalig (nicht mit -SkipScaffold): PAT für seed-scaffold anlegen und als geheime
+    Variable SeedScaffoldPat an der Pipeline seed-scaffold hinterlegen (Scopes: Code
+    read/write/manage, Build read/execute, Environment read/manage, Graph read, Project and
+    Team read, Pipeline Resources use/manage). Das Job-Token der Pipeline darf keine Repos
+    anlegen, solange "Protect access to repositories in YAML pipelines" an ist. Die Person
+    hinter dem PAT braucht "Edit policies" an den Repos (Branch-Policy der PR-Validierung).
+    Die Azure-Service-Connection gibt beim ersten Lauf jedes neuen Projekts eine
+    Administratorin oder ein Administrator frei.
 
     Ausführen mit einem Konto, das Owner der Subscription, Global Administrator (oder
     Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist.
+    Muss die Rolle für Löschsperren um eine Subscription erweitert werden, braucht das Konto
+    auch auf den Subscriptions, in denen sie schon zuweisbar ist, das Recht, Rollendefinitionen
+    zu schreiben (Owner oder User Access Administrator).
+
+.PARAMETER IdentityName
+    Name der App-Registrierung. Je Subscription eine eigene Identität; ein Name, den es im
+    Tenant schon gibt, meint diese Identität.
+
+.PARAMETER SkipScaffold
+    Repo und Pipeline seed-scaffold weglassen: für Projekte, die migriert statt neu angelegt
+    werden. Das bestehende Repo richtet danach onboarding/Initialize-SeedProject.ps1 ein.
 
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts.
@@ -54,6 +71,7 @@ param(
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
     [string] $SeedPipelinesVersion = 'v0.5.0',
+    [switch] $SkipScaffold,
     [switch] $DryRun
 )
 
@@ -135,7 +153,42 @@ function Get-Endpoint([string] $Name) {
         ConvertFrom-Json | Where-Object name -eq $Name
 }
 
+function Invoke-Arm([string] $Method, [string] $Url, [string] $BodyFile) {
+    # Direkt per HTTP wie bei Azure DevOps: Filter-URLs mit & überstehen az.cmd nicht, und az gibt
+    # Umlaute unter Windows als Ersatzzeichen aus. Gelesene Texte gehen hier zurück an Azure,
+    # der Body deshalb unverändert als UTF-8-Datei.
+    $token = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
+    $request = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $token" } }
+    if ($BodyFile) {
+        $request.InFile = $BodyFile
+        $request.ContentType = 'application/json'
+    }
+    Invoke-RestMethod @request
+}
+
+# Eigene Rollen sind im Tenant eindeutig benannt, sichtbar aber nur unter ihren assignableScopes.
+# Deshalb in allen Subscriptions des Tenants suchen, die das Konto sieht, die Ziel-Subscription zuerst.
+function Find-CustomRole([string] $RoleName) {
+    $subscriptions = [Collections.Generic.List[string]]::new()
+    $subscriptions.Add($SubscriptionId)
+    $url = 'https://management.azure.com/subscriptions?api-version=2022-12-01'
+    while ($url) {
+        $page = Invoke-Arm get $url
+        $page.value | Where-Object { $_.tenantId -eq $tenantId -and $_.state -eq 'Enabled' -and $_.subscriptionId -ne $SubscriptionId } |
+            ForEach-Object { $subscriptions.Add($_.subscriptionId) }
+        $url = $page.nextLink
+    }
+    $filter = [uri]::EscapeDataString("roleName eq '$RoleName'")
+    foreach ($id in $subscriptions) {
+        $role = (Invoke-Arm get "https://management.azure.com/subscriptions/$id/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01&`$filter=$filter").value |
+            Where-Object { $_.properties.type -eq 'CustomRole' } | Select-Object -First 1
+        if ($role) { return $role }
+    }
+}
+
 try {
+    # Das Skript wechselt die Subscription von az; am Ende gilt wieder die vorherige.
+    $previousSubscription = Get-OrNull { az account show --query id -o tsv 2>$null }
     az account set --subscription $SubscriptionId
     $tenantId = az account show --query tenantId -o tsv
     $subscriptionName = az account show --query name -o tsv
@@ -148,7 +201,11 @@ try {
     # --- 1. Deployment-Identität ----------------------------------------------------
     Write-Host '1. Deployment-Identität'
     $app = Invoke-Step "App-Registrierung $IdentityName" {
-        az ad app list --display-name $IdentityName -o json | ConvertFrom-Json | Select-Object -First 1
+        # --display-name sucht nach dem Anfang des Namens: "sentinel-seed" fände auch
+        # "sentinel-seed-deployment". Deshalb nur exakte Treffer, und nur einer.
+        $apps = @(az ad app list --display-name $IdentityName -o json | ConvertFrom-Json | Where-Object displayName -eq $IdentityName)
+        if ($apps.Count -gt 1) { throw "Es gibt $($apps.Count) App-Registrierungen mit dem Namen $IdentityName; der Name muss im Tenant eindeutig sein." }
+        $apps | Select-Object -First 1
     } {
         az ad app create --display-name $IdentityName --sign-in-audience AzureADMyOrg -o json | ConvertFrom-Json
     }
@@ -213,27 +270,52 @@ try {
     }
     foreach ($a in $assignments) { Set-RoleAssignment $a }
 
-    $lockRole = Invoke-Step "Rolle $LockRoleName" {
-        az role definition list --custom-role-only true --name $LockRoleName --scope $Subscription -o json |
-            ConvertFrom-Json | Select-Object -First 1
-    } {
-        $file = Save-Json @{
-            Name             = $LockRoleName
-            Description      = 'Sentinel Seed: Löschsperren lesen, setzen und entfernen (Modul storage).'
-            Actions          = @('Microsoft.Authorization/locks/read', 'Microsoft.Authorization/locks/write', 'Microsoft.Authorization/locks/delete')
-            NotActions       = @()
-            AssignableScopes = @($Subscription)
-        } 'lock-role.json'
-        az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+    # Die Rolle gibt es im Tenant nur einmal. Ist sie schon für eine andere Subscription angelegt,
+    # kommt diese Subscription in ihre assignableScopes; neu angelegt wird sie nur, wenn sie fehlt.
+    $lockRole = Find-CustomRole $LockRoleName
+    $lockScopes = if ($lockRole) { @($lockRole.properties.assignableScopes) } else { @() }
+    if ($lockRole -and -not ($lockScopes | Where-Object { $_ -eq $Subscription -or $_ -eq '/' })) {
+        if ($DryRun) {
+            Write-Host "  [alt]   Rolle ${LockRoleName}: Subscription wird in assignableScopes ergänzt" -ForegroundColor Yellow
+            $missing.Add("Rolle $LockRoleName (assignableScopes)")
+        } else {
+            # Definition unverändert zurückschreiben, nur mit der zusätzlichen Subscription.
+            $definition = $lockRole.properties
+            $file = Save-Json @{ properties = @{
+                    roleName         = $definition.roleName
+                    description      = $definition.description
+                    type             = $definition.type
+                    permissions      = $definition.permissions
+                    assignableScopes = @($lockScopes) + $Subscription
+                } } 'lock-role-scopes.json'
+            Invoke-Arm put "https://management.azure.com$($lockRole.id)?api-version=2022-04-01" $file | Out-Null
+            Write-Host "  [neu]   Rolle ${LockRoleName}: Subscription in assignableScopes ergänzt" -ForegroundColor Green
+        }
+    } else {
+        $lockRole = Invoke-Step "Rolle $LockRoleName" { $lockRole } {
+            $file = Save-Json @{
+                Name             = $LockRoleName
+                Description      = 'Sentinel Seed: Löschsperren lesen, setzen und entfernen (Modul storage).'
+                Actions          = @('Microsoft.Authorization/locks/read', 'Microsoft.Authorization/locks/write', 'Microsoft.Authorization/locks/delete')
+                NotActions       = @()
+                AssignableScopes = @($Subscription)
+            } 'lock-role.json'
+            try {
+                az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+            } catch {
+                throw "Rolle $LockRoleName ließ sich nicht anlegen. Gibt es sie schon unter einer Subscription, die dieses Konto nicht sieht? Dann dort Leserechte geben und neu starten. ($_)"
+            }
+        }
     }
     if ($lockRole) {
-        # Eine neue Rollendefinition kennt Azure nicht sofort überall; deshalb einige Versuche.
-        foreach ($attempt in 1..6) {
+        # Eine neue oder erweiterte Rollendefinition kennt Azure nicht sofort überall; deshalb
+        # einige Versuche, zusammen bis zu zwei Minuten.
+        foreach ($attempt in 1..12) {
             try {
                 Set-RoleAssignment @{ Scope = $Subscription; RoleId = $lockRole.name; Name = "$LockRoleName auf der Subscription" }
                 break
             } catch {
-                if ($attempt -eq 6) { throw }
+                if ($attempt -eq 12) { throw }
                 Write-Host '          Rollendefinition noch nicht verteilt, neuer Versuch in 10 Sekunden'
                 Start-Sleep -Seconds 10
             }
@@ -280,9 +362,8 @@ try {
         az rest --method put --url $containerUrl --body "@$file" -o none
         $true
     } | Out-Null
-    if ($sp) {
-        Set-RoleAssignment @{ Scope = $StateContainerScope; RoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'; Name = "Storage Blob Data Contributor auf Container $StateContainer" }
-    }
+    # Ohne Service Principal (nur im DryRun) meldet das den Schritt als fehlend.
+    Set-RoleAssignment @{ Scope = $StateContainerScope; RoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'; Name = "Storage Blob Data Contributor auf Container $StateContainer" }
 
     # --- 5. Service Connection --------------------------------------------------------------
     Write-Host '5. Azure DevOps: Service Connection'
@@ -310,7 +391,8 @@ try {
             az ad app federated-credential list --id $app.appId -o json | ConvertFrom-Json | Where-Object subject -eq $subject
         } {
             $file = Save-Json @{
-                name        = "ado-$($project.name -replace '[^A-Za-z0-9-]', '-')-$ServiceConnectionName"
+                # Eindeutig je App-Registrierung; erlaubt sind nur Buchstaben, Ziffern, - und _.
+                name        = "ado-$($project.name)-$ServiceConnectionName" -replace '[^A-Za-z0-9_-]', '-'
                 issuer      = $issuer
                 subject     = $subject
                 audiences   = @('api://AzureADTokenExchange')
@@ -341,48 +423,52 @@ try {
     }
 
     # --- 7. seed-scaffold -----------------------------------------------------------------
-    Write-Host '7. Azure DevOps: seed-scaffold'
-    $repo = Invoke-Step 'Repo seed-scaffold' {
-        az repos list --org $Org --project $AzureDevOpsProject -o json | ConvertFrom-Json | Where-Object name -eq 'seed-scaffold'
-    } {
-        az repos create --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json
-    }
-    if ($repo) {
-        Invoke-Step 'azure-pipelines.yml in seed-scaffold' {
-            (Invoke-AzDevOps get "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/refs?filter=heads/main&api-version=7.1" $null).count -gt 0
+    if ($SkipScaffold) {
+        Write-Host '7. Azure DevOps: seed-scaffold entfällt (-SkipScaffold)'
+    } else {
+        Write-Host '7. Azure DevOps: seed-scaffold'
+        $repo = Invoke-Step 'Repo seed-scaffold' {
+            az repos list --org $Org --project $AzureDevOpsProject -o json | ConvertFrom-Json | Where-Object name -eq 'seed-scaffold'
         } {
-            $approverList = if ($Approvers.Count) { '[' + (($Approvers | ForEach-Object { "'$_'" }) -join ', ') + ']' } else { '[]' }
-            $content = (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'azure-pipelines.yml')).
-                Replace('__APPROVERS__', $approverList).
-                Replace('__SEED_PIPELINES_VERSION__', $SeedPipelinesVersion).
-                Replace('__GITHUB_CONNECTION__', $GitHubConnectionName).
-                Replace('__SERVICE_CONNECTION__', $ServiceConnectionName).
-                Replace('__STATE_RESOURCE_GROUP__', $StateResourceGroup).
-                Replace('__STATE_STORAGE_ACCOUNT__', $StateStorageAccount).
-                Replace('__STATE_CONTAINER__', $StateContainer)
-            Invoke-AzDevOps post "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1" @{
-                refUpdates = @(@{ name = 'refs/heads/main'; oldObjectId = '0000000000000000000000000000000000000000' })
-                commits    = @(@{
-                    comment = 'Sentinel Seed: seed-scaffold'
-                    changes = @(@{ changeType = 'add'; item = @{ path = '/azure-pipelines.yml' }; newContent = @{ content = $content; contentType = 'rawtext' } })
-                })
-            } | Out-Null
-            $true
-        } | Out-Null
-    }
-    $pipeline = Invoke-Step 'Pipeline seed-scaffold' {
-        az pipelines list --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json | Select-Object -First 1
-    } {
-        az pipelines create --org $Org --project $AzureDevOpsProject --name seed-scaffold --repository seed-scaffold `
-            --repository-type tfsgit --branch main --yml-path azure-pipelines.yml --skip-first-run true -o json | ConvertFrom-Json
-    }
-    if ($pipeline -and $endpoint -and $github -and -not $DryRun) {
-        foreach ($resource in @("endpoint/$($endpoint.id)", "endpoint/$($github.id)")) {
-            Invoke-AzDevOps patch "$Org/$($project.id)/_apis/pipelines/pipelinePermissions/$($resource)?api-version=7.1-preview.1" @{
-                pipelines = @(@{ id = $pipeline.id; authorized = $true })
+            az repos create --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json
+        }
+        if ($repo) {
+            Invoke-Step 'azure-pipelines.yml in seed-scaffold' {
+                (Invoke-AzDevOps get "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/refs?filter=heads/main&api-version=7.1" $null).count -gt 0
+            } {
+                $approverList = if ($Approvers.Count) { '[' + (($Approvers | ForEach-Object { "'$_'" }) -join ', ') + ']' } else { '[]' }
+                $content = (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'azure-pipelines.yml')).
+                    Replace('__APPROVERS__', $approverList).
+                    Replace('__SEED_PIPELINES_VERSION__', $SeedPipelinesVersion).
+                    Replace('__GITHUB_CONNECTION__', $GitHubConnectionName).
+                    Replace('__SERVICE_CONNECTION__', $ServiceConnectionName).
+                    Replace('__STATE_RESOURCE_GROUP__', $StateResourceGroup).
+                    Replace('__STATE_STORAGE_ACCOUNT__', $StateStorageAccount).
+                    Replace('__STATE_CONTAINER__', $StateContainer)
+                Invoke-AzDevOps post "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1" @{
+                    refUpdates = @(@{ name = 'refs/heads/main'; oldObjectId = '0000000000000000000000000000000000000000' })
+                    commits    = @(@{
+                        comment = 'Sentinel Seed: seed-scaffold'
+                        changes = @(@{ changeType = 'add'; item = @{ path = '/azure-pipelines.yml' }; newContent = @{ content = $content; contentType = 'rawtext' } })
+                    })
+                } | Out-Null
+                $true
             } | Out-Null
         }
-        Write-Host '  [ok]    seed-scaffold für beide Service Connections berechtigt'
+        $pipeline = Invoke-Step 'Pipeline seed-scaffold' {
+            az pipelines list --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json | Select-Object -First 1
+        } {
+            az pipelines create --org $Org --project $AzureDevOpsProject --name seed-scaffold --repository seed-scaffold `
+                --repository-type tfsgit --branch main --yml-path azure-pipelines.yml --skip-first-run true -o json | ConvertFrom-Json
+        }
+        if ($pipeline -and $endpoint -and $github -and -not $DryRun) {
+            foreach ($resource in @("endpoint/$($endpoint.id)", "endpoint/$($github.id)")) {
+                Invoke-AzDevOps patch "$Org/$($project.id)/_apis/pipelines/pipelinePermissions/$($resource)?api-version=7.1-preview.1" @{
+                    pipelines = @(@{ id = $pipeline.id; authorized = $true })
+                } | Out-Null
+            }
+            Write-Host '  [ok]    seed-scaffold für beide Service Connections berechtigt'
+        }
     }
 
     # --- 8. GitHub-Service-Connection für alle Pipelines ------------------------------------
@@ -395,6 +481,8 @@ try {
             Invoke-AzDevOps patch $githubPermissionsUrl @{ allPipelines = @{ authorized = $true } } | Out-Null
             $true
         } | Out-Null
+    } else {
+        Write-Host '          folgt, sobald die GitHub-Service-Connection besteht (Schritt 6)'
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------
@@ -402,6 +490,9 @@ try {
     if ($missing.Count) {
         Write-Host "Es fehlen $($missing.Count) Schritte:" -ForegroundColor Yellow
         $missing | ForEach-Object { Write-Host "  - $_" }
+    } elseif ($SkipScaffold) {
+        Write-Host 'Fertig. Bestehendes Repo als Seed-Projekt einrichten: onboarding/Initialize-SeedProject.ps1.' -ForegroundColor Green
+        Write-Host 'Werte für azure-pipelines.yml des Projekts:'
     } else {
         Write-Host 'Fertig. Noch offen: PAT als geheime Variable SeedScaffoldPat an der Pipeline seed-scaffold (siehe Hilfe).' -ForegroundColor Green
         Write-Host 'Werte für azure-pipelines.yml eines Projekts:'
@@ -410,5 +501,8 @@ try {
     Write-Host "  terraformState: resourceGroup $StateResourceGroup, storageAccount $StateStorageAccount, container $StateContainer"
 }
 finally {
+    if ($previousSubscription -and $previousSubscription -ne $SubscriptionId) {
+        az account set --subscription $previousSubscription
+    }
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
