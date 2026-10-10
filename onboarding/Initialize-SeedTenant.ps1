@@ -186,6 +186,18 @@ function Find-CustomRole([string] $RoleName) {
     }
 }
 
+# Ein falsches Token (etwa ein kopierter Platzhalter) fiele sonst erst beim ersten Pipeline-Lauf
+# auf, wenn die Verbindung schon existiert und Schritt 6 sie nicht mehr anfasst. Deshalb vorher
+# gegen GitHub prüfen, bevor irgendetwas angelegt wird.
+if ($env:SEED_GITHUB_TOKEN) {
+    try {
+        $null = Invoke-RestMethod -Uri 'https://api.github.com/repos/blackforestsentinel/seed-pipelines' `
+            -Headers @{ Authorization = "Bearer $env:SEED_GITHUB_TOKEN"; 'User-Agent' = 'sentinel-seed-onboarding' }
+    } catch {
+        throw '$env:SEED_GITHUB_TOKEN wird von GitHub nicht angenommen. Ein echtes Fine-grained Token mit Lesezugriff auf öffentliche Repos eintragen, nicht den Platzhalter aus der Anleitung.'
+    }
+}
+
 try {
     # Das Skript wechselt die Subscription von az; am Ende gilt wieder die vorherige.
     $previousSubscription = Get-OrNull { az account show --query id -o tsv 2>$null }
