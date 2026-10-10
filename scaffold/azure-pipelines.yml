@@ -12,6 +12,10 @@ parameters:
     displayName: Login mit Entra ID (sso)
     type: boolean
     default: false
+  - name: frontend
+    displayName: Mit Frontend (Static Web App); aus = nur API
+    type: boolean
+    default: true
   - name: environments
     displayName: Umgebungen in Deploy-Reihenfolge
     type: object
@@ -42,6 +46,7 @@ extends:
   parameters:
     name: ${{ parameters.name }}
     sso: ${{ parameters.sso }}
+    frontend: ${{ parameters.frontend }}
     environments: ${{ parameters.environments }}
     approvers: ${{ parameters.approvers }}
     appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
