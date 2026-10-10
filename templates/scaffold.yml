@@ -18,6 +18,10 @@ parameters:
   - name: sso
     type: boolean
     default: false
+  # Projekt mit Frontend (Static Web App); false: nur API.
+  - name: frontend
+    type: boolean
+    default: true
   - name: environments
     type: object
     default: [dev]
@@ -41,10 +45,10 @@ parameters:
     default: true
   - name: terraformModuleVersion
     type: string
-    default: v0.4.0
+    default: v0.5.0
   - name: pipelinesVersion
     type: string
-    default: v0.3.0
+    default: v0.4.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
@@ -96,6 +100,7 @@ stages:
                 authorize_service_connections = false
                 name                      = var.project.name
                 features                  = var.project.features
+                frontend                  = var.project.frontend
                 environments              = var.project.environments
                 approvers                 = var.project.approvers
                 app_approval_environments = var.project.app_approval_environments
@@ -120,6 +125,7 @@ stages:
                   "ado_project": "$(System.TeamProject)",
                   "name": ${{ convertToJson(parameters.name) }},
                   "features": { "sso": ${{ lower(parameters.sso) }} },
+                  "frontend": ${{ lower(parameters.frontend) }},
                   "environments": ${{ convertToJson(parameters.environments) }},
                   "approvers": ${{ convertToJson(parameters.approvers) }},
                   "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
