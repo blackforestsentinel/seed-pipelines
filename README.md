@@ -3,6 +3,13 @@
 Azure-DevOps-Pipeline-Templates für Projekte aus dem [Sentinel-Seed-Template](https://github.com/blackforestsentinel/seed-template). Projekte binden sie per `extends` ein und pinnen einen Tag:
 
 ```yaml
+# Nur von Hand ankreuzen: erlaubt einem Lauf, Daten zu löschen (siehe Schutz vor Datenverlust)
+parameters:
+  - name: confirmDataDeletion
+    displayName: Datenlöschung bestätigen (Storage, Key Vault, Logs)
+    type: boolean
+    default: false
+
 resources:
   repositories:
     - repository: seed
@@ -24,9 +31,10 @@ extends:
       - name: dev
       - name: prod
         serviceConnection: sc-kundenportal-prod   # optional, sonst serviceConnection
+    confirmDataDeletion: ${{ parameters.confirmDataDeletion }}
+    smokeTest:
+      protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # frontend: false                             # Projekt ohne Frontend (nur API)
-    # smokeTest:
-    #   protectedPath: api/me                     # mit sso: 401 ohne Token erwartet
 ```
 
 ## templates/web-app.yml
@@ -58,13 +66,19 @@ Mit `validationOnly: true` läuft dieselbe Prüfung ohne PR, etwa um sie von Han
 
 Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester Version, der Download wird per SHA-256 geprüft. Er prüft alle Commits des PRs (`HEAD^1..HEAD^2` des Merge-Commits), nicht nur den Endstand: Ein Secret, das ein späterer Commit entfernt, bliebe sonst in der Historie. Gefundene Werte erscheinen geschwärzt im Log. Bei falschem Alarm den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`. In Läufen auf `main` scannt die Pipeline nicht: Mit der Pflicht-Policy kommt jede Änderung über einen PR.
 
+### Schutz vor Datenverlust
+
+Löscht oder ersetzt ein Plan Ressourcen mit Daten, endet der Lauf in `plan_<env>` mit einer Liste dieser Ressourcen, noch vor jeder Freigabe. Geschützt sind standardmäßig Storage Accounts samt Tabellen, Queues, Containern und Freigaben, Key Vaults, Log-Analytics-Workspaces und Löschsperren (`protectedResourceTypes`). Das trifft etwa eine Tabelle, die aus `project.yaml` verschwindet, `storage: false` oder ein Modul-Update, das einen Storage Account ersetzen würde.
+
+Ist das Löschen gewollt, startet man die Pipeline von Hand und kreuzt „Datenlöschung bestätigen“ an (`confirmDataDeletion`, Laufzeitparameter in `azure-pipelines.yml`). Der Plan nennt die betroffenen Ressourcen dann als Warnung, die Freigabe folgt wie immer. Ein Push kann diese Bestätigung nicht mitbringen. In diesem Lauf bekommt Terraform `TF_VAR_allow_data_deletion=true`: Das Modul `storage` hebt damit seine Löschsperre auf, die sonst auch Tabellen, Queues und Container vor dem Löschen schützt. Der nächste Lauf ohne Bestätigung setzt sie wieder; dafür braucht er eine Freigabe.
+
 ### Smoke-Test
 
 `templates/steps/smoke-test.yml` prüft nach dem Deploy:
 
 - **API:** `/api/health` meldet die Build-Nummer dieses Laufs (`version` aus `SeedHealthReport`, das .NET SDK hängt `+<commit>` an). Bis zu 3 Minuten lang, denn kurz nach dem Deploy antwortet noch die alte Fassung oder ein 503.
 - **CORS** (nur mit Frontend): Preflight vom Ursprung der Static Web App ist erlaubt, von einem fremden Ursprung nicht.
-- **Token-Pflicht** (nur mit `sso: true` und `smokeTest.protectedPath`): Die angegebene Function ohne `[AllowAnonymous]` antwortet ohne Token mit 401. Das Template hat keinen geschützten Endpunkt; Projekte geben dafür einen eigenen an.
+- **Token-Pflicht** (nur mit `sso: true` und `smokeTest.protectedPath`): Die angegebene Function ohne `[AllowAnonymous]` antwortet ohne Token mit 401. Das Template trägt dafür `api/me` ein.
 - **Frontend:** Startseite und `config.json` erreichbar, `Content-Security-Policy`-Header vorhanden und ohne Platzhalter.
 
 Weitere Prüfungen je Feature kommen als eigener Schritt in `smoke-test.yml`, geschaltet über `condition: eq(variables['feature.<name>'], 'true')`. Der erste Schritt setzt diese Variablen aus `features` in `project.yaml`, das so die einzige Wahrheit bleibt. Projektspezifische Angaben wie Pfade kommen über den Parameter `smokeTest`.
@@ -107,7 +121,7 @@ cd seed-pipelines
 ```
 
 1. Deployment-Identität: App-Registrierung ohne Secret
-2. Azure: `Contributor` und `Role Based Access Control Administrator` auf der Subscription. Die Bedingung erlaubt nur die Rollen, die Seed-Module vergeben: Storage-Datenrollen, `Key Vault Secrets User` und `Key Vault Secrets Officer`, `Monitoring Metrics Publisher`. Nach einem Seed-Update mit neuen Rollen das Skript erneut ausführen; es ersetzt dann die ältere Bedingung.
+2. Azure: `Contributor` und `Role Based Access Control Administrator` auf der Subscription. Die Bedingung erlaubt nur die Rollen, die Seed-Module vergeben: Storage-Datenrollen, `Key Vault Secrets User` und `Key Vault Secrets Officer`, `Monitoring Metrics Publisher`. Nach einem Seed-Update mit neuen Rollen das Skript erneut ausführen; es ersetzt dann die ältere Bedingung. Dazu kommt die eigene Rolle `Sentinel Seed Lock Contributor`, die nur Löschsperren lesen, setzen und entfernen darf (Modul `storage`); Contributor allein darf das nicht.
 3. Microsoft Graph: `Application.ReadWrite.OwnedBy` mit Admin-Consent (Modul `sso`)
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
 5. Service Connection per Workload Identity Federation
