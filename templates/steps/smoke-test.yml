@@ -1,0 +1,124 @@
+# Smoke-Test nach dem Deploy: Läuft der Stand dieses Laufs, und sind die Schutzmechanismen
+# noch da, die sonst unbemerkt verloren gehen (Token-Pflicht, CORS, CSP)? Er ist zugleich die
+# Bereitschaftsprüfung des Function-Deploys, der deshalb nicht selbst auf die App wartet.
+# Erwartet die Variablen tf_function_app_url und tf_static_web_app_url.
+#
+# Weitere Prüfungen je Feature (etwa MCP-Endpunkt, aufgelöste Key-Vault-Referenzen) kommen als
+# eigener Schritt in diese Datei, geschaltet über das Feature in project.yaml:
+#   condition: and(succeeded(), eq(variables['feature.<name>'], 'true'))
+# Der erste Schritt setzt diese Variablen aus features in project.yaml, das so die einzige
+# Wahrheit bleibt. Projektspezifische Angaben wie Pfade kommen über den Parameter smokeTest.
+parameters:
+  - name: frontend
+    type: boolean
+  # Siehe Parameter smokeTest in web-app.yml.
+  - name: smokeTest
+    type: object
+    default: {}
+  # Verzeichnis mit project.yaml
+  - name: projectDir
+    type: string
+
+steps:
+  - bash: |
+      set -euo pipefail
+      # features in project.yaml als Variablen feature.<name> (true/false), ohne YAML-Bibliothek
+      while read -r name value; do
+        echo "feature.$name: $value"
+        echo "##vso[task.setvariable variable=feature.$name]$value"
+      done < <(awk '
+        /^[^[:space:]#]/ { in_features = ($1 == "features:"); next }
+        in_features && $1 ~ /^[A-Za-z0-9_]+:$/ && tolower($2) ~ /^(true|false)$/ {
+          name = $1; sub(/:$/, "", name); print name, tolower($2)
+        }' "${{ parameters.projectDir }}/project.yaml")
+    displayName: Features aus project.yaml
+
+  - bash: |
+      set -euo pipefail
+      api="$(tf_function_app_url)"
+      expected="$(Build.BuildNumber)"
+      # Health-Endpunkt mit Build-Nummer: Erst wenn die API die Nummer dieses Laufs meldet, läuft
+      # der neue Stand. Kurz nach dem Deploy oder bei einer neuen Function antwortet noch die alte
+      # Fassung oder ein 503, daher mehrere Versuche.
+      echo "API: $api/api/health"
+      body=""
+      version=""
+      for attempt in $(seq 1 18); do
+        body="$(curl --silent --show-error --max-time 10 "$api/api/health" || true)"
+        version="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("version", ""))' "$body" 2>/dev/null || true)"
+        # Das .NET SDK hängt den Commit an: 20261010.3+1a2b3c…
+        [ "${version%%+*}" = "$expected" ] && break
+        sleep 10
+      done
+      if [ "${version%%+*}" != "$expected" ]; then
+        echo "##vso[task.logissue type=error]Die API meldet Version '${version:-keine}' statt $expected. Letzte Antwort: ${body:-keine}"
+        exit 1
+      fi
+      echo "$body"
+
+      if [ "${{ lower(parameters.frontend) }}" = true ]; then
+        # CORS-Preflight wie aus dem Browser: Der Ursprung des Frontends ist erlaubt, ein fremder nicht.
+        allowed_origin() {
+          curl --silent --show-error --max-time 10 -o /dev/null -D - -X OPTIONS "$api/api/health" \
+            -H "Origin: $1" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" |
+            tr -d '\r' | awk -F': ' 'tolower($1) == "access-control-allow-origin" { print $2 }'
+        }
+        frontend="$(tf_static_web_app_url)"
+        allowed="$(allowed_origin "$frontend")"
+        if [ "$allowed" != "$frontend" ]; then
+          echo "##vso[task.logissue type=error]CORS: Die API erlaubt '${allowed:-keinen Ursprung}' statt $frontend."
+          exit 1
+        fi
+        foreign="$(allowed_origin https://example.org)"
+        if [ -n "$foreign" ]; then
+          echo "##vso[task.logissue type=error]CORS: Die API erlaubt auch fremde Ursprünge ($foreign)."
+          exit 1
+        fi
+        echo "CORS: $frontend erlaubt, fremde Ursprünge nicht."
+      fi
+    displayName: Smoke-Test API
+
+  # Mit sso muss eine Function ohne [AllowAnonymous] ein Token verlangen. Fehlt etwa
+  # UseSeedAuth() in Program.cs, wäre die API sonst offen, während das Frontend anmeldet.
+  - ${{ if parameters.smokeTest.protectedPath }}:
+      - bash: |
+          set -euo pipefail
+          url="$(tf_function_app_url)/${PROTECTED_PATH#/}"
+          status="$(curl --silent --output /dev/null --max-time 10 --write-out '%{http_code}' "$url" || true)"
+          echo "$url ohne Token: $status"
+          if [ "$status" != 401 ]; then
+            echo "##vso[task.logissue type=error]$url antwortet ohne Token mit $status statt 401. Ist UseSeedAuth() in Program.cs aktiv?"
+            exit 1
+          fi
+        displayName: Smoke-Test Token-Pflicht
+        condition: and(succeeded(), eq(variables['feature.sso'], 'true'))
+        env:
+          PROTECTED_PATH: ${{ parameters.smokeTest.protectedPath }}
+
+  - ${{ if parameters.frontend }}:
+      - bash: |
+          set -euo pipefail
+          url="$(tf_static_web_app_url)"
+          echo "Frontend: $url"
+          curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
+            -o /dev/null "$url/"
+          curl --fail --silent --show-error "$url/config.json"
+          echo
+          # Security-Header aus staticwebapp.config.json: CSP vorhanden, Platzhalter
+          # ersetzt. Die neue Konfiguration greift unter Umständen erst nach einigen Sekunden.
+          csp=""
+          for attempt in 1 2 3 4 5 6; do
+            csp="$(curl --fail --silent --show-error -D - -o /dev/null "$url/" | tr -d '\r' | grep -i '^content-security-policy:' || true)"
+            if [ -n "$csp" ] && ! grep -q '__API_ORIGIN__' <<< "$csp"; then
+              echo "$csp"
+              exit 0
+            fi
+            sleep 10
+          done
+          if [ -z "$csp" ]; then
+            echo "##vso[task.logissue type=error]Das Frontend liefert keinen Content-Security-Policy-Header. globalHeaders in frontend/public/staticwebapp.config.json aus seed-template übernehmen."
+          else
+            echo "##vso[task.logissue type=error]Die Content-Security-Policy enthält noch den Platzhalter __API_ORIGIN__: $csp"
+          fi
+          exit 1
+        displayName: Smoke-Test Frontend
