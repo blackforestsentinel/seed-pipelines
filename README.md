@@ -44,7 +44,7 @@ Umgebungen laufen in der Reihenfolge der Liste nacheinander.
 - GitHub-Service-Connection in der Azure-DevOps-Organisation (Name frei wählbar, im Projekt als `endpoint` angegeben).
 - Azure-Service-Connection mit Workload Identity Federation. Terraform bekommt deren OIDC-Token, es gibt keine Secrets.
 - Rollen der Service-Connection-Identität: `Contributor` und `Role Based Access Control Administrator` auf der Subscription, `Storage Blob Data Contributor` auf dem State-Storage.
-- Environment `<project>-<env>` je Umgebung mit Freigabe als Check (Infrastruktur). `<project>-<env>-app` legt die Pipeline selbst an; dort optional eine Freigabe für App-Deploys, etwa in Produktion.
+- Je Umgebung zwei Environments, für die Pipeline berechtigt: `<project>-<env>` mit Freigabe als Check (Infrastruktur) und `<project>-<env>-app` für den App-Deploy, dort optional eine Freigabe, etwa in Produktion. Azure DevOps legt sie nicht selbst an.
 
 ### Projektstruktur, die das Template erwartet
 
