@@ -16,6 +16,10 @@
       5. Azure DevOps: Service Connection per Workload Identity Federation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
+      8. Azure DevOps: Rechte des Build-Service ("<Projekt> Build Service"), mit denen
+         seed-scaffold Repos, Pipelines und Environments anlegt; die GitHub-Service-
+         Connection für alle Pipelines. Die Azure-Service-Connection gibt beim ersten Lauf
+         jedes neuen Projekts eine Administratorin oder ein Administrator frei.
 
     Ausführen mit einem Konto, das Owner der Subscription, Global Administrator (oder
     Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist.
@@ -71,7 +75,7 @@ $missing = [Collections.Generic.List[string]]::new()
 
 function Save-Json([object] $Value, [string] $Name) {
     $path = Join-Path $work $Name
-    $Value | ConvertTo-Json -Depth 20 | Set-Content -Path $path -Encoding utf8NoBOM
+    ConvertTo-Json -InputObject $Value -Depth 20 | Set-Content -Path $path -Encoding utf8NoBOM
     $path
 }
 
@@ -97,7 +101,8 @@ function Invoke-AzDevOps([string] $Method, [string] $Url, [object] $Body) {
     $token = az account get-access-token --resource $AzureDevOpsResource --query accessToken -o tsv
     $request = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $token" }; ContentType = 'application/json' }
     if ($null -ne $Body) {
-        $request.Body = $Body | ConvertTo-Json -Depth 20
+        # -InputObject: ein Array mit einem Eintrag bleibt ein Array
+        $request.Body = ConvertTo-Json -InputObject $Body -Depth 20
     }
     Invoke-RestMethod @request
 }
@@ -314,6 +319,57 @@ try {
             } | Out-Null
         }
         Write-Host '  [ok]    seed-scaffold für beide Service Connections berechtigt'
+    }
+
+    # --- 8. Rechte des Build-Service ---------------------------------------------------------
+    Write-Host '8. Azure DevOps: Rechte des Build-Service für seed-scaffold'
+    $orgName = ([uri]$Org).AbsolutePath.Trim('/')
+    $vssps = $Org -replace '^https://dev\.azure\.com', 'https://vssps.dev.azure.com'
+    $buildServiceName = "$($project.name) Build Service ($orgName)"
+    $buildService = (Invoke-AzDevOps get "$vssps/_apis/identities?searchFilter=General&filterValue=$([uri]::EscapeDataString($buildServiceName))&api-version=7.1" $null).value |
+        Select-Object -First 1
+    if (-not $buildService) {
+        throw "Build-Service-Identität '$buildServiceName' nicht gefunden."
+    }
+
+    $permissions = @(
+        # Git Repositories: Read 2, Contribute 4, Create branch 16, Create tag 32, Create repository 256
+        @{ Name = 'Repos anlegen und beschreiben'; Namespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'; Token = "repoV2/$($project.id)"; Allow = 310 }
+        # Build: View builds 1, Queue builds 128, View pipeline 1024, Edit pipeline 2048
+        @{ Name = 'Pipelines anlegen und starten'; Namespace = '33344d9c-fc72-4d6f-aba5-fa317101a7e9'; Token = $project.id; Allow = 3201 }
+    )
+    foreach ($permission in $permissions) {
+        Invoke-Step "Build-Service: $($permission.Name)" {
+            $acl = Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$($permission.Namespace)?token=$([uri]::EscapeDataString($permission.Token))&descriptors=$([uri]::EscapeDataString($buildService.descriptor))&api-version=7.1" $null
+            $ace = $acl.value | ForEach-Object { $_.acesDictionary.PSObject.Properties.Value } | Select-Object -First 1
+            $ace -and (($ace.allow -band $permission.Allow) -eq $permission.Allow)
+        } {
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$($permission.Namespace)?api-version=7.1" @{
+                token                = $permission.Token
+                merge                = $true
+                accessControlEntries = @(@{ descriptor = $buildService.descriptor; allow = $permission.Allow; deny = 0 })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
+
+    $roleUrl = "$Org/_apis/securityroles/scopes/distributedtask.globalenvironmentreferencerole/roleassignments/resources/$($project.id)?api-version=7.1-preview.1"
+    Invoke-Step 'Build-Service: Environments anlegen (Rolle Creator)' {
+        (Invoke-AzDevOps get $roleUrl $null).value |
+            Where-Object { $_.identity.id -eq $buildService.id -and $_.role.name -in 'Creator', 'Administrator' }
+    } {
+        Invoke-AzDevOps put $roleUrl @(@{ userId = $buildService.id; roleName = 'Creator' }) | Out-Null
+        $true
+    } | Out-Null
+
+    if ($github) {
+        $githubPermissionsUrl = "$Org/$($project.id)/_apis/pipelines/pipelinePermissions/endpoint/$($github.id)?api-version=7.1-preview.1"
+        Invoke-Step "GitHub-Service-Connection für alle Pipelines" {
+            (Invoke-AzDevOps get $githubPermissionsUrl $null).allPipelines.authorized
+        } {
+            Invoke-AzDevOps patch $githubPermissionsUrl @{ allPipelines = @{ authorized = $true } } | Out-Null
+            $true
+        } | Out-Null
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------
