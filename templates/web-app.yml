@@ -8,6 +8,10 @@
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test
 #                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
 # Mit frontend: false (Projekt ohne Frontend) entfallen alle Schritte der Static Web App.
+#
+# PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy) und Läufe mit
+# validationOnly: true bestehen nur aus Build und Tests samt Secret-Scan: kein Plan, kein
+# Deploy, keine Service Connection.
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -36,6 +40,43 @@ parameters:
   - name: frontend
     type: boolean
     default: true
+
+  # Nur prüfen wie im PR-Lauf (Build, Tests, Secret-Scan), etwa um die PR-Validierung von
+  # Hand nachzustellen. PR-Läufe erkennt das Template selbst.
+  - name: validationOnly
+    type: boolean
+    default: false
+
+  # Zusätzliche Angaben für den Smoke-Test, alle optional:
+  #   protectedPath  Pfad einer Function ohne [AllowAnonymous], z. B. api/me. Mit sso in
+  #                  project.yaml muss sie ohne Token mit 401 antworten.
+  - name: smokeTest
+    type: object
+    default: {}
+
+  # Löschen von Daten bestätigen. Ein Plan, der Ressourcen aus protectedResourceTypes löscht
+  # oder ersetzt, bricht sonst ab. Projekte reichen dafür einen Laufzeitparameter durch
+  # (azure-pipelines.yml aus seed-template); bestätigt wird also nur in einem bewusst von Hand
+  # gestarteten Lauf, danach folgt wie immer die Freigabe. Terraform bekommt in diesem Lauf
+  # TF_VAR_allow_data_deletion=true; das Modul storage hebt damit seine Löschsperre auf, der
+  # nächste Lauf ohne Bestätigung setzt sie wieder.
+  - name: confirmDataDeletion
+    type: boolean
+    default: false
+
+  # Ressourcentypen, deren Löschen oder Ersetzen confirmDataDeletion verlangt: Daten, die ein
+  # Apply unwiederbringlich mitnehmen würde, und die Löschsperren selbst.
+  - name: protectedResourceTypes
+    type: object
+    default:
+      - azurerm_storage_account
+      - azurerm_storage_container
+      - azurerm_storage_queue
+      - azurerm_storage_share
+      - azurerm_storage_table
+      - azurerm_key_vault
+      - azurerm_log_analytics_workspace
+      - azurerm_management_lock
 
   - name: vmImage
     type: string
@@ -69,65 +110,21 @@ stages:
   - stage: build
     displayName: Build und Tests
     jobs:
-      - job: api
-        displayName: API
+      # Ein Job statt drei (API, Frontend, Infrastruktur): Mit einem parallelen Job liefen sie
+      # ohnehin nacheinander, und jeder brauchte einen eigenen Agent-Start.
+      - job: build
+        displayName: Build und Tests
         pool:
           vmImage: ${{ parameters.vmImage }}
         steps:
-          - checkout: self
-          - task: UseDotNet@2
-            displayName: .NET SDK laut global.json
-            inputs:
-              useGlobalJson: true
-          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release
-            displayName: dotnet test
-          - script: >
-              dotnet publish ${{ parameters.apiProject }}
-              --configuration Release
-              --output $(Build.ArtifactStagingDirectory)/api
-              -p:InformationalVersion=$(Build.BuildNumber)
-            displayName: dotnet publish
-          - task: ArchiveFiles@2
-            displayName: Paket packen
-            inputs:
-              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/api
-              includeRootFolder: false
-              archiveType: zip
-              archiveFile: $(Build.ArtifactStagingDirectory)/api.zip
-          - publish: $(Build.ArtifactStagingDirectory)/api.zip
-            artifact: api
-            displayName: Artefakt api
-
-      - ${{ if parameters.frontend }}:
-          - job: web
-            displayName: Frontend
-            pool:
-              vmImage: ${{ parameters.vmImage }}
-            steps:
+          - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
+              # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
               - checkout: self
-              - task: UseNode@1
-                displayName: Node ${{ parameters.nodeVersion }}
-                inputs:
-                  version: ${{ parameters.nodeVersion }}
-              - script: npm ci
-                displayName: npm ci
-                workingDirectory: ${{ parameters.frontendPath }}
-              - script: npm test
-                displayName: npm test
-                workingDirectory: ${{ parameters.frontendPath }}
-              - script: npm run build
-                displayName: npm run build
-                workingDirectory: ${{ parameters.frontendPath }}
-              - publish: ${{ parameters.frontendPath }}/dist
-                artifact: web
-                displayName: Artefakt web
+                fetchDepth: 0
+              - template: steps/secret-scan.yml
+          - ${{ else }}:
+              - checkout: self
 
-      - job: infra
-        displayName: Infrastruktur prüfen
-        pool:
-          vmImage: ${{ parameters.vmImage }}
-        steps:
-          - checkout: self
           - bash: |
               set -euo pipefail
               actual="$(grep -E '^project:' project.yaml | awk '{print $2}' | tr -d "\"'")"
@@ -157,244 +154,372 @@ stages:
             displayName: terraform fmt und validate
             workingDirectory: ${{ parameters.infraPath }}
 
-  - ${{ each env in parameters.environments }}:
-      - stage: plan_${{ env.name }}
-        displayName: Plan ${{ env.name }}
-        jobs:
-          - job: plan
-            displayName: terraform plan
-            pool:
-              vmImage: ${{ parameters.vmImage }}
-            steps:
-              - checkout: self
-              - template: steps/terraform-install.yml
-                parameters:
-                  version: ${{ parameters.terraformVersion }}
-              - template: steps/terraform.yml
-                parameters:
-                  name: tfplan
-                  displayName: terraform plan
-                  serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
-                  workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
-                  terraformState: ${{ parameters.terraformState }}
-                  stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
-                  script: |
-                    set +e
-                    terraform plan -var "environment=${{ env.name }}" -out=tfplan -detailed-exitcode
-                    code=$?
-                    set -e
-                    case "$code" in
-                      0) changes=false ;;
-                      2) changes=true ;;
-                      *) exit "$code" ;;
-                    esac
-                    # Ein Plan, der nur Ressourcen im State verschiebt (moved-Blöcke nach einem
-                    # Modul-Update), ändert keine Infrastruktur und braucht keine Freigabe.
-                    # Terraform wiederholt die Verschiebung bei jedem Plan; gespeichert wird sie
-                    # mit dem nächsten Apply.
-                    if [ "$changes" = true ] && terraform show -json tfplan | python3 -c '
-                    import json, sys
-                    plan = json.load(sys.stdin)
-                    changed = [r for r in plan.get("resource_changes", []) if r["change"]["actions"] != ["no-op"] or r["change"].get("importing")]
-                    changed += [o for o in (plan.get("output_changes") or {}).values() if o["actions"] != ["no-op"]]
-                    sys.exit(1 if changed or plan.get("deferred_changes") else 0)
-                    '; then
-                      changes=false
-                      echo "Der Plan verschiebt nur Ressourcen im State; an der Infrastruktur ändert sich nichts."
-                    fi
-                    echo "Infrastruktur-Änderungen: $changes"
-                    echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
-              - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
-                artifact: tfplan_${{ env.name }}
-                displayName: Plan als Artefakt
+          # Das .NET SDK des Images genügt, wenn es zu global.json passt (sonst scheitert
+          # dotnet --version); dann entfällt der Download durch UseDotNet.
+          - bash: |
+              if sdk="$(dotnet --version 2>/dev/null)"; then
+                echo ".NET SDK $sdk aus dem Image passt zu global.json."
+                echo "##vso[task.setvariable variable=dotnetSdkReady]true"
+              fi
+            displayName: .NET SDK prüfen
+          - task: UseDotNet@2
+            displayName: .NET SDK laut global.json
+            condition: and(succeeded(), ne(variables.dotnetSdkReady, 'true'))
+            inputs:
+              useGlobalJson: true
+          - script: dotnet restore ${{ parameters.apiSolution }}
+            displayName: dotnet restore
+          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore
+            displayName: dotnet test
+          - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
+              - script: >
+                  dotnet publish ${{ parameters.apiProject }}
+                  --configuration Release
+                  --no-restore
+                  --output $(Build.ArtifactStagingDirectory)/api
+                  -p:InformationalVersion=$(Build.BuildNumber)
+                displayName: dotnet publish
+              - task: ArchiveFiles@2
+                displayName: Paket packen
+                inputs:
+                  rootFolderOrFile: $(Build.ArtifactStagingDirectory)/api
+                  includeRootFolder: false
+                  archiveType: zip
+                  archiveFile: $(Build.ArtifactStagingDirectory)/api.zip
+              - publish: $(Build.ArtifactStagingDirectory)/api.zip
+                artifact: api
+                displayName: Artefakt api
 
-      - stage: apply_${{ env.name }}
-        displayName: Apply ${{ env.name }}
-        dependsOn: plan_${{ env.name }}
-        # Ohne Änderungen entfällt die Stage und damit auch die Freigabe.
-        condition: and(succeeded(), eq(dependencies.plan_${{ env.name }}.outputs['plan.tfplan.changes'], 'true'))
-        jobs:
-          - deployment: apply
-            displayName: terraform apply
-            pool:
-              vmImage: ${{ parameters.vmImage }}
-            # Freigaben hängen als Check an diesem Environment.
-            environment: ${{ parameters.project }}-${{ env.name }}
-            strategy:
-              runOnce:
-                deploy:
-                  steps:
-                    - checkout: self
-                    - download: current
-                      artifact: tfplan_${{ env.name }}
-                    - template: steps/terraform-install.yml
-                      parameters:
-                        version: ${{ parameters.terraformVersion }}
-                    - template: steps/terraform.yml
-                      parameters:
-                        displayName: terraform apply
-                        serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
-                        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
-                        terraformState: ${{ parameters.terraformState }}
-                        stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
-                        script: |
-                          if ! terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan" 2>&1 | tee apply.log; then
-                            if grep -q "Saved plan is stale" apply.log; then
-                              echo "##vso[task.logissue type=error]Der Plan ist veraltet, weil sich der State seit dem Plan geändert hat. Bitte einen neuen Lauf starten, damit ein frischer Plan zur Freigabe entsteht."
-                            fi
+          - ${{ if parameters.frontend }}:
+              - task: UseNode@1
+                displayName: Node ${{ parameters.nodeVersion }}
+                inputs:
+                  version: ${{ parameters.nodeVersion }}
+              - script: npm ci
+                displayName: npm ci
+                workingDirectory: ${{ parameters.frontendPath }}
+              - script: npm test
+                displayName: npm test
+                workingDirectory: ${{ parameters.frontendPath }}
+              - script: npm run build
+                displayName: npm run build
+                workingDirectory: ${{ parameters.frontendPath }}
+              - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
+                  - publish: ${{ parameters.frontendPath }}/dist
+                    artifact: web
+                    displayName: Artefakt web
+
+  # PR-Läufe enden nach dem Build: Plan, Apply und Deploy entstehen gar nicht erst, damit
+  # brauchen sie weder Service Connection noch Environments.
+  - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
+      - ${{ each env in parameters.environments }}:
+          - stage: plan_${{ env.name }}
+            displayName: Plan ${{ env.name }}
+            jobs:
+              - job: plan
+                displayName: terraform plan
+                pool:
+                  vmImage: ${{ parameters.vmImage }}
+                steps:
+                  - checkout: self
+                  - template: steps/terraform-install.yml
+                    parameters:
+                      version: ${{ parameters.terraformVersion }}
+                  - template: steps/terraform.yml
+                    parameters:
+                      name: tfplan
+                      displayName: terraform plan
+                      serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                      workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
+                      terraformState: ${{ parameters.terraformState }}
+                      stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
+                      outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
+                      script: |
+                        # Nur in einem Lauf mit confirmDataDeletion; Projekte ohne die Variable
+                        # ignorieren sie (TF_VAR_ für unbekannte Variablen ist kein Fehler).
+                        export TF_VAR_allow_data_deletion=${{ lower(parameters.confirmDataDeletion) }}
+                        set +e
+                        terraform plan -var "environment=${{ env.name }}" -out=tfplan -detailed-exitcode
+                        code=$?
+                        set -e
+                        case "$code" in
+                          0) changes=false ;;
+                          2) changes=true ;;
+                          *) exit "$code" ;;
+                        esac
+                        # Ein Plan, der nur Ressourcen im State verschiebt (moved-Blöcke nach einem
+                        # Modul-Update), ändert keine Infrastruktur und braucht keine Freigabe.
+                        # Terraform wiederholt die Verschiebung bei jedem Plan; gespeichert wird sie
+                        # mit dem nächsten Apply.
+                        if [ "$changes" = true ] && terraform show -json tfplan | python3 -c '
+                        import json, sys
+                        plan = json.load(sys.stdin)
+                        changed = [r for r in plan.get("resource_changes", []) if r["change"]["actions"] != ["no-op"] or r["change"].get("importing")]
+                        changed += [o for o in (plan.get("output_changes") or {}).values() if o["actions"] != ["no-op"]]
+                        sys.exit(1 if changed or plan.get("deferred_changes") else 0)
+                        '; then
+                          changes=false
+                          echo "Der Plan verschiebt nur Ressourcen im State; an der Infrastruktur ändert sich nichts."
+                        fi
+                        echo "Infrastruktur-Änderungen: $changes"
+                        # Schutz vor Datenverlust: Löschen oder Ersetzen geschützter Ressourcen nur
+                        # mit confirmDataDeletion, sonst endet der Lauf hier, vor jeder Freigabe.
+                        deletions=$(terraform show -json tfplan | python3 -c '
+                        import json, sys
+                        protected = set(sys.argv[1].split(","))
+                        for r in json.load(sys.stdin).get("resource_changes", []):
+                            if r["type"] in protected and "delete" in r["change"]["actions"]:
+                                print(r["address"])
+                        ' "${{ join(',', parameters.protectedResourceTypes) }}")
+                        if [ -n "$deletions" ]; then
+                          if [ "${{ lower(parameters.confirmDataDeletion) }}" = true ]; then
+                            while read -r address; do
+                              echo "##vso[task.logissue type=warning]Bestätigt: Der Plan löscht oder ersetzt $address."
+                            done <<< "$deletions"
+                          else
+                            while read -r address; do
+                              echo "##vso[task.logissue type=error]Der Plan löscht oder ersetzt $address."
+                            done <<< "$deletions"
+                            echo "##vso[task.logissue type=error]Datenlöschung ist nicht bestätigt. Ist sie gewollt, die Pipeline von Hand mit „Datenlöschung bestätigen“ starten und den Plan vor der Freigabe prüfen. Die Löschsperre der Storage Accounts hebt Terraform dann für diesen Lauf auf."
                             exit 1
                           fi
+                        fi
+                        echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
+                        mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
+                        cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
+                  - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
+                    artifact: tfplan_${{ env.name }}
+                    displayName: Plan als Artefakt
+                  # Ohne Änderungen gelten die Outputs aus dem State; sonst veröffentlicht apply sie.
+                  - publish: $(Build.ArtifactStagingDirectory)/tfoutputs
+                    artifact: tfoutputs_${{ env.name }}
+                    displayName: Outputs als Artefakt
+                    condition: and(succeeded(), eq(variables['tfplan.changes'], 'false'))
 
-      - stage: deploy_${{ env.name }}
-        displayName: Deploy ${{ env.name }}
-        dependsOn:
-          - plan_${{ env.name }}
-          - apply_${{ env.name }}
-        condition: and(eq(dependencies.plan_${{ env.name }}.result, 'Succeeded'), in(dependencies.apply_${{ env.name }}.result, 'Succeeded', 'Skipped'))
-        jobs:
-          - deployment: deploy
-            displayName: Deploy und Smoke-Test
-            pool:
-              vmImage: ${{ parameters.vmImage }}
-            environment: ${{ parameters.project }}-${{ env.name }}-app
-            strategy:
-              runOnce:
-                deploy:
-                  steps:
-                    - checkout: self
-                    - download: current
-                      artifact: api
-                    - ${{ if parameters.frontend }}:
+          - stage: apply_${{ env.name }}
+            displayName: Apply ${{ env.name }}
+            dependsOn: plan_${{ env.name }}
+            # Ohne Änderungen entfällt die Stage und damit auch die Freigabe.
+            condition: and(succeeded(), eq(dependencies.plan_${{ env.name }}.outputs['plan.tfplan.changes'], 'true'))
+            jobs:
+              - deployment: apply
+                displayName: terraform apply
+                pool:
+                  vmImage: ${{ parameters.vmImage }}
+                # Freigaben hängen als Check an diesem Environment.
+                environment: ${{ parameters.project }}-${{ env.name }}
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
                         - download: current
-                          artifact: web
-                    - template: steps/terraform-install.yml
-                      parameters:
-                        version: ${{ parameters.terraformVersion }}
-                    # Liest nur Outputs aus dem State, ändert nichts an der Infrastruktur.
-                    - template: steps/terraform.yml
-                      parameters:
-                        ${{ if parameters.frontend }}:
-                          displayName: Outputs, config.json und CSP
-                        ${{ else }}:
-                          displayName: Outputs
-                        serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
-                        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
-                        terraformState: ${{ parameters.terraformState }}
-                        stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
-                        script: |
-                          for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
-                            echo "##vso[task.setvariable variable=tf_${name}]$(terraform output -raw "$name")"
-                          done
-                          if [ "${{ lower(parameters.frontend) }}" = true ]; then
-                            if [ -z "$(terraform output -raw static_web_app_name)" ]; then
-                              echo "##vso[task.logissue type=error]Keine Static Web App im Terraform-Output. Für ein Projekt ohne Frontend frontend: false setzen."
-                              exit 1
-                            fi
-                            web="$(Pipeline.Workspace)/web"
-                            # Laufzeitkonfiguration des Frontends: Output frontend_config, sonst nur die API-URL
-                            config="$web/config.json"
-                            if terraform output -json frontend_config > "$config.tmp" 2>/dev/null; then
-                              mv "$config.tmp" "$config"
-                            else
-                              rm -f "$config.tmp"
-                              printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(terraform output -raw function_app_url)" > "$config"
-                            fi
-                            cat "$config"
-                            # Content-Security-Policy: Platzhalter __API_ORIGIN__ in connect-src durch den
-                            # Ursprung der Function ersetzen. Bleibt er stehen, blockiert die CSP die API.
-                            api_origin="$(terraform output -raw function_app_url | sed -E 's#^(https?://[^/]+).*$#\1#')"
-                            if [ -f "$web/staticwebapp.config.json" ]; then
-                              sed -i "s#__API_ORIGIN__#$api_origin#g" "$web/staticwebapp.config.json"
-                              grep -o '"Content-Security-Policy": *"[^"]*"' "$web/staticwebapp.config.json" || true
-                            fi
-                          fi
+                          artifact: tfplan_${{ env.name }}
+                        - template: steps/terraform-install.yml
+                          parameters:
+                            version: ${{ parameters.terraformVersion }}
+                        - template: steps/terraform.yml
+                          parameters:
+                            displayName: terraform apply
+                            serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
+                            terraformState: ${{ parameters.terraformState }}
+                            stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
+                            outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
+                            script: |
+                              if ! terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan" 2>&1 | tee apply.log; then
+                                if grep -q "Saved plan is stale" apply.log; then
+                                  echo "##vso[task.logissue type=error]Der Plan ist veraltet, weil sich der State seit dem Plan geändert hat. Bitte einen neuen Lauf starten, damit ein frischer Plan zur Freigabe entsteht."
+                                fi
+                                exit 1
+                              fi
+                              mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
+                              cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
+                        - publish: $(Build.ArtifactStagingDirectory)/tfoutputs
+                          artifact: tfoutputs_${{ env.name }}
+                          displayName: Outputs als Artefakt
 
-                    # Eine frisch angelegte Function App antwortet einige Minuten mit 503,
-                    # bis die Storage-Rollen ihrer Identität wirken. Daher mehrere Versuche.
-                    # Der Deploy läuft über Entra ID; Basic Auth ist an der Function abgeschaltet.
-                    - task: AzureCLI@2
-                      displayName: Function deployen
-                      inputs:
-                        azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
-                        scriptType: bash
-                        scriptLocation: inlineScript
-                        inlineScript: |
-                          set -euo pipefail
-                          for attempt in 1 2 3 4; do
-                            if az functionapp deployment source config-zip \
-                              --resource-group "$(tf_resource_group_name)" \
-                              --name "$(tf_function_app_name)" \
-                              --src "$(Pipeline.Workspace)/api/api.zip"; then
-                              exit 0
-                            fi
-                            echo "##vso[task.logissue type=warning]Deploy-Versuch $attempt fehlgeschlagen, nächster Versuch in 30 Sekunden."
-                            sleep 30
-                          done
-                          exit 1
+          - stage: deploy_${{ env.name }}
+            displayName: Deploy ${{ env.name }}
+            dependsOn:
+              - plan_${{ env.name }}
+              - apply_${{ env.name }}
+            condition: and(eq(dependencies.plan_${{ env.name }}.result, 'Succeeded'), in(dependencies.apply_${{ env.name }}.result, 'Succeeded', 'Skipped'))
+            jobs:
+              - deployment: deploy
+                displayName: Deploy und Smoke-Test
+                pool:
+                  vmImage: ${{ parameters.vmImage }}
+                environment: ${{ parameters.project }}-${{ env.name }}-app
+                strategy:
+                  runOnce:
+                    deploy:
+                      # Kein Checkout und kein terraform init: Pakete, Outputs und project.yaml
+                      # kommen als Artefakte aus Build und Plan bzw. Apply.
+                      steps:
+                        - download: current
+                          artifact: api
+                        - ${{ if parameters.frontend }}:
+                            - download: current
+                              artifact: web
+                        - download: current
+                          artifact: tfoutputs_${{ env.name }}
 
-                    - ${{ if parameters.frontend }}:
+                        - bash: |
+                            set -euo pipefail
+                            outputs="$(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json"
+                            output() {
+                              python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$outputs" "$1"
+                            }
+                            for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
+                              echo "##vso[task.setvariable variable=tf_${name}]$(output "$name")"
+                            done
+                            if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                              if [ -z "$(output static_web_app_name)" ]; then
+                                echo "##vso[task.logissue type=error]Keine Static Web App im Terraform-Output. Für ein Projekt ohne Frontend frontend: false setzen."
+                                exit 1
+                              fi
+                              web="$(Pipeline.Workspace)/web"
+                              # Laufzeitkonfiguration des Frontends: Output frontend_config, sonst nur die API-URL
+                              python3 -c '
+                            import json, sys
+                            outputs = json.load(open(sys.argv[1]))
+                            config = outputs.get("frontend_config") or {"apiBaseUrl": outputs["function_app_url"]}
+                            json.dump(config, open(sys.argv[2], "w"), indent=2)
+                            ' "$outputs" "$web/config.json"
+                              cat "$web/config.json"
+                              echo
+                              # Content-Security-Policy: Platzhalter __API_ORIGIN__ in connect-src durch den
+                              # Ursprung der Function ersetzen. Bleibt er stehen, blockiert die CSP die API.
+                              api_origin="$(output function_app_url | sed -E 's#^(https?://[^/]+).*$#\1#')"
+                              if [ -f "$web/staticwebapp.config.json" ]; then
+                                sed -i "s#__API_ORIGIN__#$api_origin#g" "$web/staticwebapp.config.json"
+                                grep -o '"Content-Security-Policy": *"[^"]*"' "$web/staticwebapp.config.json" || true
+                              fi
+                            fi
+                          ${{ if parameters.frontend }}:
+                            displayName: Outputs, config.json und CSP
+                          ${{ else }}:
+                            displayName: Outputs
+
+                        # Function-Deploy über Kudu (/api/publish) mit Entra-Token; Basic Auth ist an
+                        # der Function abgeschaltet. Kudu verarbeitet das Paket rund eine Minute lang,
+                        # in der Zeit läuft der Deploy der Static Web App. az functionapp deployment
+                        # wartet danach fest 60 Sekunden und prüft den Host; das übernimmt hier der
+                        # Smoke-Test, der zusätzlich die Build-Nummer vergleicht.
                         - task: AzureCLI@2
-                          displayName: Static Web App, Token und eigene Domains
+                          ${{ if parameters.frontend }}:
+                            displayName: Function-Deploy starten, Token der Static Web App
+                          ${{ else }}:
+                            displayName: Function-Deploy starten
                           inputs:
                             azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                             scriptType: bash
                             scriptLocation: inlineScript
                             inlineScript: |
                               set -euo pipefail
-                              token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" --query properties.apiKey -o tsv)"
-                              echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
-                              # Eigene Domains, die Azure noch nicht validiert hat: nötige DNS-Einträge als
-                              # Warnung. Nur zur Information, der Deploy hängt nicht davon ab.
-                              host="$(tf_static_web_app_url)"
-                              host="${host#https://}"
-                              az staticwebapp hostname list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" \
-                                --query "[?status!='Ready'].[domainName, status, validationToken || '-']" -o tsv |
-                                while IFS=$'\t' read -r domain status validation; do
-                                  echo "##vso[task.logissue type=warning]Eigene Domain $domain ist noch nicht bereit (Status $status). DNS: TXT _dnsauth.$domain = $validation, dazu CNAME $domain -> $host (Apex-Domain: ALIAS oder ANAME)."
-                                done ||
-                                echo "##vso[task.logissue type=warning]Status der eigenen Domains nicht abrufbar."
+                              rg="$(tf_resource_group_name)"
+                              app="$(tf_function_app_name)"
+                              scm="$(az rest --method get \
+                                --url "https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/$rg/providers/Microsoft.Web/sites/$app?api-version=2024-04-01" \
+                                --query "properties.hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)"
+                              token="$(az account get-access-token --resource https://appservice.azure.com --query accessToken -o tsv)"
+                              echo "##vso[task.setvariable variable=kudu_host]$scm"
+                              echo "##vso[task.setvariable variable=kudu_token;issecret=true]$token"
+                              id="none"
+                              if response="$(curl --silent --show-error --fail-with-body -X POST \
+                                -H @<(printf 'Authorization: Bearer %s\n' "$token") -H 'Content-Type: application/zip' \
+                                --data-binary @"$(Pipeline.Workspace)/api/api.zip" \
+                                "https://$scm/api/publish?RemoteBuild=false&Deployer=seed-pipelines")"; then
+                                id="$(tr -d '"' <<< "$response")"
+                                id="${id:-latest}"
+                                echo "Function-Deploy $id gestartet."
+                              else
+                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $response"
+                              fi
+                              echo "##vso[task.setvariable variable=kudu_deployment]$id"
 
-                        - task: AzureStaticWebApp@0
-                          displayName: Static Web App deployen
-                          inputs:
-                            cwd: $(Pipeline.Workspace)/web
-                            app_location: /
-                            skip_app_build: true
-                            skip_api_build: true
-                            azure_static_web_apps_api_token: $(swa_token)
+                              if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                                token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$rg" --query properties.apiKey -o tsv)"
+                                echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
+                                # Eigene Domains, die Azure noch nicht validiert hat: nötige DNS-Einträge als
+                                # Warnung. Nur zur Information, der Deploy hängt nicht davon ab.
+                                host="$(tf_static_web_app_url)"
+                                host="${host#https://}"
+                                az staticwebapp hostname list --name "$(tf_static_web_app_name)" --resource-group "$rg" \
+                                  --query "[?status!='Ready'].[domainName, status, validationToken || '-']" -o tsv |
+                                  while IFS=$'\t' read -r domain status validation; do
+                                    echo "##vso[task.logissue type=warning]Eigene Domain $domain ist noch nicht bereit (Status $status). DNS: TXT _dnsauth.$domain = $validation, dazu CNAME $domain -> $host (Apex-Domain: ALIAS oder ANAME)."
+                                  done ||
+                                  echo "##vso[task.logissue type=warning]Status der eigenen Domains nicht abrufbar."
+                              fi
 
-                    - bash: |
-                        set -euo pipefail
-                        echo "API: $(tf_function_app_url)/api/health"
-                        curl --fail --silent --show-error --retry 12 --retry-delay 10 --retry-all-errors \
-                          "$(tf_function_app_url)/api/health"
-                        echo
-                      displayName: Smoke-Test API
+                        - ${{ if parameters.frontend }}:
+                            - task: AzureStaticWebApp@0
+                              displayName: Static Web App deployen
+                              inputs:
+                                cwd: $(Pipeline.Workspace)/web
+                                app_location: /
+                                skip_app_build: true
+                                skip_api_build: true
+                                azure_static_web_apps_api_token: $(swa_token)
 
-                    - ${{ if parameters.frontend }}:
+                        # Kudu-Status je Deployment: 0 bis 2 läuft, 3 fehlgeschlagen, 4 erfolgreich,
+                        # 5 abgebrochen, 6 teilweise erfolgreich. Eine frisch angelegte Function
+                        # antwortet einige Minuten mit 503, bis die Storage-Rollen ihrer Identität
+                        # wirken; der Deploy endet dann mit 3 oder 6. Daher neue Versuche, bis zu
+                        # 10 Minuten lang.
                         - bash: |
                             set -euo pipefail
-                            url="$(tf_static_web_app_url)"
-                            echo "Frontend: $url"
-                            curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
-                              -o /dev/null "$url/"
-                            curl --fail --silent --show-error "$url/config.json"
-                            echo
-                            # Security-Header aus staticwebapp.config.json: CSP vorhanden, Platzhalter
-                            # ersetzt. Die neue Konfiguration greift unter Umständen erst nach einigen Sekunden.
-                            csp=""
-                            for attempt in 1 2 3 4 5 6; do
-                              csp="$(curl --fail --silent --show-error -D - -o /dev/null "$url/" | tr -d '\r' | grep -i '^content-security-policy:' || true)"
-                              if [ -n "$csp" ] && ! grep -q '__API_ORIGIN__' <<< "$csp"; then
-                                echo "$csp"
-                                exit 0
+                            auth() { printf 'Authorization: Bearer %s\n' "$KUDU_TOKEN"; }
+                            publish() {
+                              local response
+                              if response="$(curl --silent --show-error --fail-with-body -X POST -H @<(auth) \
+                                -H 'Content-Type: application/zip' --data-binary @"$(Pipeline.Workspace)/api/api.zip" \
+                                "https://$(kudu_host)/api/publish?RemoteBuild=false&Deployer=seed-pipelines")"; then
+                                response="$(tr -d '"' <<< "$response")"
+                                echo "${response:-latest}"
+                              else
+                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $response" >&2
+                                echo none
                               fi
-                              sleep 10
+                            }
+                            status() {
+                              curl --silent --max-time 15 -H @<(auth) "https://$(kudu_host)/api/deployments/$1" |
+                                python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("status"), d.get("status_text") or "-")' 2>/dev/null ||
+                                echo "? -"
+                            }
+                            deadline=$((SECONDS + 600))
+                            id="$(kudu_deployment)"
+                            attempt=1
+                            while :; do
+                              while [ "$id" != none ] && [ "$SECONDS" -lt "$deadline" ]; do
+                                read -r code text <<< "$(status "$id")"
+                                case "$code" in
+                                  4)
+                                    echo "Function-Deploy $id erfolgreich (Versuch $attempt, $SECONDS s)."
+                                    exit 0 ;;
+                                  3|5|6|-1)
+                                    echo "##vso[task.logissue type=warning]Function-Deploy $id, Versuch $attempt: Status $code ($text)."
+                                    break ;;
+                                esac
+                                sleep 3
+                              done
+                              if [ $((SECONDS + 30)) -ge "$deadline" ]; then
+                                echo "##vso[task.logissue type=error]Function-Deploy nach $attempt Versuchen nicht erfolgreich."
+                                exit 1
+                              fi
+                              attempt=$((attempt + 1))
+                              echo "Versuch $attempt in 30 Sekunden."
+                              sleep 30
+                              id="$(publish)"
                             done
-                            if [ -z "$csp" ]; then
-                              echo "##vso[task.logissue type=error]Das Frontend liefert keinen Content-Security-Policy-Header. globalHeaders in frontend/public/staticwebapp.config.json aus seed-template übernehmen."
-                            else
-                              echo "##vso[task.logissue type=error]Die Content-Security-Policy enthält noch den Platzhalter __API_ORIGIN__: $csp"
-                            fi
-                            exit 1
-                          displayName: Smoke-Test Frontend
+                          displayName: Function-Deploy abwarten
+                          env:
+                            KUDU_TOKEN: $(kudu_token)
+
+                        - template: steps/smoke-test.yml
+                          parameters:
+                            frontend: ${{ parameters.frontend }}
+                            smokeTest: ${{ parameters.smokeTest }}
+                            projectDir: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}

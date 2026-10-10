@@ -2,13 +2,15 @@
 #
 # Legt in diesem Azure-DevOps-Projekt ein neues Seed-Projekt an: Repo aus seed-template,
 # project.yaml und azure-pipelines.yml, Environments mit Freigaben, Pipeline und deren
-# Berechtigungen. Grundlage ist das Terraform-Modul seed-terraform//ado-project; der
-# State liegt unter scaffold/<name>.tfstate, ein erneuter Lauf ändert nur, was fehlt.
+# Berechtigungen, Branch-Policy für die PR-Validierung auf main. Grundlage ist das
+# Terraform-Modul seed-terraform//ado-project; der State liegt unter scaffold/<name>.tfstate,
+# ein erneuter Lauf ändert nur, was fehlt.
 #
 # Anmeldung bei Azure DevOps mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat
 # (Scopes: Code read/write/manage, Build read/execute, Environment read/manage, Graph read,
 # Project and Team read, Pipeline Resources use/manage). Das Job-Token reicht nicht, solange
 # "Protect access to repositories in YAML pipelines" an ist: Es darf keine Repos anlegen.
+# Für die Branch-Policy braucht die Person hinter dem PAT "Edit policies" am Repo.
 # Die Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des
 # neuen Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
 
@@ -16,6 +18,14 @@ parameters:
   - name: name
     type: string
   - name: sso
+    type: boolean
+    default: false
+  # MCP-Server für KI-Werkzeuge, setzt sso voraus.
+  - name: mcp
+    type: boolean
+    default: false
+  # Eigener Storage Account mit Tabellen, Queues und Containern (Beispiel: Tabelle und Queue jobs).
+  - name: storage
     type: boolean
     default: false
   # Projekt mit Frontend (Static Web App); false: nur API.
@@ -45,10 +55,10 @@ parameters:
     default: true
   - name: terraformModuleVersion
     type: string
-    default: v0.5.0
+    default: v0.6.0
   - name: pipelinesVersion
     type: string
-    default: v0.4.0
+    default: v0.5.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
@@ -68,6 +78,12 @@ stages:
           clean: all
         steps:
           - checkout: none
+          # Vor allem anderen, damit kein halbes Projekt entsteht.
+          - ${{ if and(parameters.mcp, not(parameters.sso)) }}:
+              - bash: |
+                  echo "##vso[task.logissue type=error]mcp setzt sso voraus: Die MCP-Anmeldung läuft über die App-Registrierung des Features sso."
+                  exit 1
+                displayName: Features prüfen
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
@@ -124,7 +140,7 @@ stages:
                 "project": {
                   "ado_project": "$(System.TeamProject)",
                   "name": ${{ convertToJson(parameters.name) }},
-                  "features": { "sso": ${{ lower(parameters.sso) }} },
+                  "features": { "sso": ${{ lower(parameters.sso) }}, "mcp": ${{ lower(parameters.mcp) }}, "storage": ${{ lower(parameters.storage) }} },
                   "frontend": ${{ lower(parameters.frontend) }},
                   "environments": ${{ convertToJson(parameters.environments) }},
                   "approvers": ${{ convertToJson(parameters.approvers) }},
