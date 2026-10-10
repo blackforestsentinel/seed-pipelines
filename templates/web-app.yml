@@ -215,6 +215,11 @@ stages:
       - ${{ each env in parameters.environments }}:
           - stage: plan_${{ env.name }}
             displayName: Plan ${{ env.name }}
+            # Hängt implizit an der vorigen Stage (build bzw. deploy der vorigen Umgebung).
+            # succeeded() wertet den ganzen Abhängigkeitsgraphen aus und wäre nach einem
+            # übersprungenen apply der vorigen Umgebung (keine Änderungen) false; failed() sieht
+            # den Graphen ebenso, ein gescheiterter Schritt davor hält die Umgebung also weiter auf.
+            condition: not(or(failed(), canceled()))
             jobs:
               - job: plan
                 displayName: terraform plan
@@ -300,7 +305,8 @@ stages:
             displayName: Apply ${{ env.name }}
             dependsOn: plan_${{ env.name }}
             # Ohne Änderungen entfällt die Stage und damit auch die Freigabe.
-            condition: and(succeeded(), eq(dependencies.plan_${{ env.name }}.outputs['plan.tfplan.changes'], 'true'))
+            # Ergebnis des eigenen Plans statt succeeded(), aus demselben Grund wie oben.
+            condition: and(eq(dependencies.plan_${{ env.name }}.result, 'Succeeded'), eq(dependencies.plan_${{ env.name }}.outputs['plan.tfplan.changes'], 'true'))
             jobs:
               - deployment: apply
                 displayName: terraform apply
