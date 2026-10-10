@@ -44,7 +44,7 @@ parameters:
     default: v0.4.0
   - name: pipelinesVersion
     type: string
-    default: v0.2.0
+    default: v0.3.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
