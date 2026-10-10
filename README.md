@@ -31,8 +31,11 @@ extends:
 | Stage | Inhalt |
 | --- | --- |
 | `build` | `dotnet test` und `dotnet publish` der API, `npm test` und `npm run build` des Frontends, `terraform fmt` und `validate`, Abgleich mit `project.yaml` |
-| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt |
-| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des Plans, Deploy der Function, `config.json` schreiben, Deploy der Static Web App, Smoke-Test |
+| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert |
+| `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans |
+| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`: Outputs lesen, `config.json` aus dem Output `frontend_config` schreiben, Function und Static Web App deployen, Smoke-Test |
+
+Ohne Infrastruktur-Änderungen entfällt `apply_<env>` samt Freigabe. `deploy_<env>` lässt sich nach einem Fehler einzeln neu starten, weil sie keinen Plan anwendet. Scheitert `apply_<env>` an einem veralteten Plan, braucht es einen neuen Lauf.
 
 Umgebungen laufen in der Reihenfolge der Liste nacheinander.
 
@@ -41,11 +44,11 @@ Umgebungen laufen in der Reihenfolge der Liste nacheinander.
 - GitHub-Service-Connection in der Azure-DevOps-Organisation (Name frei wählbar, im Projekt als `endpoint` angegeben).
 - Azure-Service-Connection mit Workload Identity Federation. Terraform bekommt deren OIDC-Token, es gibt keine Secrets.
 - Rollen der Service-Connection-Identität: `Contributor` und `Role Based Access Control Administrator` auf der Subscription, `Storage Blob Data Contributor` auf dem State-Storage.
-- Environment `<project>-<env>` je Umgebung, Freigaben als Check am Environment.
+- Environment `<project>-<env>` je Umgebung mit Freigabe als Check (Infrastruktur). `<project>-<env>-app` legt die Pipeline selbst an; dort optional eine Freigabe für App-Deploys, etwa in Produktion.
 
 ### Projektstruktur, die das Template erwartet
 
-`project.yaml`, `api/Api.slnx`, `api/Api/Api.csproj`, `frontend/` mit `npm test` und `npm run build` nach `dist/`, `infra/` mit den Outputs `resource_group_name`, `function_app_name`, `function_app_url`, `static_web_app_name` und `static_web_app_url`. Pfade sind per Parameter änderbar.
+`project.yaml`, `api/Api.slnx`, `api/Api/Api.csproj`, `frontend/` mit `npm test` und `npm run build` nach `dist/`, `infra/` mit den Outputs `resource_group_name`, `function_app_name`, `function_app_url`, `static_web_app_name`, `static_web_app_url` und optional `frontend_config` (Objekt, wird zu `config.json`). Pfade sind per Parameter änderbar.
 
 ## Lizenz
 
