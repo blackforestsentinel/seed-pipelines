@@ -5,10 +5,12 @@
 # Berechtigungen. Grundlage ist das Terraform-Modul seed-terraform//ado-project; der
 # State liegt unter scaffold/<name>.tfstate, ein erneuter Lauf ändert nur, was fehlt.
 #
-# Anmeldung bei Azure DevOps mit dem Job-Token des Build-Service ("<Projekt> Build Service");
-# seine Rechte vergibt das Tenant-Onboarding (onboarding/Initialize-SeedTenant.ps1). Die
-# Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des neuen
-# Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
+# Anmeldung bei Azure DevOps mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat
+# (Scopes: Code read/write/manage, Build read/execute, Environment read/manage, Graph read,
+# Project and Team read, Pipeline Resources use/manage). Das Job-Token reicht nicht, solange
+# "Protect access to repositories in YAML pipelines" an ist: Es darf keine Repos anlegen.
+# Die Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des
+# neuen Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
 
 parameters:
   - name: name
@@ -144,10 +146,17 @@ stages:
               workingDirectory: $(Agent.TempDirectory)/scaffold
               terraformState: ${{ parameters.terraformState }}
               stateKey: scaffold/${{ parameters.name }}.tfstate
+              env:
+                SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
               script: |
                 export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
-                # Job-Token des Build-Service; hat beim Provider Vorrang vor OIDC.
-                export AZDO_PERSONAL_ACCESS_TOKEN="$(System.AccessToken)"
+                # PAT aus der geheimen Variable; ohne sie bleibt der Wert als "$(SeedScaffoldPat)" stehen.
+                if [ -z "${SEED_SCAFFOLD_PAT:-}" ] || [[ "$SEED_SCAFFOLD_PAT" == '$('* ]]; then
+                  echo "##vso[task.logissue type=error]Geheime Pipeline-Variable SeedScaffoldPat fehlt (PAT für Azure DevOps)."
+                  exit 1
+                fi
+                # Ein PAT hat beim Provider Vorrang vor OIDC; OIDC bleibt für den State zuständig.
+                export AZDO_PERSONAL_ACCESS_TOKEN="$SEED_SCAFFOLD_PAT"
                 terraform apply -auto-approve
                 echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
                 echo "Repo: $(terraform output -raw repository_web_url)"
@@ -157,10 +166,10 @@ stages:
                   set -euo pipefail
                   url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1"
                   curl --fail --silent --show-error -X POST \
-                    -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" \
+                    -u ":$SEED_SCAFFOLD_PAT" -H "Content-Type: application/json" \
                     --data '{}' "$url" \
                     | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
                   echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Service Connection (Permit) und danach auf die Freigabe der Infrastruktur."
                 displayName: Ersten Lauf starten
                 env:
-                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                  SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
