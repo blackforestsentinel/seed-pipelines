@@ -130,7 +130,7 @@ stages:
           - task: Cache@2
             displayName: Cache Terraform-Provider
             inputs:
-              key: 'terraform | "$(Agent.OS)" | ${{ parameters.terraformVersion }} | ${{ parameters.infraPath }}/**/*.tf'
+              key: 'terraform | "$(Agent.OS)" | "${{ parameters.terraformVersion }}" | ${{ parameters.infraPath }}/**/*.tf'
               path: $(TF_PLUGIN_CACHE_DIR)
           - bash: |
               set -euo pipefail
