@@ -1,12 +1,17 @@
 # Sentinel Seed: Pipeline für Web-Apps aus Static Web App und Azure Function.
 #
-# Projekte binden das Template per extends ein (siehe README). Ablauf je Umgebung:
-# Build und Tests → terraform plan → Freigabe (Check am Environment) → terraform apply
-# → Deploy Function und Static Web App → Smoke-Test.
+# Projekte binden das Template per extends ein (siehe README). Nach Build und Tests
+# je Umgebung:
+#   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert
+#   apply_<env>   nur bei Änderungen: Freigabe (Check am Environment <project>-<env>),
+#                 dann terraform apply des geprüften Plans
+#   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test
+#                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
-  # Azure-DevOps-Environments (<project>-<umgebung>) und der State-Keys.
+  # Azure-DevOps-Environments (<project>-<umgebung> für die Infrastruktur,
+  # <project>-<umgebung>-app für den App-Deploy) und der State-Keys.
   - name: project
     type: string
 
@@ -149,35 +154,45 @@ stages:
                   version: ${{ parameters.terraformVersion }}
               - template: steps/terraform.yml
                 parameters:
+                  name: tfplan
                   displayName: terraform plan
                   serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                   workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
                   terraformState: ${{ parameters.terraformState }}
                   stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                   script: |
-                    terraform plan -var "environment=${{ env.name }}" -out=tfplan
+                    set +e
+                    terraform plan -var "environment=${{ env.name }}" -out=tfplan -detailed-exitcode
+                    code=$?
+                    set -e
+                    case "$code" in
+                      0) changes=false ;;
+                      2) changes=true ;;
+                      *) exit "$code" ;;
+                    esac
+                    echo "Infrastruktur-Änderungen: $changes"
+                    echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
               - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
                 artifact: tfplan_${{ env.name }}
                 displayName: Plan als Artefakt
 
-      - stage: deploy_${{ env.name }}
-        displayName: Deploy ${{ env.name }}
+      - stage: apply_${{ env.name }}
+        displayName: Apply ${{ env.name }}
+        dependsOn: plan_${{ env.name }}
+        # Ohne Änderungen entfällt die Stage und damit auch die Freigabe.
+        condition: and(succeeded(), eq(dependencies.plan_${{ env.name }}.outputs['plan.tfplan.changes'], 'true'))
         jobs:
-          - deployment: deploy
-            displayName: Apply, Deploy, Smoke-Test
+          - deployment: apply
+            displayName: terraform apply
             pool:
               vmImage: ${{ parameters.vmImage }}
-            # Freigaben hängen als Check am Environment, nicht in der Pipeline.
+            # Freigaben hängen als Check an diesem Environment.
             environment: ${{ parameters.project }}-${{ env.name }}
             strategy:
               runOnce:
                 deploy:
                   steps:
                     - checkout: self
-                    - download: current
-                      artifact: api
-                    - download: current
-                      artifact: web
                     - download: current
                       artifact: tfplan_${{ env.name }}
                     - template: steps/terraform-install.yml
@@ -191,19 +206,68 @@ stages:
                         terraformState: ${{ parameters.terraformState }}
                         stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                         script: |
-                          terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan"
+                          if ! terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan" 2>&1 | tee apply.log; then
+                            if grep -q "Saved plan is stale" apply.log; then
+                              echo "##vso[task.logissue type=error]Der Plan ist veraltet, weil sich der State seit dem Plan geändert hat. Bitte einen neuen Lauf starten, damit ein frischer Plan zur Freigabe entsteht."
+                            fi
+                            exit 1
+                          fi
+
+      - stage: deploy_${{ env.name }}
+        displayName: Deploy ${{ env.name }}
+        dependsOn:
+          - plan_${{ env.name }}
+          - apply_${{ env.name }}
+        condition: and(eq(dependencies.plan_${{ env.name }}.result, 'Succeeded'), in(dependencies.apply_${{ env.name }}.result, 'Succeeded', 'Skipped'))
+        jobs:
+          - deployment: deploy
+            displayName: Deploy und Smoke-Test
+            pool:
+              vmImage: ${{ parameters.vmImage }}
+            environment: ${{ parameters.project }}-${{ env.name }}-app
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - download: current
+                      artifact: api
+                    - download: current
+                      artifact: web
+                    - template: steps/terraform-install.yml
+                      parameters:
+                        version: ${{ parameters.terraformVersion }}
+                    # Liest nur Outputs aus dem State, ändert nichts an der Infrastruktur.
+                    - template: steps/terraform.yml
+                      parameters:
+                        displayName: Outputs und config.json
+                        serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                        workingDirectory: $(Build.SourcesDirectory)/${{ parameters.infraPath }}
+                        terraformState: ${{ parameters.terraformState }}
+                        stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
+                        script: |
                           for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
                             echo "##vso[task.setvariable variable=tf_${name}]$(terraform output -raw "$name")"
                           done
+                          # Laufzeitkonfiguration des Frontends: Output frontend_config, sonst nur die API-URL
+                          config="$(Pipeline.Workspace)/web/config.json"
+                          if terraform output -json frontend_config > "$config.tmp" 2>/dev/null; then
+                            mv "$config.tmp" "$config"
+                          else
+                            rm -f "$config.tmp"
+                            printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(terraform output -raw function_app_url)" > "$config"
+                          fi
+                          cat "$config"
 
+                    # Eine frisch angelegte Function App antwortet einige Minuten mit 503,
+                    # bis die Storage-Rollen ihrer Identität wirken. Daher mehrere Versuche.
+                    # Der Deploy läuft über Entra ID; Basic Auth ist an der Function abgeschaltet.
                     - task: AzureCLI@2
                       displayName: Function deployen
                       inputs:
                         azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                         scriptType: bash
                         scriptLocation: inlineScript
-                        # Eine frisch angelegte Function App antwortet einige Minuten mit 503,
-                        # bis die Storage-Rollen ihrer Identität wirken. Daher mehrere Versuche.
                         inlineScript: |
                           set -euo pipefail
                           for attempt in 1 2 3 4; do
@@ -219,14 +283,13 @@ stages:
                           exit 1
 
                     - task: AzureCLI@2
-                      displayName: Frontend vorbereiten
+                      displayName: Deployment-Token der Static Web App
                       inputs:
                         azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                         scriptType: bash
                         scriptLocation: inlineScript
                         inlineScript: |
                           set -euo pipefail
-                          printf '{\n  "apiBaseUrl": "%s"\n}\n' "$(tf_function_app_url)" > "$(Pipeline.Workspace)/web/config.json"
                           token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$(tf_resource_group_name)" --query properties.apiKey -o tsv)"
                           echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
 

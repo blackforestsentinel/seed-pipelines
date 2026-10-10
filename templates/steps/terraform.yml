@@ -14,10 +14,16 @@ parameters:
     type: string
   - name: script
     type: string
+  # Optionaler Schrittname, nötig für Output-Variablen (isOutput=true)
+  - name: name
+    type: string
+    default: ''
 
 steps:
   - task: AzureCLI@2
     displayName: ${{ parameters.displayName }}
+    ${{ if ne(parameters.name, '') }}:
+      name: ${{ parameters.name }}
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
