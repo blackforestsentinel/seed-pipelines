@@ -92,6 +92,11 @@ stages:
         displayName: Build und Tests
         pool:
           vmImage: ${{ parameters.vmImage }}
+        variables:
+          NUGET_PACKAGES: $(Pipeline.Workspace)/.nuget/packages
+          npm_config_cache: $(Pipeline.Workspace)/.npm
+          TF_PLUGIN_CACHE_DIR: $(Pipeline.Workspace)/.terraform-plugins
+          TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: 'true'
         steps:
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
@@ -122,8 +127,14 @@ stages:
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
+          - task: Cache@2
+            displayName: Cache Terraform-Provider
+            inputs:
+              key: 'terraform | "$(Agent.OS)" | ${{ parameters.terraformVersion }} | ${{ parameters.infraPath }}/**/*.tf'
+              path: $(TF_PLUGIN_CACHE_DIR)
           - bash: |
               set -euo pipefail
+              mkdir -p "$TF_PLUGIN_CACHE_DIR"
               terraform fmt -check -recursive
               terraform init -backend=false -input=false
               terraform validate
@@ -143,6 +154,11 @@ stages:
             condition: and(succeeded(), ne(variables.dotnetSdkReady, 'true'))
             inputs:
               useGlobalJson: true
+          - task: Cache@2
+            displayName: Cache NuGet
+            inputs:
+              key: 'nuget | "$(Agent.OS)" | **/*.csproj'
+              path: $(NUGET_PACKAGES)
           - script: dotnet restore ${{ parameters.apiSolution }}
             displayName: dotnet restore
           - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore
@@ -171,6 +187,11 @@ stages:
                 displayName: Node ${{ parameters.nodeVersion }}
                 inputs:
                   version: ${{ parameters.nodeVersion }}
+              - task: Cache@2
+                displayName: Cache npm
+                inputs:
+                  key: 'npm | "$(Agent.OS)" | ${{ parameters.frontendPath }}/package-lock.json'
+                  path: $(npm_config_cache)
               - script: npm ci
                 displayName: npm ci
                 workingDirectory: ${{ parameters.frontendPath }}
