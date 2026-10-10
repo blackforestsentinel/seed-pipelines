@@ -18,12 +18,17 @@ parameters:
   - name: name
     type: string
     default: ''
+  # Zusätzliche Umgebungsvariablen, etwa geheime Variablen (die Pipeline reicht sie nur explizit durch)
+  - name: env
+    type: object
+    default: {}
 
 steps:
   - task: AzureCLI@2
     displayName: ${{ parameters.displayName }}
     ${{ if ne(parameters.name, '') }}:
       name: ${{ parameters.name }}
+    env: ${{ parameters.env }}
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
