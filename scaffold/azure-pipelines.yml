@@ -12,6 +12,14 @@ parameters:
     displayName: Login mit Entra ID (sso)
     type: boolean
     default: false
+  - name: mcp
+    displayName: MCP-Server für KI-Werkzeuge (mcp, setzt sso voraus)
+    type: boolean
+    default: false
+  - name: storage
+    displayName: Storage Account mit Tabellen und Queues (storage)
+    type: boolean
+    default: false
   - name: frontend
     displayName: Mit Frontend (Static Web App); aus = nur API
     type: boolean
@@ -46,6 +54,8 @@ extends:
   parameters:
     name: ${{ parameters.name }}
     sso: ${{ parameters.sso }}
+    mcp: ${{ parameters.mcp }}
+    storage: ${{ parameters.storage }}
     frontend: ${{ parameters.frontend }}
     environments: ${{ parameters.environments }}
     approvers: ${{ parameters.approvers }}
