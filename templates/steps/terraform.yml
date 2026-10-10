@@ -22,6 +22,11 @@ parameters:
   - name: env
     type: object
     default: {}
+  # Optional: Verzeichnis, in das nach dem Skript die Outputs als outputs.json kommen
+  # (Name -> Wert, ohne sensible Outputs). Der Deploy liest sie daraus statt aus dem State.
+  - name: outputsDir
+    type: string
+    default: ''
 
 steps:
   - task: AzureCLI@2
@@ -53,3 +58,14 @@ steps:
           -backend-config="use_azuread_auth=true"
 
         ${{ parameters.script }}
+
+        outputs_dir="${{ parameters.outputsDir }}"
+        if [ -n "$outputs_dir" ]; then
+          mkdir -p "$outputs_dir"
+          # Sensible Outputs bleiben draußen: Das Artefakt kann jeder lesen, der den Lauf sieht.
+          terraform output -json | python3 -c '
+        import json, sys
+        outputs = json.load(sys.stdin)
+        json.dump({k: v["value"] for k, v in outputs.items() if not v.get("sensitive")}, sys.stdout, indent=2)
+        ' > "$outputs_dir/outputs.json"
+        fi

@@ -24,8 +24,10 @@
     an der Pipeline seed-scaffold hinterlegen (Scopes: Code read/write/manage, Build
     read/execute, Environment read/manage, Graph read, Project and Team read, Pipeline
     Resources use/manage). Das Job-Token der Pipeline darf keine Repos anlegen, solange
-    "Protect access to repositories in YAML pipelines" an ist. Die Azure-Service-Connection
-    gibt beim ersten Lauf jedes neuen Projekts eine Administratorin oder ein Administrator frei.
+    "Protect access to repositories in YAML pipelines" an ist. Die Person hinter dem PAT
+    braucht "Edit policies" an den Repos (Branch-Policy der PR-Validierung). Die Azure-Service-
+    Connection gibt beim ersten Lauf jedes neuen Projekts eine Administratorin oder ein
+    Administrator frei.
 
     Ausführen mit einem Konto, das Owner der Subscription, Global Administrator (oder
     Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist.
