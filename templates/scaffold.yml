@@ -2,13 +2,15 @@
 #
 # Legt in diesem Azure-DevOps-Projekt ein neues Seed-Projekt an: Repo aus seed-template,
 # project.yaml und azure-pipelines.yml, Environments mit Freigaben, Pipeline und deren
-# Berechtigungen. Grundlage ist das Terraform-Modul seed-terraform//ado-project; der
-# State liegt unter scaffold/<name>.tfstate, ein erneuter Lauf ändert nur, was fehlt.
+# Berechtigungen, Branch-Policy für die PR-Validierung auf main. Grundlage ist das
+# Terraform-Modul seed-terraform//ado-project; der State liegt unter scaffold/<name>.tfstate,
+# ein erneuter Lauf ändert nur, was fehlt.
 #
 # Anmeldung bei Azure DevOps mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat
 # (Scopes: Code read/write/manage, Build read/execute, Environment read/manage, Graph read,
 # Project and Team read, Pipeline Resources use/manage). Das Job-Token reicht nicht, solange
 # "Protect access to repositories in YAML pipelines" an ist: Es darf keine Repos anlegen.
+# Für die Branch-Policy braucht die Person hinter dem PAT "Edit policies" am Repo.
 # Die Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des
 # neuen Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
 
