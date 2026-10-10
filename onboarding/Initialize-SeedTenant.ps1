@@ -9,7 +9,9 @@
 
       1. Deployment-Identität: App-Registrierung mit Service Principal, ohne Secret
       2. Azure-Rechte auf der Subscription: Contributor und Role Based Access Control
-         Administrator, per Bedingung auf die Storage-Datenrollen des core-Moduls beschränkt
+         Administrator, per Bedingung auf die Rollen beschränkt, die Seed-Module vergeben
+         (Storage-Daten, Key-Vault-Secrets, Monitoring Metrics Publisher); eine bestehende
+         Zuweisung mit älterer Bedingung wird aktualisiert
       3. Microsoft Graph: Application.ReadWrite.OwnedBy mit Admin-Consent (Modul sso)
       4. Terraform-State: Resource Group, Storage Account ohne Shared Key, Container;
          Storage Blob Data Contributor nur auf dem Container
@@ -66,12 +68,17 @@ if (-not $StateStorageAccount) {
 }
 $StateContainerScope = "$Subscription/resourceGroups/$StateResourceGroup/providers/Microsoft.Storage/storageAccounts/$StateStorageAccount/blobServices/default/containers/$StateContainer"
 
-# Rollen, die das core-Modul der Function-Identität zuweist
-$StorageDataRoles = @(
+# Rollen, die Seed-Module vergeben dürfen: der Function-Identität (core, storage, keyvault,
+# monitoring), der Pipeline-Identität auf dem eigenen Key Vault und Personen, die Secrets setzen.
+# Andere Rollen, etwa Owner oder User Access Administrator, kann die Pipeline nicht vergeben.
+$AssignableRoles = @(
     'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'   # Storage Blob Data Owner
     '974c5e8b-45b9-4653-ba55-5f855dd0fb88'   # Storage Queue Data Contributor
     '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'   # Storage Table Data Contributor
     'ba92f5b4-2d11-453d-a403-e96b0029c9fe'   # Storage Blob Data Contributor
+    '4633458b-17de-408a-b874-0445c86b69e6'   # Key Vault Secrets User
+    'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'   # Key Vault Secrets Officer
+    '3913510d-42f4-4e42-8a64-420c390055eb'   # Monitoring Metrics Publisher
 )
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-onboarding-$(Get-Random)")
@@ -148,21 +155,40 @@ try {
 
     # --- 2. Azure-Rechte --------------------------------------------------------------
     Write-Host '2. Azure-Rechte'
-    $roleIds = $StorageDataRoles -join ', '
+    $roleIds = $AssignableRoles -join ', '
     $rbacCondition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
         "(@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$roleIds})) AND " +
         "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})) OR " +
         "(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$roleIds}))"
     $assignments = @(
         @{ Scope = $Subscription; RoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'; Name = 'Contributor auf der Subscription' }
-        @{ Scope = $Subscription; RoleId = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'; Name = 'Role Based Access Control Administrator (nur Storage-Datenrollen)'; Condition = $rbacCondition }
+        @{ Scope = $Subscription; RoleId = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'; Name = 'Role Based Access Control Administrator (nur Seed-Rollen)'; Condition = $rbacCondition }
     )
     $existingAssignments = if ($sp) { az role assignment list --assignee $sp.id --all -o json | ConvertFrom-Json } else { @() }
 
     function Set-RoleAssignment([hashtable] $Assignment) {
-        Invoke-Step $Assignment.Name {
-            $existingAssignments | Where-Object { $_.scope -eq $Assignment.Scope -and $_.roleDefinitionId -like "*/$($Assignment.RoleId)" }
-        } {
+        $existing = $existingAssignments | Where-Object { $_.scope -eq $Assignment.Scope -and $_.roleDefinitionId -like "*/$($Assignment.RoleId)" } |
+            Select-Object -First 1
+        # Neue Seed-Versionen erlauben weitere Rollen: eine ältere Bedingung wird ersetzt, nicht ergänzt.
+        if ($existing -and $Assignment.Condition -and $existing.condition -ne $Assignment.Condition) {
+            if ($DryRun) {
+                Write-Host "  [alt]   $($Assignment.Name): Bedingung wird aktualisiert" -ForegroundColor Yellow
+                $missing.Add("$($Assignment.Name) (Bedingung)")
+                return
+            }
+            $file = Save-Json @{ properties = @{
+                    roleDefinitionId = $existing.roleDefinitionId
+                    principalId      = $existing.principalId
+                    principalType    = 'ServicePrincipal'
+                    description      = "Sentinel Seed: $($Assignment.Name)"
+                    condition        = $Assignment.Condition
+                    conditionVersion = '2.0'
+                } } "role-$(Get-Random).json"
+            az rest --method put --url "https://management.azure.com$($existing.id)?api-version=2022-04-01" --body "@$file" -o none
+            Write-Host "  [neu]   $($Assignment.Name): Bedingung aktualisiert" -ForegroundColor Green
+            return
+        }
+        Invoke-Step $Assignment.Name { $existing } {
             $properties = @{
                 roleDefinitionId = "$Subscription/providers/Microsoft.Authorization/roleDefinitions/$($Assignment.RoleId)"
                 principalId      = $sp.id

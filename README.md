@@ -78,7 +78,7 @@ cd seed-pipelines
 ```
 
 1. Deployment-Identität: App-Registrierung ohne Secret
-2. Azure: `Contributor` und `Role Based Access Control Administrator` (per Bedingung nur Storage-Datenrollen) auf der Subscription
+2. Azure: `Contributor` und `Role Based Access Control Administrator` auf der Subscription. Die Bedingung erlaubt nur die Rollen, die Seed-Module vergeben: Storage-Datenrollen, `Key Vault Secrets User` und `Key Vault Secrets Officer`, `Monitoring Metrics Publisher`. Nach einem Seed-Update mit neuen Rollen das Skript erneut ausführen; es ersetzt dann die ältere Bedingung.
 3. Microsoft Graph: `Application.ReadWrite.OwnedBy` mit Admin-Consent (Modul `sso`)
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
 5. Service Connection per Workload Identity Federation
