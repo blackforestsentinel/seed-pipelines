@@ -110,7 +110,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 
 ## Tenant-Onboarding
 
-[`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal pro Kunde alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
+[`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal je Subscription und Azure-DevOps-Projekt alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
 git clone --branch v0.5.0 https://github.com/blackforestsentinel/seed-pipelines.git
@@ -126,8 +126,12 @@ cd seed-pipelines
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
 5. Service Connection per Workload Identity Federation
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
-7. Repo und Pipeline `seed-scaffold`
+7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
 8. GitHub-Service-Connection für alle Pipelines
+
+**Weitere Subscription im selben Tenant:** Das Skript erneut ausführen, mit eigener Identität und Service Connection (`-IdentityName`, `-ServiceConnectionName`). Der State-Account bekommt nach Default je Subscription einen eigenen Namen. Die Rolle `Sentinel Seed Lock Contributor` gibt es im Tenant nur einmal: Das Skript sucht sie in allen Subscriptions, die das Konto sieht, und nimmt die neue Subscription in ihre `assignableScopes` auf (im DryRun `[alt]`). Dafür braucht das Konto auch in den Subscriptions, in denen die Rolle schon zuweisbar ist, Owner oder User Access Administrator. Bestehende Identitäten fasst das Skript nicht an.
+
+`-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)); der PAT entfällt dann.
 
 Danach einmalig einen PAT anlegen und als geheime Variable `SeedScaffoldPat` an der Pipeline `seed-scaffold` hinterlegen. Scopes: Code (Read, write & manage), Build (Read & execute), Environment (Read & manage), Graph (Read), Project and Team (Read), Pipeline Resources (Use and manage). Das Job-Token der Pipeline reicht nicht, solange „Protect access to repositories in YAML pipelines“ an ist; dann darf es keine Repos anlegen. Die Person, deren PAT es ist, braucht außerdem „Edit policies“ an den Repos des Projekts (Branch-Policy der PR-Validierung).
 
@@ -143,6 +147,42 @@ Die Pipeline `seed-scaffold` (Vorlage: [`scaffold/azure-pipelines.yml`](scaffold
 Die Azure-Service-Connection berechtigt `seed-scaffold` bewusst nicht selbst: Im ersten Lauf eines neuen Projekts gibt eine Administratorin oder ein Administrator sie einmal frei („Permit“). PR-Läufe brauchen keine Freigabe, weil sie die Service Connection nicht verwenden. Der State liegt unter `scaffold/<name>.tfstate`; ein erneuter Lauf ergänzt nur, was fehlt.
 
 Für die Branch-Policy reicht der Scope Code (Read, write & manage) des PATs; die Person, deren PAT es ist, braucht am Repo die Berechtigung „Edit policies“ (Projektadministratoren haben sie). Die Policy setzt voraus, dass das neue Projekt seed-pipelines ab v0.5.0 einbindet (`pipelinesVersion`); ältere Versionen würden in PR-Läufen deployen, `ado-project` bricht dann ab.
+
+## Bestehendes Projekt migrieren
+
+Ein Projekt mit eigenem Repo und eigenen Pipelines zieht ohne neues Repo auf Seed um. [`onboarding/Initialize-SeedProject.ps1`](onboarding/Initialize-SeedProject.ps1) legt dafür an, was sonst `seed-terraform//ado-project` für neue Projekte anlegt, mit denselben Einstellungen, aber ohne Repo-Import und ohne Dateien zu schreiben:
+
+- Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`
+- die Pipeline-Definition für die YAML-Datei (Default `azure-pipelines.yml`), ohne sie zu starten
+- die Berechtigungen der Pipeline für die Environments, die Azure- und die GitHub-Service-Connection; das „Permit“ beim ersten Lauf entfällt
+- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung
+
+Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das Onboarding prüft es jeden Schritt zuerst, und `-DryRun` zeigt nur an, was fehlt. Die Reihenfolge:
+
+1. **Onboarding mit `-SkipScaffold`** für die Subscription des Projekts: Identität, Rechte, State und Service Connections.
+
+   ```powershell
+   ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
+     -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
+     -IdentityName sentinel-seed-<kurzname> -ServiceConnectionName sc-<name> -SkipScaffold -DryRun
+   ```
+
+2. **Projekt einrichten:**
+
+   ```powershell
+   ./onboarding/Initialize-SeedProject.ps1 -AzureDevOpsOrganization https://dev.azure.com/<org> `
+     -AzureDevOpsProject <projekt> -Repository <repo> -SeedProjectName <name> `
+     -Environments test,prod -Approvers it@kunde.de -AppApprovalEnvironments prod `
+     -ServiceConnectionName sc-<name> -DryRun
+   ```
+
+3. **Repo umstellen** auf einem eigenen Branch: `project.yaml`, `azure-pipelines.yml` mit `extends` auf `web-app.yml` (siehe oben) und die Projektstruktur, die das Template erwartet.
+4. **Pipeline auf dem Branch** von Hand starten (`az pipelines run --name <pipeline> --branch <branch>`) und Plan, Deploy und Smoke-Test prüfen. Ein Lauf auf einem Branch deployt wie einer auf `main`, mit denselben Freigaben; wer zuerst nur die erste Umgebung prüfen will, lehnt die Freigabe der nächsten ab.
+5. **Alte Pipelines deaktivieren**, bevor der Branch nach `main` geht (Pipeline-Einstellungen, „Disabled“). Sonst startet der Merge sie mit: eine alte Pipeline auf derselben YAML-Datei mit dem neuen Inhalt, andere mit ihren alten Dateien, solange es diese noch gibt.
+6. **Mergen.** Ab dann deployt die Seed-Pipeline bei jedem Push auf `main`.
+7. **Branch-Policy nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern und `-EnableBranchPolicy`. Das Skript prüft vorher, dass die YAML-Datei auf `main` `web-app.yml` ab v0.5.0 einbindet; mit der alten Datei würden PR-Läufe deployen. Danach gehen Änderungen an `main` nur noch per PR.
+
+Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben Pfad, startet ein Push auf `main` auch die neue Pipeline, mit dem alten Inhalt. Diese Pipeline ist für die alten Service Connections und Environments nicht berechtigt und fragt nach Zugriff: solche Läufe abbrechen, den Zugriff nicht erlauben. `Initialize-SeedProject.ps1` weist darauf hin und listet die übrigen aktiven Pipelines des Repos.
 
 ## Lizenz
 
