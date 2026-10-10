@@ -54,6 +54,30 @@ parameters:
     type: object
     default: {}
 
+  # Löschen von Daten bestätigen. Ein Plan, der Ressourcen aus protectedResourceTypes löscht
+  # oder ersetzt, bricht sonst ab. Projekte reichen dafür einen Laufzeitparameter durch
+  # (azure-pipelines.yml aus seed-template); bestätigt wird also nur in einem bewusst von Hand
+  # gestarteten Lauf, danach folgt wie immer die Freigabe. Terraform bekommt in diesem Lauf
+  # TF_VAR_allow_data_deletion=true; das Modul storage hebt damit seine Löschsperre auf, der
+  # nächste Lauf ohne Bestätigung setzt sie wieder.
+  - name: confirmDataDeletion
+    type: boolean
+    default: false
+
+  # Ressourcentypen, deren Löschen oder Ersetzen confirmDataDeletion verlangt: Daten, die ein
+  # Apply unwiederbringlich mitnehmen würde, und die Löschsperren selbst.
+  - name: protectedResourceTypes
+    type: object
+    default:
+      - azurerm_storage_account
+      - azurerm_storage_container
+      - azurerm_storage_queue
+      - azurerm_storage_share
+      - azurerm_storage_table
+      - azurerm_key_vault
+      - azurerm_log_analytics_workspace
+      - azurerm_management_lock
+
   - name: vmImage
     type: string
     default: ubuntu-24.04
@@ -211,6 +235,9 @@ stages:
                       stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                       outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
                       script: |
+                        # Nur in einem Lauf mit confirmDataDeletion; Projekte ohne die Variable
+                        # ignorieren sie (TF_VAR_ für unbekannte Variablen ist kein Fehler).
+                        export TF_VAR_allow_data_deletion=${{ lower(parameters.confirmDataDeletion) }}
                         set +e
                         terraform plan -var "environment=${{ env.name }}" -out=tfplan -detailed-exitcode
                         code=$?
@@ -235,6 +262,28 @@ stages:
                           echo "Der Plan verschiebt nur Ressourcen im State; an der Infrastruktur ändert sich nichts."
                         fi
                         echo "Infrastruktur-Änderungen: $changes"
+                        # Schutz vor Datenverlust: Löschen oder Ersetzen geschützter Ressourcen nur
+                        # mit confirmDataDeletion, sonst endet der Lauf hier, vor jeder Freigabe.
+                        deletions=$(terraform show -json tfplan | python3 -c '
+                        import json, sys
+                        protected = set(sys.argv[1].split(","))
+                        for r in json.load(sys.stdin).get("resource_changes", []):
+                            if r["type"] in protected and "delete" in r["change"]["actions"]:
+                                print(r["address"])
+                        ' "${{ join(',', parameters.protectedResourceTypes) }}")
+                        if [ -n "$deletions" ]; then
+                          if [ "${{ lower(parameters.confirmDataDeletion) }}" = true ]; then
+                            while read -r address; do
+                              echo "##vso[task.logissue type=warning]Bestätigt: Der Plan löscht oder ersetzt $address."
+                            done <<< "$deletions"
+                          else
+                            while read -r address; do
+                              echo "##vso[task.logissue type=error]Der Plan löscht oder ersetzt $address."
+                            done <<< "$deletions"
+                            echo "##vso[task.logissue type=error]Datenlöschung ist nicht bestätigt. Ist sie gewollt, die Pipeline von Hand mit „Datenlöschung bestätigen“ starten und den Plan vor der Freigabe prüfen. Die Löschsperre der Storage Accounts hebt Terraform dann für diesen Lauf auf."
+                            exit 1
+                          fi
+                        fi
                         echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
                         mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                         cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"

@@ -11,7 +11,8 @@
       2. Azure-Rechte auf der Subscription: Contributor und Role Based Access Control
          Administrator, per Bedingung auf die Rollen beschränkt, die Seed-Module vergeben
          (Storage-Daten, Key-Vault-Secrets, Monitoring Metrics Publisher); eine bestehende
-         Zuweisung mit älterer Bedingung wird aktualisiert
+         Zuweisung mit älterer Bedingung wird aktualisiert; dazu die eigene Rolle
+         "Sentinel Seed Lock Contributor" nur für Löschsperren (Modul storage)
       3. Microsoft Graph: Application.ReadWrite.OwnedBy mit Admin-Consent (Modul sso)
       4. Terraform-State: Resource Group, Storage Account ohne Shared Key, Container;
          Storage Blob Data Contributor nur auf dem Container
@@ -82,6 +83,10 @@ $AssignableRoles = @(
     'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'   # Key Vault Secrets Officer
     '3913510d-42f4-4e42-8a64-420c390055eb'   # Monitoring Metrics Publisher
 )
+
+# Eigene Rolle für Löschsperren: Contributor darf keine Sperren setzen, Owner oder User Access
+# Administrator wären viel zu weit. Diese Rolle darf nur Sperren lesen, setzen und entfernen.
+$LockRoleName = 'Sentinel Seed Lock Contributor'
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-onboarding-$(Get-Random)")
 $missing = [Collections.Generic.List[string]]::new()
@@ -207,6 +212,33 @@ try {
         } | Out-Null
     }
     foreach ($a in $assignments) { Set-RoleAssignment $a }
+
+    $lockRole = Invoke-Step "Rolle $LockRoleName" {
+        az role definition list --custom-role-only true --name $LockRoleName --scope $Subscription -o json |
+            ConvertFrom-Json | Select-Object -First 1
+    } {
+        $file = Save-Json @{
+            Name             = $LockRoleName
+            Description      = 'Sentinel Seed: Löschsperren lesen, setzen und entfernen (Modul storage).'
+            Actions          = @('Microsoft.Authorization/locks/read', 'Microsoft.Authorization/locks/write', 'Microsoft.Authorization/locks/delete')
+            NotActions       = @()
+            AssignableScopes = @($Subscription)
+        } 'lock-role.json'
+        az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+    }
+    if ($lockRole) {
+        # Eine neue Rollendefinition kennt Azure nicht sofort überall; deshalb einige Versuche.
+        foreach ($attempt in 1..6) {
+            try {
+                Set-RoleAssignment @{ Scope = $Subscription; RoleId = $lockRole.name; Name = "$LockRoleName auf der Subscription" }
+                break
+            } catch {
+                if ($attempt -eq 6) { throw }
+                Write-Host '          Rollendefinition noch nicht verteilt, neuer Versuch in 10 Sekunden'
+                Start-Sleep -Seconds 10
+            }
+        }
+    }
 
     # --- 3. Microsoft Graph -------------------------------------------------------------
     Write-Host '3. Microsoft Graph'
