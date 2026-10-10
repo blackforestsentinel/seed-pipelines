@@ -8,7 +8,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.1.0
+      ref: refs/tags/v0.3.0
       endpoint: github-blackforestsentinel
 
 extends:
