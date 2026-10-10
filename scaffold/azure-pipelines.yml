@@ -1,0 +1,55 @@
+# Sentinel Seed: neues Projekt anlegen.
+# Angelegt vom Tenant-Onboarding (onboarding/Initialize-SeedTenant.ps1). Pipeline von Hand
+# starten und die Parameter ausfüllen; sie legt Repo, Environments und Pipeline an.
+trigger: none
+pr: none
+
+parameters:
+  - name: name
+    displayName: Projektname (3-20 Zeichen, a-z, 0-9, Bindestrich)
+    type: string
+  - name: sso
+    displayName: Login mit Entra ID (sso)
+    type: boolean
+    default: false
+  - name: environments
+    displayName: Umgebungen in Deploy-Reihenfolge
+    type: object
+    default: [dev]
+  - name: approvers
+    displayName: Freigabe für Infrastruktur-Änderungen (E-Mail-Adressen)
+    type: object
+    default: __APPROVERS__
+  - name: appApprovalEnvironments
+    displayName: Umgebungen, in denen auch der App-Deploy eine Freigabe braucht
+    type: object
+    default: []
+  - name: startFirstRun
+    displayName: Ersten Lauf der neuen Pipeline starten
+    type: boolean
+    default: true
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/tags/__SEED_PIPELINES_VERSION__
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/scaffold.yml@seed
+  parameters:
+    name: ${{ parameters.name }}
+    sso: ${{ parameters.sso }}
+    environments: ${{ parameters.environments }}
+    approvers: ${{ parameters.approvers }}
+    appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
+    startFirstRun: ${{ parameters.startFirstRun }}
+    pipelinesVersion: __SEED_PIPELINES_VERSION__
+    serviceConnection: __SERVICE_CONNECTION__
+    githubConnection: __GITHUB_CONNECTION__
+    terraformState:
+      resourceGroup: __STATE_RESOURCE_GROUP__
+      storageAccount: __STATE_STORAGE_ACCOUNT__
+      container: __STATE_CONTAINER__

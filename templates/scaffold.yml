@@ -1,0 +1,175 @@
+# Sentinel Seed: Projekt anlegen (seed-scaffold).
+#
+# Legt in diesem Azure-DevOps-Projekt ein neues Seed-Projekt an: Repo aus seed-template,
+# project.yaml und azure-pipelines.yml, Environments mit Freigaben, Pipeline und deren
+# Berechtigungen. Grundlage ist das Terraform-Modul seed-terraform//ado-project; der
+# State liegt unter scaffold/<name>.tfstate, ein erneuter Lauf ändert nur, was fehlt.
+#
+# Anmeldung bei Azure DevOps mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat
+# (Scopes: Code read/write/manage, Build read/execute, Environment read/manage, Graph read,
+# Project and Team read, Pipeline Resources use/manage). Das Job-Token reicht nicht, solange
+# "Protect access to repositories in YAML pipelines" an ist: Es darf keine Repos anlegen.
+# Die Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des
+# neuen Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
+
+parameters:
+  - name: name
+    type: string
+  - name: sso
+    type: boolean
+    default: false
+  - name: environments
+    type: object
+    default: [dev]
+  # Principal Names (E-Mail) der Personen, die Infrastruktur-Änderungen freigeben.
+  - name: approvers
+    type: object
+    default: []
+  # Umgebungen, in denen auch der App-Deploy eine Freigabe braucht.
+  - name: appApprovalEnvironments
+    type: object
+    default: []
+  - name: serviceConnection
+    type: string
+  - name: githubConnection
+    type: string
+  - name: terraformState
+    type: object
+  # Erster Lauf der neuen Pipeline direkt im Anschluss.
+  - name: startFirstRun
+    type: boolean
+    default: true
+  - name: terraformModuleVersion
+    type: string
+    default: v0.4.0
+  - name: pipelinesVersion
+    type: string
+    default: v0.3.0
+  - name: terraformVersion
+    type: string
+    default: '1.15.3'
+  - name: vmImage
+    type: string
+    default: ubuntu-24.04
+
+stages:
+  - stage: scaffold
+    displayName: Projekt ${{ parameters.name }} anlegen
+    jobs:
+      - job: scaffold
+        displayName: Repo, Environments, Pipeline
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        workspace:
+          clean: all
+        steps:
+          - checkout: none
+          - template: steps/terraform-install.yml
+            parameters:
+              version: ${{ parameters.terraformVersion }}
+
+          - bash: |
+              set -euo pipefail
+              dir="$(Agent.TempDirectory)/scaffold"
+              mkdir -p "$dir"
+              cat > "$dir/main.tf" <<'EOF'
+              terraform {
+                required_providers {
+                  azuredevops = {
+                    source  = "microsoft/azuredevops"
+                    version = "1.16.0"
+                  }
+                }
+                backend "azurerm" {}
+              }
+
+              provider "azuredevops" {}
+
+              variable "project" {
+                type = any
+              }
+
+              module "project" {
+                source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
+
+                ado_project                   = var.project.ado_project
+                authorize_service_connections = false
+                name                      = var.project.name
+                features                  = var.project.features
+                environments              = var.project.environments
+                approvers                 = var.project.approvers
+                app_approval_environments = var.project.app_approval_environments
+                service_connection        = var.project.service_connection
+                github_connection         = var.project.github_connection
+                terraform_state           = var.project.terraform_state
+                pipelines_version         = var.project.pipelines_version
+              }
+
+              output "repository_web_url" {
+                value = module.project.repository_web_url
+              }
+
+              output "pipeline_id" {
+                value = module.project.pipeline_id
+              }
+              EOF
+              # Parameter als JSON, nicht als HCL-Text: Sonderzeichen können nichts aufbrechen.
+              cat > "$dir/terraform.tfvars.json" <<'EOF'
+              {
+                "project": {
+                  "ado_project": "$(System.TeamProject)",
+                  "name": ${{ convertToJson(parameters.name) }},
+                  "features": { "sso": ${{ lower(parameters.sso) }} },
+                  "environments": ${{ convertToJson(parameters.environments) }},
+                  "approvers": ${{ convertToJson(parameters.approvers) }},
+                  "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
+                  "service_connection": ${{ convertToJson(parameters.serviceConnection) }},
+                  "github_connection": ${{ convertToJson(parameters.githubConnection) }},
+                  "terraform_state": {
+                    "resource_group": ${{ convertToJson(parameters.terraformState.resourceGroup) }},
+                    "storage_account": ${{ convertToJson(parameters.terraformState.storageAccount) }},
+                    "container": ${{ convertToJson(parameters.terraformState.container) }}
+                  },
+                  "pipelines_version": ${{ convertToJson(parameters.pipelinesVersion) }}
+                }
+              }
+              EOF
+              sed -i 's/^              //' "$dir/main.tf" "$dir/terraform.tfvars.json"
+              python3 -m json.tool "$dir/terraform.tfvars.json"
+            displayName: Terraform-Konfiguration schreiben
+
+          - template: steps/terraform.yml
+            parameters:
+              name: scaffold
+              displayName: terraform apply
+              serviceConnection: ${{ parameters.serviceConnection }}
+              workingDirectory: $(Agent.TempDirectory)/scaffold
+              terraformState: ${{ parameters.terraformState }}
+              stateKey: scaffold/${{ parameters.name }}.tfstate
+              env:
+                SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
+              script: |
+                export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
+                # PAT aus der geheimen Variable; ohne sie bleibt der Wert als "$(SeedScaffoldPat)" stehen.
+                if [ -z "${SEED_SCAFFOLD_PAT:-}" ] || [[ "$SEED_SCAFFOLD_PAT" == '$('* ]]; then
+                  echo "##vso[task.logissue type=error]Geheime Pipeline-Variable SeedScaffoldPat fehlt (PAT für Azure DevOps)."
+                  exit 1
+                fi
+                # Ein PAT hat beim Provider Vorrang vor OIDC; OIDC bleibt für den State zuständig.
+                export AZDO_PERSONAL_ACCESS_TOKEN="$SEED_SCAFFOLD_PAT"
+                terraform apply -auto-approve
+                echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
+                echo "Repo: $(terraform output -raw repository_web_url)"
+
+          - ${{ if parameters.startFirstRun }}:
+              - bash: |
+                  set -euo pipefail
+                  url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1"
+                  curl --fail --silent --show-error -X POST \
+                    -u ":$SEED_SCAFFOLD_PAT" -H "Content-Type: application/json" \
+                    --data '{}' "$url" \
+                    | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
+                  echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Service Connection (Permit) und danach auf die Freigabe der Infrastruktur."
+                displayName: Ersten Lauf starten
+                env:
+                  SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
