@@ -15,7 +15,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.5.0
+      ref: refs/tags/v0.7.0
       endpoint: github-blackforestsentinel
 
 extends:
@@ -168,7 +168,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 [`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal je Subscription und Azure-DevOps-Projekt alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
-git clone --branch v0.5.0 https://github.com/blackforestsentinel/seed-pipelines.git
+git clone --branch v0.7.0 https://github.com/blackforestsentinel/seed-pipelines.git
 cd seed-pipelines
 ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
   -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
@@ -238,6 +238,16 @@ Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das
 7. **Branch-Policy nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern und `-EnableBranchPolicy`. Das Skript prüft vorher, dass die YAML-Datei auf `main` `web-app.yml` ab v0.5.0 einbindet; mit der alten Datei würden PR-Läufe deployen. Danach gehen Änderungen an `main` nur noch per PR.
 
 Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben Pfad, startet ein Push auf `main` auch die neue Pipeline, mit dem alten Inhalt. Diese Pipeline ist für die alten Service Connections und Environments nicht berechtigt und fragt nach Zugriff: solche Läufe abbrechen, den Zugriff nicht erlauben. `Initialize-SeedProject.ps1` weist darauf hin und listet die übrigen aktiven Pipelines des Repos.
+
+## Release
+
+Neue Projekte bekommen die Versionen, die hier als Standard stehen. Vor jedem Tag deshalb anheben:
+
+- `onboarding/Initialize-SeedTenant.ps1`: `$SeedPipelinesVersion`, landet im Repo `seed-scaffold` und damit in jedem neuen Projekt;
+- `templates/scaffold.yml`: `pipelinesVersion` und `terraformModuleVersion` (Modul `ado-project`);
+- die Beispiele in dieser README.
+
+Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`.
 
 ## Lizenz
 
