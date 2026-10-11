@@ -62,8 +62,10 @@ if ($SeedRef) {
     if (-not $rx.IsMatch($yaml)) { throw "$YamlPath enthält keine Zeile 'ref:' für -SeedRef." }
     $yaml = $rx.Replace($yaml, "`${1}$SeedRef", 1)
 }
+# Nur ein Hinweis: Auch Templates enthalten solche Namen absichtlich (__API_ORIGIN__ ersetzt erst
+# der Deploy).
 $left = [regex]::Matches($yaml, '__[A-Z_]+__') | ForEach-Object Value | Sort-Object -Unique
-if ($left) { throw "Platzhalter ohne Wert (-Replace): $($left -join ', ')" }
+if ($left) { Write-Warning "Nicht ersetzt (-Replace), falls Platzhalter gemeint sind: $($left -join ', ')" }
 
 $body = @{ previewRun = $true; yamlOverride = $yaml }
 if ($TemplateParameters.Count) { $body.templateParameters = $TemplateParameters }
