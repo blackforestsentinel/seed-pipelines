@@ -1,0 +1,37 @@
+# Vorschau-Beispiel: normaler Lauf mit eigenen Schritten im Build (extraBuildSteps).
+# Erwartet: die eigenen Schritte nach npm run build und vor dem Artefakt web; danach Plan,
+# Apply und Deploy. Platzhalter: __PROJECT__ und __ENVIRONMENT__ (die Environments
+# <projekt>-<umgebung> und <projekt>-<umgebung>-app müssen im Projekt existieren),
+# __SERVICE_CONNECTION__ (ebenso), __GITHUB_CONNECTION__.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: __PROJECT__
+    serviceConnection: __SERVICE_CONNECTION__
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    environments:
+      - name: __ENVIRONMENT__
+    smokeTest:
+      protectedPath: api/me
+    extraBuildSteps:
+      - script: echo lint
+        displayName: Lint (Beispiel)
+        workingDirectory: frontend
+      - bash: |
+          mkdir -p frontend/dist/widgets
+          echo 'console.log(1)' > frontend/dist/widgets/widget.js
+        displayName: Datei ins Frontend (Beispiel)

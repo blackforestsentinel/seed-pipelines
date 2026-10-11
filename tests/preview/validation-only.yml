@@ -1,0 +1,27 @@
+# Vorschau-Beispiel: Prüflauf wie im PR (validationOnly). Erwartet: Secret-Scan, Build und Tests,
+# die eigenen Schritte, aber weder Artefakte noch Plan, Apply oder Deploy. Ohne Service Connection.
+# Platzhalter: __GITHUB_CONNECTION__.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: preview-app
+    serviceConnection: sc-wird-nicht-gebraucht
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    validationOnly: true
+    extraBuildSteps:
+      - script: echo lint
+        displayName: Lint (Beispiel)
