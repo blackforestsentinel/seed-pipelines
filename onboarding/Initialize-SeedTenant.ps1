@@ -70,7 +70,7 @@ param(
     [string] $StateStorageAccount = '',
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
-    [string] $SeedPipelinesVersion = 'v0.5.0',
+    [string] $SeedPipelinesVersion = 'v0.7.0',
     [switch] $SkipScaffold,
     [switch] $DryRun
 )
