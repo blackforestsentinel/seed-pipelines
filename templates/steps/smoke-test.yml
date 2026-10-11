@@ -58,10 +58,14 @@ steps:
 
       if [ "${{ lower(parameters.frontend) }}" = true ]; then
         # CORS-Preflight wie aus dem Browser: Der Ursprung des Frontends ist erlaubt, ein fremder nicht.
+        # Mit Wiederholungen: Direkt nach dem Deploy startet die Function teils noch eine weitere
+        # Instanz; ein Aufruf lief dabei schon einmal 10 Sekunden ohne Antwort ab, obwohl der
+        # Health-Aufruf davor geantwortet hatte.
         allowed_origin() {
-          curl --silent --show-error --max-time 10 -o /dev/null -D - -X OPTIONS "$api/api/health" \
+          curl --silent --show-error --max-time 10 --retry 3 --retry-delay 5 --retry-all-errors \
+            -o /dev/null -D - -X OPTIONS "$api/api/health" \
             -H "Origin: $1" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" |
-            tr -d '\r' | awk -F': ' 'tolower($1) == "access-control-allow-origin" { print $2 }'
+            tr -d '\r' | awk -F': ' 'tolower($1) == "access-control-allow-origin" { v = $2 } END { if (v != "") print v }'
         }
         frontend="$(tf_static_web_app_url)"
         allowed="$(allowed_origin "$frontend")"
