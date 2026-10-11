@@ -55,10 +55,10 @@ parameters:
     default: true
   - name: terraformModuleVersion
     type: string
-    default: v0.6.0
+    default: v0.8.0
   - name: pipelinesVersion
     type: string
-    default: v0.5.0
+    default: v0.7.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
