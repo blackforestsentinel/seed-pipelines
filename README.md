@@ -35,13 +35,17 @@ extends:
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # frontend: false                             # Projekt ohne Frontend (nur API)
+    # extraBuildSteps:                            # eigene Schritte im Build, siehe unten
+    #   - script: npm run lint
+    #     displayName: Lint
+    #     workingDirectory: frontend
 ```
 
 ## templates/web-app.yml
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, `dotnet test` und `dotnet publish` der API, `npm test` und `npm run build` des Frontends (nur mit Frontend); im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, `dotnet test` und `dotnet publish` der API, `npm test` und `npm run build` des Frontends (nur mit Frontend), danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert. Ohne Änderungen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test |
@@ -71,6 +75,57 @@ Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester
 Löscht oder ersetzt ein Plan Ressourcen mit Daten, endet der Lauf in `plan_<env>` mit einer Liste dieser Ressourcen, noch vor jeder Freigabe. Geschützt sind standardmäßig Storage Accounts samt Tabellen, Queues, Containern und Freigaben, Key Vaults, Log-Analytics-Workspaces und Löschsperren (`protectedResourceTypes`). Das trifft etwa eine Tabelle, die aus `project.yaml` verschwindet, `storage: false` oder ein Modul-Update, das einen Storage Account ersetzen würde.
 
 Ist das Löschen gewollt, startet man die Pipeline von Hand und kreuzt „Datenlöschung bestätigen“ an (`confirmDataDeletion`, Laufzeitparameter in `azure-pipelines.yml`). Der Plan nennt die betroffenen Ressourcen dann als Warnung, die Freigabe folgt wie immer. Ein Push kann diese Bestätigung nicht mitbringen. In diesem Lauf bekommt Terraform `TF_VAR_allow_data_deletion=true`: Das Modul `storage` hebt damit seine Löschsperre auf, die sonst auch Tabellen, Queues und Container vor dem Löschen schützt. Der nächste Lauf ohne Bestätigung setzt sie wieder; dafür braucht er eine Freigabe.
+
+### Eigene Schritte im Build
+
+Projektspezifische Prüfungen oder Pakete kommen über den Parameter `extraBuildSteps` (Typ `stepList`) in den Build-Job, statt das Template zu kopieren:
+
+```yaml
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    # ...
+    extraBuildSteps:
+      - script: npm run lint
+        displayName: Lint Frontend
+        workingDirectory: frontend
+      - script: |
+          npm ci && npm run build
+          mkdir -p ../frontend/dist/widgets
+          cp dist/widget.js ../frontend/dist/widgets/
+        displayName: Widget bauen und ins Frontend legen
+        workingDirectory: widget
+```
+
+- **Reihenfolge:** nach `dotnet test`/`dotnet publish` und nach `npm test`/`npm run build` des Frontends, vor dem Veröffentlichen des Artefakts `web`. Was ein Schritt nach `<frontendPath>/dist` legt, wird also mit der Static Web App ausgeliefert. Die Abhängigkeiten des Frontends (`node_modules`) sind dann schon installiert, Node und das .NET SDK ebenso.
+- **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`; eine Prüfung hier hält also den PR auf.
+- **Arbeitsverzeichnis** ist der Checkout, je Schritt änderbar mit `workingDirectory`.
+- **Rechte:** Der Build-Job hat keine Azure-Service-Connection und keine Secrets. Schritte, die etwas in Azure brauchen, gehören nicht in den Build.
+
+### Vorschau ohne Lauf
+
+Ob ein Projekt-YAML mit dem Template zusammenpasst, zeigt die Vorschau-API von Azure DevOps (`previewRun`): Sie löst Templates und Ausdrücke auf und gibt das fertige YAML zurück, ohne einen Lauf zu starten, ohne Freigaben und ohne Service Connection. [`tests/preview/Invoke-SeedPipelinePreview.ps1`](tests/preview/Invoke-SeedPipelinePreview.ps1) schickt eine YAML-Datei als `yamlOverride` an eine beliebige vorhandene Pipeline des Azure-DevOps-Projekts, legt das Ergebnis als `<datei>.final.yml` ab und prüft optional die Reihenfolge von Schritten im Build-Job:
+
+```powershell
+$common = @{
+  Organization = 'https://dev.azure.com/<org>'; Project = '<projekt>'; PipelineId = <id>
+  SeedRef = 'refs/heads/<branch>'
+  Replace = @{
+    GITHUB_CONNECTION = 'github-blackforestsentinel'; SERVICE_CONNECTION = '<sc-im-projekt>'
+    PROJECT = '<seed-projekt-im-projekt>'; ENVIRONMENT = '<umgebung>'
+  }
+}
+# Normaler Lauf: eigene Schritte nach dem Frontend-Build, vor dem Artefakt web
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extra-build-steps.yml `
+  -ExpectBuildSteps 'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web'
+# Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
+  -ExpectBuildSteps 'npm run build', 'Lint (Beispiel)' -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
+```
+
+- `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
+- Die Pipeline-ID dient nur als Rahmen (Projekt, GitHub-Service-Connection); ihre eigene YAML-Datei spielt keine Rolle. Service Connections und Environments, die das YAML nennt, müssen im Projekt existieren, sonst lehnt Azure DevOps schon die Vorschau ab. Deshalb nennt das Beispiel für den normalen Lauf ein vorhandenes Seed-Projekt und eine seiner Umgebungen; der Prüflauf braucht beides nicht.
+- Ebenso lässt sich das YAML eines Projekts vor dem Umstellen prüfen, etwa bei einer Migration, deren Projekt in Azure DevOps noch keine Seed-Service-Connection hat: `-Replace` bzw. eine angepasste Kopie mit einer Service Connection des Rahmenprojekts.
 
 ### Smoke-Test
 

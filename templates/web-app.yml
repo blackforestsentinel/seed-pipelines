@@ -11,7 +11,8 @@
 #
 # PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy) und Läufe mit
 # validationOnly: true bestehen nur aus Build und Tests samt Secret-Scan: kein Plan, kein
-# Deploy, keine Service Connection.
+# Deploy, keine Service Connection. Eigene Schritte im Build (extraBuildSteps) laufen in
+# beiden Fällen mit.
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -53,6 +54,15 @@ parameters:
   - name: smokeTest
     type: object
     default: {}
+
+  # Projektspezifische Schritte im Build-Job, etwa eine zusätzliche Prüfung, ein Lint oder ein
+  # weiteres Paket, das mit dem Frontend ausgeliefert wird. Sie laufen nach Build und Tests von API
+  # und Frontend und vor dem Veröffentlichen des Artefakts web, auch im PR-Lauf. Arbeitsverzeichnis
+  # ist der Checkout; was ein Schritt nach <frontendPath>/dist legt, geht mit ins Artefakt web.
+  # Scheitert ein Schritt, scheitert der Build. Die Schritte bekommen keine Service Connection.
+  - name: extraBuildSteps
+    type: stepList
+    default: []
 
   # Löschen von Daten bestätigen. Ein Plan, der Ressourcen aus protectedResourceTypes löscht
   # oder ersetzt, bricht sonst ab. Projekte reichen dafür einen Laufzeitparameter durch
@@ -204,10 +214,16 @@ stages:
               - script: npm run build
                 displayName: npm run build
                 workingDirectory: ${{ parameters.frontendPath }}
-              - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
-                  - publish: ${{ parameters.frontendPath }}/dist
-                    artifact: web
-                    displayName: Artefakt web
+
+          # Projektspezifische Schritte (Parameter extraBuildSteps), nach den Builds und vor dem
+          # Artefakt web, damit sie Dateien ins Frontend legen können.
+          - ${{ each step in parameters.extraBuildSteps }}:
+              - ${{ step }}
+
+          - ${{ if and(parameters.frontend, not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly))) }}:
+              - publish: ${{ parameters.frontendPath }}/dist
+                artifact: web
+                displayName: Artefakt web
 
   # PR-Läufe enden nach dem Build: Plan, Apply und Deploy entstehen gar nicht erst, damit
   # brauchen sie weder Service Connection noch Environments.
