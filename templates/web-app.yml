@@ -5,7 +5,8 @@
 #   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert
 #   apply_<env>   nur bei Änderungen: Freigabe (Check am Environment <project>-<env>),
 #                 dann terraform apply des geprüften Plans
-#   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test
+#   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test, mit
+#                 features.customConnector der Custom Connector der Power Platform
 #                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
 # Mit frontend: false (Projekt ohne Frontend) entfallen alle Schritte der Static Web App.
 #
@@ -188,6 +189,7 @@ stages:
                   --no-restore
                   --output $(Build.ArtifactStagingDirectory)/api
                   -p:InformationalVersion=$(Build.BuildNumber)
+                  -p:SeedOpenApiPublishDir=$(Build.ArtifactStagingDirectory)/openapi
                 displayName: dotnet publish
               - task: ArchiveFiles@2
                 displayName: Paket packen
@@ -199,6 +201,21 @@ stages:
               - publish: $(Build.ArtifactStagingDirectory)/api.zip
                 artifact: api
                 displayName: Artefakt api
+              # OpenAPI-Dokument aus Bfs.Seed.OpenApi für den Custom Connector. Das Artefakt gibt es
+              # immer, damit der Deploy es ohne Kenntnis der Features laden kann.
+              - bash: |
+                  set -euo pipefail
+                  dir="$(Build.ArtifactStagingDirectory)/openapi"
+                  mkdir -p "$dir"
+                  if [ -f "$dir/openapi.json" ]; then
+                    echo "OpenAPI-Dokument: $(wc -c < "$dir/openapi.json") Bytes"
+                  else
+                    echo "Kein OpenAPI-Dokument (Paket Bfs.Seed.OpenApi nicht im API-Projekt)." | tee "$dir/README.txt"
+                  fi
+                displayName: OpenAPI-Dokument
+              - publish: $(Build.ArtifactStagingDirectory)/openapi
+                artifact: openapi
+                displayName: Artefakt openapi
 
           - ${{ if parameters.frontend }}:
               - task: UseNode@1
@@ -386,6 +403,8 @@ stages:
                               artifact: web
                         - download: current
                           artifact: tfoutputs_${{ env.name }}
+                        - download: current
+                          artifact: openapi
 
                         - bash: |
                             set -euo pipefail
@@ -545,3 +564,11 @@ stages:
                             frontend: ${{ parameters.frontend }}
                             smokeTest: ${{ parameters.smokeTest }}
                             projectDir: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}
+
+                        # Nach dem Smoke-Test, damit der Connector erst auf die neue Version zeigt,
+                        # wenn sie läuft. Ohne Output custom_connector tut der Schritt nichts.
+                        - template: steps/custom-connector.yml
+                          parameters:
+                            serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                            outputsFile: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json
+                            openApiFile: $(Pipeline.Workspace)/openapi/openapi.json
