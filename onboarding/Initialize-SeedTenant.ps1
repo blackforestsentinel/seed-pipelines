@@ -21,6 +21,9 @@
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
          (entfällt mit -SkipScaffold)
       8. Azure DevOps: GitHub-Service-Connection für alle Pipelines
+      9. Power Platform (nur mit -PowerPlatformEnvironmentUrl): die Deployment-Identität als
+         Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Umgebung, damit
+         die Pipeline Custom Connectors anlegen, aktualisieren und teilen kann
 
     Weitere Subscription im selben Tenant: Skript erneut ausführen, mit eigener -IdentityName
     und eigener -ServiceConnectionName. Die Rolle "Sentinel Seed Lock Contributor" ist im
@@ -37,7 +40,8 @@
     Administratorin oder ein Administrator frei.
 
     Ausführen mit einem Konto, das Owner der Subscription, Global Administrator (oder
-    Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist.
+    Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist; mit
+    -PowerPlatformEnvironmentUrl zusätzlich System Administrator in diesen Umgebungen.
     Muss die Rolle für Löschsperren um eine Subscription erweitert werden, braucht das Konto
     auch auf den Subscriptions, in denen sie schon zuweisbar ist, das Recht, Rollendefinitionen
     zu schreiben (Owner oder User Access Administrator).
@@ -49,6 +53,12 @@
 .PARAMETER SkipScaffold
     Repo und Pipeline seed-scaffold weglassen: für Projekte, die migriert statt neu angelegt
     werden. Das bestehende Repo richtet danach onboarding/Initialize-SeedProject.ps1 ein.
+
+.PARAMETER PowerPlatformEnvironmentUrl
+    Umgebungs-URL (Dataverse) jeder Power-Platform-Umgebung, in der Seed-Projekte mit
+    features.customConnector einen Connector anlegen, z. B. https://org0000000.crm4.dynamics.com
+    (Power Platform Admin Center, Umgebung, „Umgebungs-URL“). Die Umgebung braucht Dataverse.
+    Weitere Umgebungen später: Skript erneut mit allen gewünschten URLs ausführen.
 
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts.
@@ -71,6 +81,7 @@ param(
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
     [string] $SeedPipelinesVersion = 'v0.7.0',
+    [string[]] $PowerPlatformEnvironmentUrl = @(),
     [switch] $SkipScaffold,
     [switch] $DryRun
 )
@@ -495,6 +506,37 @@ try {
         } | Out-Null
     } else {
         Write-Host '          folgt, sobald die GitHub-Service-Connection besteht (Schritt 6)'
+    }
+
+    # --- 9. Power Platform -------------------------------------------------------------------
+    # Custom Connectors liegen in Dataverse (Tabelle connector). Environment Maker darf eigene
+    # Connectors anlegen, ändern und teilen; mehr braucht die Pipeline nicht.
+    if ($PowerPlatformEnvironmentUrl) {
+        Write-Host '9. Power Platform'
+        foreach ($environmentUrl in $PowerPlatformEnvironmentUrl | ForEach-Object { $_.TrimEnd('/') }) {
+            $token = az account get-access-token --resource $environmentUrl --query accessToken -o tsv
+            $dv = @{ Headers = @{ Authorization = "Bearer $token"; Accept = 'application/json' }; ContentType = 'application/json' }
+            $api = "$environmentUrl/api/data/v9.2"
+            $rootUnit = (Invoke-RestMethod @dv "$api/businessunits?`$select=businessunitid&`$filter=_parentbusinessunitid_value eq null").value[0].businessunitid
+            # Die Rolle hat in der Root-Business-Unit überall dieselbe ID; der Name kann je nach
+            # Sprache der Umgebung abweichen und dient nur als Rückfall.
+            $role = (Invoke-RestMethod @dv "$api/roles?`$select=roleid,name&`$filter=_businessunitid_value eq $rootUnit and (roleid eq d58407f2-48d5-e711-a82c-000d3a37c848 or name eq 'Environment Maker')").value |
+                Select-Object -First 1
+            if (-not $role) { throw "Rolle Environment Maker in $environmentUrl nicht gefunden." }
+            $findUser = { if ($app) { (Invoke-RestMethod @dv "$api/systemusers?`$select=systemuserid&`$filter=applicationid eq $($app.appId)").value | Select-Object -First 1 } }
+            $user = Invoke-Step "Anwendungsbenutzer $IdentityName in $environmentUrl" $findUser {
+                $body = @{ applicationid = $app.appId; 'businessunitid@odata.bind' = "/businessunits($rootUnit)" } | ConvertTo-Json
+                Invoke-RestMethod @dv -Method Post -Body $body "$api/systemusers" | Out-Null
+                & $findUser
+            }
+            Invoke-Step "Rolle $($role.name) für $IdentityName in $environmentUrl" {
+                if ($user) { (Invoke-RestMethod @dv "$api/systemusers($($user.systemuserid))/systemuserroles_association?`$select=roleid").value | Where-Object roleid -eq $role.roleid }
+            } {
+                $body = @{ '@odata.id' = "$api/roles($($role.roleid))" } | ConvertTo-Json
+                Invoke-RestMethod @dv -Method Post -Body $body "$api/systemusers($($user.systemuserid))/systemuserroles_association/`$ref" | Out-Null
+                $true
+            } | Out-Null
+        }
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------

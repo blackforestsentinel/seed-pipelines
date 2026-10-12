@@ -1,0 +1,182 @@
+# Custom Connector der Power Platform (features.customConnector in project.yaml): legt den
+# Connector aus dem OpenAPI-Dokument des Builds an oder aktualisiert ihn, trägt Redirect-URI und
+# Federated Credential an seiner Client-Registrierung ein und teilt ihn. Ohne Terraform-Output
+# custom_connector (Feature aus oder keine Power-Platform-Umgebung für diese Umgebung) tut er
+# nichts.
+#
+# Der Connector liegt in Dataverse (Tabelle connectors), wie bei pac connector create/update. Die
+# Pipeline-Identität braucht dort einen Anwendungsbenutzer mit Environment Maker (Onboarding,
+# -PowerPlatformEnvironmentUrl). Der Connector meldet sich ohne Secret an: Managed Identity des
+# Connectors (Preview der Power Platform) plus Federated Credential an der Client-Registrierung.
+# Redirect-URI und Federated Credential enthalten eine Endung der Power-Platform-Umgebung, die
+# erst der angelegte Connector kennt; deshalb trägt sie dieser Schritt ein und nicht Terraform.
+# Die Pipeline ist Besitzerin der Registrierung (Modul sso), Application.ReadWrite.OwnedBy genügt.
+parameters:
+  - name: serviceConnection
+    type: string
+  # outputs.json aus Plan bzw. Apply
+  - name: outputsFile
+    type: string
+  # openapi.json aus dem Build (Paket Bfs.Seed.OpenApi)
+  - name: openApiFile
+    type: string
+
+steps:
+  - task: AzureCLI@2
+    displayName: Custom Connector
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        function Fail([string] $message) {
+          Write-Host "##vso[task.logissue type=error]$message"
+          exit 1
+        }
+
+        $c = (Get-Content -Raw '${{ parameters.outputsFile }}' | ConvertFrom-Json).custom_connector
+        if (-not $c) {
+          Write-Host 'Kein Custom Connector in dieser Umgebung (features.customConnector, customConnector.environmentUrl).'
+          exit 0
+        }
+        if (-not (Test-Path '${{ parameters.openApiFile }}')) {
+          Fail 'features.customConnector braucht das OpenAPI-Dokument aus dem Build: Paket Bfs.Seed.OpenApi im API-Projekt (README von seed-template, customConnector).'
+        }
+
+        # --- Dokument: Host dieser Umgebung -------------------------------------------------------
+        $swagger = Get-Content -Raw '${{ parameters.openApiFile }}' | ConvertFrom-Json
+        $swagger | Add-Member -NotePropertyName host -NotePropertyValue ([uri]'$(tf_function_app_url)').Host -Force
+        $definition = $swagger | ConvertTo-Json -Depth 100 -Compress
+        if ([Text.Encoding]::UTF8.GetByteCount($definition) -ge 1MB) {
+          Fail 'Das OpenAPI-Dokument ist größer als 1 MB; mehr nimmt die Power Platform nicht an.'
+        }
+
+        # --- Dataverse ----------------------------------------------------------------------------
+        $environmentUrl = $c.environmentUrl.TrimEnd('/')
+        $api = "$environmentUrl/api/data/v9.2"
+        $token = az account get-access-token --resource $environmentUrl --query accessToken -o tsv
+        $dv = @{ Headers = @{ Authorization = "Bearer $token"; Accept = 'application/json' }; ContentType = 'application/json; charset=utf-8' }
+        try {
+          Invoke-RestMethod @dv "$api/WhoAmI" | Out-Null
+        }
+        catch {
+          Fail "Kein Zugriff auf $environmentUrl ($($_.Exception.Message)). Die Pipeline-Identität braucht dort einen Anwendungsbenutzer mit Environment Maker: onboarding/Initialize-SeedTenant.ps1 mit -PowerPlatformEnvironmentUrl $environmentUrl ausführen."
+        }
+
+        # Name mit dem Präfix des Standard-Publishers; er bleibt, auch wenn sich der Anzeigename ändert.
+        $prefix = (Invoke-RestMethod @dv "$api/solutions?`$select=uniquename&`$filter=uniquename eq 'Default'&`$expand=publisherid(`$select=customizationprefix)").value[0].publisherid.customizationprefix
+        $name = "$($prefix)_$($c.name)"
+
+        # Anmeldung mit Entra ID im Namen der Person, ohne Secret: Managed Identity des Connectors.
+        $parameters = [ordered]@{
+          token             = [ordered]@{
+            type          = 'oauthSetting'
+            oAuthSettings = [ordered]@{
+              identityProvider    = 'aad'
+              clientId            = $c.clientId
+              clientAssertionType = 'GenericFederatedIdentityCredential'
+              scopes              = @()
+              redirectMode        = 'GlobalPerConnector'
+              properties          = [ordered]@{
+                IsFirstParty                   = 'False'
+                AzureActiveDirectoryResourceId = $c.resourceUri
+                IsOnbehalfofLoginSupported     = $false
+              }
+              customParameters    = [ordered]@{
+                LoginUri              = @{ value = 'https://login.microsoftonline.com' }
+                TenantId              = @{ value = $c.tenantId }
+                ResourceUri           = @{ value = $c.resourceUri }
+                EnableOnbehalfOfLogin = @{ value = 'false' }
+                grantType             = @{ value = 'authorization_code_with_federated_identity_credentials' }
+              }
+            }
+            uiDefinition  = [ordered]@{
+              displayName = 'OAuth Connection'
+              description = 'OAuth Connection'
+              constraints = @{ required = 'true'; hidden = 'false' }
+            }
+          }
+          'token:TenantId' = [ordered]@{
+            type         = 'string'
+            metadata     = @{ sourceType = 'AzureActiveDirectoryTenant' }
+            uiDefinition = @{ constraints = @{ required = 'false'; hidden = 'true' } }
+          }
+        }
+
+        $description = [string]$swagger.info.description
+        $body = [ordered]@{
+          displayname          = $c.displayName
+          description          = $description.Substring(0, [Math]::Min($description.Length, 1000))
+          iconbrandcolor       = $c.iconBrandColor
+          openapidefinition    = $definition
+          connectionparameters = $parameters | ConvertTo-Json -Depth 20 -Compress
+        }
+        $existing = (Invoke-RestMethod @dv "$api/connectors?`$select=connectorid&`$filter=name eq '$name'").value | Select-Object -First 1
+        if ($existing) {
+          $id = $existing.connectorid
+          Invoke-RestMethod @dv -Method Patch -Body ($body | ConvertTo-Json -Depth 5) "$api/connectors($id)" | Out-Null
+          Write-Host "Connector $name aktualisiert."
+        }
+        else {
+          $body.name = $name
+          $body.connectortype = 1
+          $create = $dv.Clone()
+          $create.Headers = $dv.Headers + @{ Prefer = 'return=representation' }
+          $created = Invoke-RestMethod @create -Method Post -Body ($body | ConvertTo-Json -Depth 5) "$api/connectors?`$select=connectorid"
+          $id = $created.connectorid
+          Write-Host "Connector $name angelegt."
+        }
+
+        $row = Invoke-RestMethod @dv "$api/connectors($id)?`$select=connectorinternalid,connectionparameters"
+        $oauth = ($row.connectionparameters | ConvertFrom-Json).token.oAuthSettings
+        $redirect = $oauth.redirectUrl
+        $fic = $oauth.properties.FederatedIdentityCredentials
+        if (-not $redirect -or -not $fic.Subject) {
+          Fail "Die Power Platform hat für $name keine Redirect-URI oder keine Managed Identity vergeben (Option ist Preview)."
+        }
+
+        # --- Client-Registrierung: Redirect-URI und Federated Credential --------------------------
+        $app = az ad app show --id $c.clientId -o json | ConvertFrom-Json
+        $uris = @($app.web.redirectUris)
+        if ($uris -notcontains $redirect) {
+          az ad app update --id $c.clientId --web-redirect-uris @($uris + $redirect) -o none
+          Write-Host "Redirect-URI ergänzt: $redirect"
+        }
+        $fics = @(az ad app federated-credential list --id $c.clientId -o json | ConvertFrom-Json)
+        if (-not ($fics | Where-Object { $_.issuer -eq $fic.Issuer -and $_.subject -eq $fic.Subject })) {
+          $file = New-TemporaryFile
+          @{ name = "power-platform-$id"; issuer = $fic.Issuer; subject = $fic.Subject; audiences = @($fic.Audience ?? 'api://AzureADTokenExchange') } |
+            ConvertTo-Json | Set-Content -Path $file -Encoding utf8NoBOM
+          az ad app federated-credential create --id $c.clientId --parameters "@$file" -o none
+          Remove-Item $file
+          Write-Host "Federated Credential ergänzt: $($fic.Subject)"
+        }
+
+        # --- Freigabe ------------------------------------------------------------------------------
+        # Basic User liest Connectors nur auf Benutzerebene; ohne Freigabe sähe nur die Pipeline den
+        # Connector. everyone: Lesen für das Standardteam der Root-Business-Unit, also alle.
+        $rootUnit = (Invoke-RestMethod @dv "$api/businessunits?`$select=businessunitid&`$filter=_parentbusinessunitid_value eq null").value[0].businessunitid
+        $team = (Invoke-RestMethod @dv "$api/teams?`$select=teamid,name&`$filter=isdefault eq true and _businessunitid_value eq $rootUnit").value[0]
+        $target = @{ '@odata.type' = 'Microsoft.Dynamics.CRM.connector'; connectorid = $id }
+        $principal = @{ '@odata.type' = 'Microsoft.Dynamics.CRM.team'; teamid = $team.teamid }
+        $shared = (Invoke-RestMethod @dv "$api/RetrieveSharedPrincipalsAndAccess(Target=@t)?@t={'@odata.id':'connectors($id)'}").PrincipalAccesses |
+          Where-Object { $_.Principal.ownerid -eq $team.teamid }
+        if ($c.shareWith -eq 'everyone' -and -not $shared) {
+          $grant = @{ Target = $target; PrincipalAccess = @{ Principal = $principal; AccessMask = 'ReadAccess' } }
+          Invoke-RestMethod @dv -Method Post -Body ($grant | ConvertTo-Json -Depth 5) "$api/GrantAccess" | Out-Null
+          Write-Host "Geteilt mit allen (Team $($team.name))."
+        }
+        elseif ($c.shareWith -ne 'everyone' -and $shared) {
+          $revoke = @{ Target = $target; Revokee = $principal }
+          Invoke-RestMethod @dv -Method Post -Body ($revoke | ConvertTo-Json -Depth 5) "$api/RevokeAccess" | Out-Null
+          Write-Host 'Freigabe für alle entzogen (shareWith: none).'
+        }
+
+        Write-Host ''
+        Write-Host "Custom Connector: $($c.displayName) ($($row.connectorinternalid))"
+        Write-Host "  Umgebung:     $environmentUrl"
+        Write-Host "  Backend:      https://$($swagger.host)$($swagger.basePath)"
+        Write-Host "  Redirect-URI: $redirect"
+        Write-Host "  Freigabe:     $($c.shareWith)"
