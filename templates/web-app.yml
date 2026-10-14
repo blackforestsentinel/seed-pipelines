@@ -12,8 +12,8 @@
 #
 # PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy) und Läufe mit
 # validationOnly: true bestehen nur aus Build und Tests samt Secret-Scan: kein Plan, kein
-# Deploy, keine Service Connection. Eigene Schritte im Build (extraBuildSteps) laufen in
-# beiden Fällen mit.
+# Deploy, keine Service Connection. Eigene Schritte im Build (preBuildSteps, extraBuildSteps)
+# laufen in beiden Fällen mit.
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -55,6 +55,15 @@ parameters:
   - name: smokeTest
     type: object
     default: {}
+
+  # Projektspezifische Schritte im Build-Job vor dotnet restore und npm ci, etwa die Anmeldung an
+  # einem privaten Paket-Feed (NuGetAuthenticate@1, npmAuthenticate@0). Sie laufen nach terraform
+  # validate und der Einrichtung des .NET SDK, auch im PR-Lauf. Arbeitsverzeichnis ist der
+  # Checkout. Scheitert ein Schritt, scheitert der Build. Die Schritte bekommen keine
+  # Azure-Service-Connection.
+  - name: preBuildSteps
+    type: stepList
+    default: []
 
   # Projektspezifische Schritte im Build-Job, etwa eine zusätzliche Prüfung, ein Lint oder ein
   # weiteres Paket, das mit dem Frontend ausgeliefert wird. Sie laufen nach Build und Tests von API
@@ -178,7 +187,24 @@ stages:
             condition: and(succeeded(), ne(variables.dotnetSdkReady, 'true'))
             inputs:
               useGlobalJson: true
-          - script: dotnet restore ${{ parameters.apiSolution }}
+
+          # Projektspezifische Schritte (Parameter preBuildSteps) vor dem ersten Restore, damit etwa
+          # die Anmeldung an einem privaten Feed für dotnet restore und npm ci gilt.
+          - ${{ each step in parameters.preBuildSteps }}:
+              - ${{ step }}
+
+          # Fehlt die Anmeldung an einem privaten Feed, wiederholt dotnet restore die Anfrage mit
+          # NU1301 (401) ohne Ende, und der Job stünde bis zu seinem Timeout. Sonst dauert der
+          # Restore keine Minute.
+          - bash: |
+              set -uo pipefail
+              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }}
+              code=$?
+              # 124: timeout, 137: nach weiteren 30 s hart beendet
+              if [ "$code" = 124 ] || [ "$code" = 137 ]; then
+                echo "##vso[task.logissue type=error]dotnet restore nach 10 Minuten abgebrochen. Meldet das Log NU1301 mit 401, fehlt die Anmeldung an einem privaten Feed (Parameter preBuildSteps, README von seed-pipelines: Privater Paket-Feed)."
+              fi
+              exit "$code"
             displayName: dotnet restore
           - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore
             displayName: dotnet test

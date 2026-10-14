@@ -1,5 +1,6 @@
 # Vorschau-Beispiel: Prüflauf wie im PR (validationOnly). Erwartet: Secret-Scan, Build und Tests,
-# die eigenen Schritte, aber weder Artefakte noch Plan, Apply oder Deploy. Ohne Service Connection.
+# die eigenen Schritte (Anmeldung am Feed vor dotnet restore), aber weder Artefakte noch Plan,
+# Apply oder Deploy. Ohne Service Connection.
 # Platzhalter: __GITHUB_CONNECTION__.
 trigger: none
 pr: none
@@ -22,6 +23,9 @@ extends:
       storageAccount: stpreview
       container: tfstate
     validationOnly: true
+    preBuildSteps:
+      - task: NuGetAuthenticate@1
+        displayName: Anmeldung am Feed (Beispiel)
     extraBuildSteps:
       - script: echo lint
         displayName: Lint (Beispiel)
