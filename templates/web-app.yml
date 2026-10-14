@@ -12,8 +12,8 @@
 #
 # PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy) und Läufe mit
 # validationOnly: true bestehen nur aus Build und Tests samt Secret-Scan: kein Plan, kein
-# Deploy, keine Service Connection. Eigene Schritte im Build (extraBuildSteps) laufen in
-# beiden Fällen mit.
+# Deploy, keine Service Connection. Eigene Schritte im Build (preBuildSteps, extraBuildSteps)
+# laufen in beiden Fällen mit.
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -55,6 +55,15 @@ parameters:
   - name: smokeTest
     type: object
     default: {}
+
+  # Projektspezifische Schritte im Build-Job vor dotnet restore und npm ci, etwa die Anmeldung an
+  # einem privaten Paket-Feed (NuGetAuthenticate@1, npmAuthenticate@0). Sie laufen nach terraform
+  # validate und der Einrichtung des .NET SDK, auch im PR-Lauf. Arbeitsverzeichnis ist der
+  # Checkout. Scheitert ein Schritt, scheitert der Build. Die Schritte bekommen keine
+  # Azure-Service-Connection.
+  - name: preBuildSteps
+    type: stepList
+    default: []
 
   # Projektspezifische Schritte im Build-Job, etwa eine zusätzliche Prüfung, ein Lint oder ein
   # weiteres Paket, das mit dem Frontend ausgeliefert wird. Sie laufen nach Build und Tests von API
@@ -178,6 +187,12 @@ stages:
             condition: and(succeeded(), ne(variables.dotnetSdkReady, 'true'))
             inputs:
               useGlobalJson: true
+
+          # Projektspezifische Schritte (Parameter preBuildSteps) vor dem ersten Restore, damit etwa
+          # die Anmeldung an einem privaten Feed für dotnet restore und npm ci gilt.
+          - ${{ each step in parameters.preBuildSteps }}:
+              - ${{ step }}
+
           - script: dotnet restore ${{ parameters.apiSolution }}
             displayName: dotnet restore
           - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore

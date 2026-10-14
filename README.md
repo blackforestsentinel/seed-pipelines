@@ -35,6 +35,8 @@ extends:
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # frontend: false                             # Projekt ohne Frontend (nur API)
+    # preBuildSteps:                              # vor dem Restore, etwa privater Feed, siehe unten
+    #   - task: NuGetAuthenticate@1
     # extraBuildSteps:                            # eigene Schritte im Build, siehe unten
     #   - script: npm run lint
     #     displayName: Lint
@@ -45,7 +47,7 @@ extends:
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert. Ohne Änderungen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector |
@@ -75,6 +77,29 @@ Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester
 Löscht oder ersetzt ein Plan Ressourcen mit Daten, endet der Lauf in `plan_<env>` mit einer Liste dieser Ressourcen, noch vor jeder Freigabe. Geschützt sind standardmäßig Storage Accounts samt Tabellen, Queues, Containern und Freigaben, Key Vaults, Log-Analytics-Workspaces und Löschsperren (`protectedResourceTypes`). Das trifft etwa eine Tabelle, die aus `project.yaml` verschwindet, `storage: false` oder ein Modul-Update, das einen Storage Account ersetzen würde.
 
 Ist das Löschen gewollt, startet man die Pipeline von Hand und kreuzt „Datenlöschung bestätigen“ an (`confirmDataDeletion`, Laufzeitparameter in `azure-pipelines.yml`). Der Plan nennt die betroffenen Ressourcen dann als Warnung, die Freigabe folgt wie immer. Ein Push kann diese Bestätigung nicht mitbringen. In diesem Lauf bekommt Terraform `TF_VAR_allow_data_deletion=true`: Das Modul `storage` hebt damit seine Löschsperre auf, die sonst auch Tabellen, Queues und Container vor dem Löschen schützt. Der nächste Lauf ohne Bestätigung setzt sie wieder; dafür braucht er eine Freigabe.
+
+### Privater Paket-Feed
+
+`dotnet restore` und `npm ci` laufen ohne Anmeldung. Nennt `nuget.config` oder `.npmrc` einen privaten Feed in Azure Artifacts, scheitert der Restore deshalb mit 401 (`NU1301` bzw. `E401`). Die Anmeldung kommt über den Parameter `preBuildSteps` (Typ `stepList`); diese Schritte laufen vor `dotnet restore` und `npm ci`:
+
+```yaml
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    # ...
+    preBuildSteps:
+      - task: NuGetAuthenticate@1
+        displayName: Anmeldung am NuGet-Feed
+      - task: npmAuthenticate@0             # nur mit privatem npm-Feed
+        displayName: Anmeldung am npm-Feed
+        inputs:
+          workingFile: frontend/.npmrc
+```
+
+- **Reihenfolge:** nach Checkout, Abgleich mit `project.yaml`, `terraform validate` und dem .NET SDK laut `global.json`, vor `dotnet restore`. Node in der Version `nodeVersion` richtet das Template erst danach ein; bis dahin gilt die des Images.
+- **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`, denn ohne Restore gibt es keinen Build.
+- **Rechte:** `NuGetAuthenticate@1` und `npmAuthenticate@0` melden sich ohne Secret mit dem Job-Token an, also als `<Projekt> Build Service (<org>)` oder, wenn das Projekt den Job-Scope nicht auf sich beschränkt, als `Project Collection Build Service (<org>)`. Diese Identität braucht am Feed mindestens die Rolle Feed Reader (Feed settings, Permissions). Liegt der Feed in einem anderen Projekt, braucht sie zusätzlich Lesezugriff auf dieses Projekt (Gruppe Readers). Für Feeds einer anderen Organisation oder außerhalb von Azure DevOps nennt der Schritt eine NuGet-Service-Connection des Projekts (`nuGetServiceConnections`). Eine Azure-Service-Connection bekommen die Schritte nicht.
+- Für die Anmeldung taugt `extraBuildSteps` nicht: Diese Schritte laufen erst nach Build und Tests.
 
 ### Eigene Schritte im Build
 
@@ -115,12 +140,15 @@ $common = @{
     PROJECT = '<seed-projekt-im-projekt>'; ENVIRONMENT = '<umgebung>'
   }
 }
-# Normaler Lauf: eigene Schritte nach dem Frontend-Build, vor dem Artefakt web
+# Normaler Lauf: Anmeldung am Feed vor dem Restore, eigene Schritte nach dem Frontend-Build und
+# vor dem Artefakt web
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extra-build-steps.yml `
-  -ExpectBuildSteps 'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web'
+  -ExpectBuildSteps '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
+    'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web'
 # Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'npm run build', 'Lint (Beispiel)' -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
+  -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
+  -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
 ```
 
 - `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
