@@ -80,7 +80,7 @@ Ist das Löschen gewollt, startet man die Pipeline von Hand und kreuzt „Datenl
 
 ### Privater Paket-Feed
 
-`dotnet restore` und `npm ci` laufen ohne Anmeldung. Nennt `nuget.config` oder `.npmrc` einen privaten Feed in Azure Artifacts, scheitert der Restore deshalb mit 401 (`NU1301` bzw. `E401`). Die Anmeldung kommt über den Parameter `preBuildSteps` (Typ `stepList`); diese Schritte laufen vor `dotnet restore` und `npm ci`:
+`dotnet restore` und `npm ci` laufen ohne Anmeldung. Nennt `nuget.config` oder `.npmrc` einen privaten Feed in Azure Artifacts, scheitert der Restore deshalb mit 401 (`NU1301` bzw. `E401`). `dotnet restore` wiederholt die Anfrage dann ohne Ende; das Template bricht es nach 10 Minuten mit einem Hinweis auf diesen Abschnitt ab, statt den Job bis zu seinem Timeout zu blockieren. Die Anmeldung kommt über den Parameter `preBuildSteps` (Typ `stepList`); diese Schritte laufen vor `dotnet restore` und `npm ci`:
 
 ```yaml
 extends:
