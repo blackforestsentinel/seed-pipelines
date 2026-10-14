@@ -1,8 +1,8 @@
-# Vorschau-Beispiel: normaler Lauf mit eigenen Schritten im Build (extraBuildSteps).
-# Erwartet: die eigenen Schritte nach npm run build und vor dem Artefakt web; danach Plan,
-# Apply und Deploy. Platzhalter: __PROJECT__ und __ENVIRONMENT__ (die Environments
-# <projekt>-<umgebung> und <projekt>-<umgebung>-app müssen im Projekt existieren),
-# __SERVICE_CONNECTION__ (ebenso), __GITHUB_CONNECTION__.
+# Vorschau-Beispiel: normaler Lauf mit eigenen Schritten im Build (preBuildSteps, extraBuildSteps).
+# Erwartet: die Anmeldung am Feed vor dotnet restore, die übrigen eigenen Schritte nach npm run
+# build und vor dem Artefakt web; danach Plan, Apply und Deploy. Platzhalter: __PROJECT__ und
+# __ENVIRONMENT__ (die Environments <projekt>-<umgebung> und <projekt>-<umgebung>-app müssen im
+# Projekt existieren), __SERVICE_CONNECTION__ (ebenso), __GITHUB_CONNECTION__.
 trigger: none
 pr: none
 
@@ -27,6 +27,9 @@ extends:
       - name: __ENVIRONMENT__
     smokeTest:
       protectedPath: api/me
+    preBuildSteps:
+      - task: NuGetAuthenticate@1
+        displayName: Anmeldung am Feed (Beispiel)
     extraBuildSteps:
       - script: echo lint
         displayName: Lint (Beispiel)
