@@ -546,6 +546,8 @@ try {
             } | Out-Null
             $true
         } | Out-Null
+        # Mit dem Startinhalt gibt es main; ohne das legte erst ein zweiter Lauf die Branch-Policies an.
+        $hasBranch = -not $DryRun
     } else {
         Write-Host "  [ok]    Branch $DefaultBranch in $Repository (Inhalt bleibt unverändert)"
         $yaml = Get-OrNull {
