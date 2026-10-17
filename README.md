@@ -35,6 +35,8 @@ extends:
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # frontend: false                             # Projekt ohne Frontend (nur API)
+    # extension:                                  # Browser-Erweiterung als zweiter Client, siehe unten
+    #   path: extension
     # preBuildSteps:                              # vor dem Restore, etwa privater Feed, siehe unten
     #   - task: NuGetAuthenticate@1
     # extraBuildSteps:                            # eigene Schritte im Build, siehe unten
@@ -47,10 +49,10 @@ extends:
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert. Ohne Änderungen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
-| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector |
+| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>` |
 
 Ohne Infrastruktur-Änderungen entfällt `apply_<env>` samt Freigabe. Ein Plan, der nur Ressourcen im State verschiebt (`moved`-Blöcke nach einem Update von seed-terraform), zählt nicht als Änderung: Terraform wiederholt die Verschiebung bei jedem Plan und speichert sie mit dem nächsten echten Apply. `deploy_<env>` lässt sich nach einem Fehler einzeln neu starten, weil sie keinen Plan anwendet. Scheitert `apply_<env>` an einem veralteten Plan, braucht es einen neuen Lauf.
 
@@ -144,7 +146,13 @@ $common = @{
 # vor dem Artefakt web
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extra-build-steps.yml `
   -ExpectBuildSteps '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
-    'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web'
+    'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web' `
+  -AbsentBuildSteps 'npm ci (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Artefakt extension'
+# Mit Browser-Erweiterung: ihr Build nach dem Frontend und vor den eigenen Schritten
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
+  -ExpectBuildSteps 'npm run build', 'npm ci (Erweiterung)', 'npm test (Erweiterung)', `
+    'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Lint (Beispiel)', 'Artefakt web', `
+    'Artefakt extension'
 # Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
   -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
@@ -176,6 +184,29 @@ Mit `features.customConnector` in `project.yaml` liefert Terraform den Output `c
 4. Mit `customConnector.shareWith: everyone` (Standard) bekommt das Standardteam der Root-Business-Unit Lesezugriff, also alle Personen der Umgebung. Ohne Freigabe sähe nur die Pipeline den Connector, denn Basic User liest Connectors nur auf Benutzerebene. Was eine Person über den Connector darf, regeln wie im Browser App-Rollen und Capabilities der API.
 
 Voraussetzung: Die Service-Connection-Identität ist in der Power-Platform-Umgebung Anwendungsbenutzer mit der Rolle Environment Maker; das richtet das Onboarding mit `-PowerPlatformEnvironmentUrl` ein. Fehlt das, endet der Schritt mit einem Hinweis darauf. Ohne Output `custom_connector` (Feature aus oder keine Umgebung angegeben) tut er nichts; das Artefakt `openapi` gibt es trotzdem, im Zweifel mit einer Notiz statt des Dokuments.
+
+### Browser-Erweiterung
+
+Eine Browser-Erweiterung für Edge (Manifest V3) kann zweiter Client derselben API sein, mit oder ohne Frontend. Das ist ein Sonderfall: Ohne den Parameter `extension` ändert sich an der Pipeline nichts.
+
+```yaml
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    # ...
+    extension:
+      path: extension                # Ordner mit package.json
+      # outputPath: dist             # Build-Ausgabe relativ zu path, dort liegt manifest.json
+      # name: my-extension           # Dateiname der Pakete, Standard project
+      # storeEnvironments: [prod]    # Pakete für Edge Add-ons, ohne key
+```
+
+- **Build**, auch im PR-Lauf und mit `validationOnly`: nach dem Frontend-Build und vor `extraBuildSteps` `npm ci`, `npm test` und `npm run build` in `path`, mit Node in `nodeVersion`. Danach muss `<path>/<outputPath>/manifest.json` Manifest V3 sein und eine gültige `version` haben. Im Hauptlauf wird die Build-Ausgabe zum Artefakt `extension`.
+- **Deploy:** Als letzter Schritt von `deploy_<env>`, nach Smoke-Test und Custom Connector, entsteht aus einer Kopie das Paket `<name>-<env>.zip` (Artefakt `extension_<env>`, `manifest.json` im Wurzelverzeichnis). Darin `config.json` wie beim Frontend aus dem Output `frontend_config`, aber ohne `auth.redirectBridgePath`, denn die Erweiterung hat keine Bridge-Seite. Anders als sonst gibt es also je Umgebung ein eigenes Paket, weil die Konfiguration im Paket steckt; gebaut und getestet wird trotzdem nur einmal.
+- **Version:** die ersten drei Zahlen aus `version` im `manifest.json` des Repos (fehlende als 0, eine vierte wird ersetzt), dazu die Build-ID als vierte, etwa `1.2.0.2160`. So steigt die Version mit jedem Lauf, wie der Store es verlangt; die ersten drei Stellen pflegt das Team im Repo. Edge erlaubt je Stelle höchstens 65535, eine größere Build-ID bricht ab.
+- **`key`:** Im Paket für die Umgebungen aus `storeEnvironments` entfernt die Pipeline `key` aus dem Manifest, denn Edge Add-ons vergibt die ID selbst. In den übrigen bleibt `key`, damit die entpackte Erweiterung ihre feste ID und damit ihre Redirect-URI behält; fehlt er dort, warnt die Pipeline.
+- **Veröffentlichen von Hand:** Das Paket der Store-Umgebung lädt ein Mensch in Edge Add-ons hoch, die übrigen werden für Tests entpackt geladen. Eine Anbindung an die API von Edge Add-ons gibt es nicht.
+- Redirect-URI und CORS für die Erweiterung setzt das Projekt in `project.yaml` (README von seed-template, „Browser-Erweiterungen“).
 
 ### Voraussetzungen
 

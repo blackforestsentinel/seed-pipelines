@@ -6,14 +6,15 @@
 #   apply_<env>   nur bei Änderungen: Freigabe (Check am Environment <project>-<env>),
 #                 dann terraform apply des geprüften Plans
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test, mit
-#                 features.customConnector der Custom Connector der Power Platform
+#                 features.customConnector der Custom Connector der Power Platform, mit
+#                 extension das Paket der Browser-Erweiterung für diese Umgebung
 #                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
 # Mit frontend: false (Projekt ohne Frontend) entfallen alle Schritte der Static Web App.
 #
 # PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy) und Läufe mit
 # validationOnly: true bestehen nur aus Build und Tests samt Secret-Scan: kein Plan, kein
 # Deploy, keine Service Connection. Eigene Schritte im Build (preBuildSteps, extraBuildSteps)
-# laufen in beiden Fällen mit.
+# laufen in beiden Fällen mit, ebenso Build und Tests der Browser-Erweiterung (extension).
 
 parameters:
   # Projektname, muss mit project.yaml übereinstimmen. Daraus entstehen die Namen der
@@ -42,6 +43,20 @@ parameters:
   - name: frontend
     type: boolean
     default: true
+
+  # Browser-Erweiterung (Edge, Manifest V3) als zweiter Client der API, ein Sonderfall. Ohne path
+  # gibt es keine Erweiterung, und nichts ändert sich. Schlüssel (README: Browser-Erweiterung):
+  #   path               Ordner der Erweiterung mit package.json, z. B. extension
+  #   outputPath         Build-Ausgabe relativ zu path, Standard dist; dort liegt nach
+  #                      npm run build die fertige manifest.json
+  #   name               Dateiname der Pakete ohne Umgebung, Standard project
+  #   storeEnvironments  Umgebungen, deren Paket in den Store geht (Edge Add-ons), Standard
+  #                      [prod]. In deren Paket entfernt die Pipeline key aus dem Manifest, weil
+  #                      der Store die ID selbst vergibt; in den übrigen bleibt key, damit die
+  #                      entpackte Erweiterung ihre feste ID und damit ihre Redirect-URI behält.
+  - name: extension
+    type: object
+    default: {}
 
   # Nur prüfen wie im PR-Lauf (Build, Tests, Secret-Scan), etwa um die PR-Validierung von
   # Hand nachzustellen. PR-Läufe erkennt das Template selbst.
@@ -258,6 +273,50 @@ stages:
                 displayName: npm run build
                 workingDirectory: ${{ parameters.frontendPath }}
 
+          # Browser-Erweiterung (Parameter extension), ein eigenes npm-Projekt. Node richtet sonst
+          # der Frontend-Build ein.
+          - ${{ if parameters.extension.path }}:
+              - ${{ if not(parameters.frontend) }}:
+                  - task: UseNode@1
+                    displayName: Node ${{ parameters.nodeVersion }}
+                    inputs:
+                      version: ${{ parameters.nodeVersion }}
+              - script: npm ci
+                displayName: npm ci (Erweiterung)
+                workingDirectory: ${{ parameters.extension.path }}
+              - script: npm test
+                displayName: npm test (Erweiterung)
+                workingDirectory: ${{ parameters.extension.path }}
+              - script: npm run build
+                displayName: npm run build (Erweiterung)
+                workingDirectory: ${{ parameters.extension.path }}
+              # Prüft auch die Version, aus der der Deploy die Paketversion bildet; ein Fehler fiele
+              # sonst erst nach dem Deploy der API auf.
+              - bash: |
+                  set -euo pipefail
+                  python3 -c '
+                  import json, re, sys
+                  path = sys.argv[1]
+                  def fail(message):
+                      print("##vso[task.logissue type=error]" + message)
+                      sys.exit(1)
+                  try:
+                      manifest = json.load(open(path, encoding="utf-8"))
+                  except FileNotFoundError:
+                      fail(f"{path} fehlt. npm run build muss die fertige Erweiterung samt manifest.json nach extension.outputPath legen (Standard dist).")
+                  except ValueError as error:
+                      fail(f"{path} ist kein gültiges JSON: {error}")
+                  found = manifest.get("manifest_version", "nicht gesetzt")
+                  if found != 3:
+                      fail(f"{path}: manifest_version ist {found}, erwartet 3 (Manifest V3).")
+                  version = manifest.get("version", "")
+                  if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){0,3}", version) or max(map(int, version.split("."))) > 65535:
+                      fail(f"{path}: version ist „{version}“, erwartet bis zu vier Zahlen von 0 bis 65535 ohne führende Nullen, z. B. 1.2.0.")
+                  name = manifest.get("name")
+                  print(f"{path}: {name} {version}, Manifest V3")
+                  ' "${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}/manifest.json"
+                displayName: Manifest der Erweiterung prüfen
+
           # Projektspezifische Schritte (Parameter extraBuildSteps), nach den Builds und vor dem
           # Artefakt web, damit sie Dateien ins Frontend legen können.
           - ${{ each step in parameters.extraBuildSteps }}:
@@ -267,6 +326,10 @@ stages:
               - publish: ${{ parameters.frontendPath }}/dist
                 artifact: web
                 displayName: Artefakt web
+          - ${{ if and(parameters.extension.path, not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly))) }}:
+              - publish: ${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}
+                artifact: extension
+                displayName: Artefakt extension
 
   # PR-Läufe enden nach dem Build: Plan, Apply und Deploy entstehen gar nicht erst, damit
   # brauchen sie weder Service Connection noch Environments.
@@ -431,6 +494,9 @@ stages:
                           artifact: tfoutputs_${{ env.name }}
                         - download: current
                           artifact: openapi
+                        - ${{ if parameters.extension.path }}:
+                            - download: current
+                              artifact: extension
 
                         - bash: |
                             set -euo pipefail
@@ -598,3 +664,19 @@ stages:
                             serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                             outputsFile: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json
                             openApiFile: $(Pipeline.Workspace)/openapi/openapi.json
+
+                        # Paket der Browser-Erweiterung für diese Umgebung (Parameter extension). Nach
+                        # dem Smoke-Test, damit nur Pakete für einen laufenden Stand entstehen, und als
+                        # letzter Schritt nach dem Custom Connector: Pipeline-Artefakte lassen sich nicht
+                        # überschreiben, auch nicht beim Neustart eines gescheiterten Jobs. Stünde das
+                        # Paket davor, käme deploy_<env> nach einem Fehler des Connectors mit einem
+                        # Neustart nicht mehr durch.
+                        - ${{ if parameters.extension.path }}:
+                            - template: steps/extension-package.yml
+                              parameters:
+                                name: ${{ coalesce(parameters.extension.name, parameters.project) }}
+                                environment: ${{ env.name }}
+                                ${{ if parameters.extension.storeEnvironments }}:
+                                  storeEnvironments: ${{ parameters.extension.storeEnvironments }}
+                                outputsFile: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json
+                                buildDir: $(Pipeline.Workspace)/extension
