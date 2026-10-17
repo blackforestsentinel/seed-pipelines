@@ -231,6 +231,18 @@ class RegistryTests(unittest.TestCase):
 
         self.assertProblem(text, "name „abc“ steht schon im Eintrag ab Zeile 2", f"id „{LINK_ID}“ steht schon")
 
+    def test_tenant_template_is_valid(self):
+        template = Path(__file__).resolve().parents[2] / "tenant" / "extensions.yaml"
+        text = template.read_text(encoding="utf-8")
+
+        self.assertEqual(intune.parse_registry(text), [])
+        # Das Beispiel im Kopf, ohne Kommentarzeichen, ist ebenfalls gültig.
+        lines = text.splitlines()
+        start = lines.index("#   extensions:")
+        end = lines.index("#", start)
+        example = "\n".join(line[4:] for line in lines[start:end])
+        self.assertEqual([e.name for e in intune.parse_registry(example)], ["kundenportal"])
+
     def test_read_registry_reports_missing_file(self):
         with self.assertRaises(intune.IntuneError):
             intune.read_registry(str(Path(tempfile.gettempdir(), "gibt-es-nicht.yaml")))

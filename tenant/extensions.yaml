@@ -1,0 +1,25 @@
+# Edge-Erweiterungen, die Intune auf allen verwalteten Windows-Geräten installiert.
+# Die Pipeline __PIPELINE__ hält die Intune-Richtlinie „__POLICY_TEXT__“ gleich dieser Liste:
+# Ein neuer Eintrag installiert die Erweiterung, ein gelöschter deinstalliert sie überall.
+# Änderungen nur per Pull Request (README).
+#
+# Je Erweiterung ein Eintrag:
+#   name       Projekt, wie in project.yaml (3 bis 40 Zeichen: a-z, 0-9, Bindestrich)
+#   id         ID der Erweiterung, 32 Zeichen a bis p (folgt aus ihrem Signaturschlüssel)
+#   updateUrl  https://<api>/api/extension/updates.xml; muss die ID schon ausliefern,
+#              also erst veröffentlichen (Deploy des Projekts), dann eintragen
+#   owner      optional: Ansprechpartner
+#   comment    optional
+#
+# Beispiel (statt „extensions: []“):
+#
+#   extensions:
+#     - name: kundenportal
+#       id: abcdefghijklmnopabcdefghijklmnop
+#       updateUrl: https://func-kundenportal-prod-1a2b3c.azurewebsites.net/api/extension/updates.xml
+#       owner: it@example.org
+#
+# Erlaubt ist nur dieser einfache Aufbau, eingerückt mit Leerzeichen. Werte mit „: “ oder „ #“,
+# Werte, die mit einem Sonderzeichen beginnen, und Werte wie yes oder 2026-01-01 in '…' setzen.
+# Die Prüfung im Pull Request nennt jede Abweichung mit Zeilennummer.
+extensions: []
