@@ -18,7 +18,8 @@ parameters:
     type: string
   - name: environment
     type: string
-  # Umgebungen, deren Paket in den Store geht: ohne key im Manifest
+  # Umgebungen, deren Paket in den Store geht: ohne key im Manifest. Eine Liste oder ein einzelner
+  # Name; join macht aus beidem eine Aufzählung.
   - name: storeEnvironments
     type: object
     default: [prod]
@@ -34,7 +35,8 @@ steps:
       set -euo pipefail
       python3 -c '
       import json, os, re, shutil, sys, zipfile
-      build_dir, outputs_file, package, store, build_id, work_dir, staging_dir = sys.argv[1:]
+      build_dir, outputs_file, package, environment, store_environments, build_id, work_dir, staging_dir = sys.argv[1:]
+      store = environment in [name.strip() for name in store_environments.split(",")]
 
       def fail(message):
           print("##vso[task.logissue type=error]" + message)
@@ -67,7 +69,7 @@ steps:
       print(f"Version: {version} (manifest.json im Repo: {repo_version}, Build-ID {build_id})")
 
       # key: Der Store vergibt die ID selbst; die entpackte Erweiterung behält mit key ihre feste ID.
-      if store != "true":
+      if not store:
           if "key" in manifest:
               print("Paket zum Entpacken, key bleibt.")
           else:
@@ -89,7 +91,7 @@ steps:
               zip_file.write(os.path.join(copy, path), path.replace(os.sep, "/"))
       print(f"{package}.zip: {len(files)} Dateien, {os.path.getsize(archive)} Bytes")
       ' "${{ parameters.buildDir }}" "${{ parameters.outputsFile }}" "${{ parameters.name }}-${{ parameters.environment }}" \
-        "${{ lower(containsValue(parameters.storeEnvironments, parameters.environment)) }}" "$(Build.BuildId)" \
+        "${{ parameters.environment }}" "${{ join(',', parameters.storeEnvironments) }}" "$(Build.BuildId)" \
         "$(Agent.TempDirectory)/extension" "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}"
     displayName: Browser-Erweiterung packen
   - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
