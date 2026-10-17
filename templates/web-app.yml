@@ -411,12 +411,37 @@ stages:
                             exit 1
                           fi
                         fi
+                        # Der Plan enthält den State samt sensibler Werte im Klartext (etwa den
+                        # Deployment-Token der Static Web App). Er liegt deshalb nicht als Artefakt
+                        # am Lauf, das jeder mit Lesezugriff auf die Pipeline laden kann, sondern
+                        # neben dem State im Container, auf den nur die Deployment-Identität kommt.
+                        # apply löscht ihn; Pläne, die nie angewendet wurden (Freigabe abgelehnt oder
+                        # abgelaufen), räumt der nächste Plan nach 31 Tagen ab.
+                        if [ "$changes" = true ]; then
+                          az storage blob upload --auth-mode login --only-show-errors -o none \
+                            --account-name "${{ parameters.terraformState.storageAccount }}" \
+                            --container-name "${{ parameters.terraformState.container }}" \
+                            --name "plans/${{ parameters.project }}/${{ env.name }}/$(Build.BuildId).tfplan" \
+                            --file tfplan --overwrite
+                        fi
+                        rm -f tfplan
+                        # Zeitstempel im Format von az (2026-01-31T12:00:00+00:00), als Text vergleichbar
+                        cutoff="$(date -u -d '31 days ago' +%Y-%m-%dT%H:%M:%S+00:00)"
+                        az storage blob list --auth-mode login --only-show-errors \
+                          --account-name "${{ parameters.terraformState.storageAccount }}" \
+                          --container-name "${{ parameters.terraformState.container }}" \
+                          --prefix "plans/${{ parameters.project }}/${{ env.name }}/" \
+                          --query "[].[name, properties.lastModified]" -o tsv |
+                          while read -r old modified; do
+                            if [[ "$modified" < "$cutoff" ]]; then
+                              az storage blob delete --auth-mode login --only-show-errors -o none \
+                                --account-name "${{ parameters.terraformState.storageAccount }}" \
+                                --container-name "${{ parameters.terraformState.container }}" --name "$old"
+                            fi
+                          done
                         echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
                         mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                         cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
-                  - publish: $(Build.SourcesDirectory)/${{ parameters.infraPath }}/tfplan
-                    artifact: tfplan_${{ env.name }}
-                    displayName: Plan als Artefakt
                   # Ohne Änderungen gelten die Outputs aus dem State; sonst veröffentlicht apply sie.
                   - publish: $(Build.ArtifactStagingDirectory)/tfoutputs
                     artifact: tfoutputs_${{ env.name }}
@@ -441,8 +466,6 @@ stages:
                     deploy:
                       steps:
                         - checkout: self
-                        - download: current
-                          artifact: tfplan_${{ env.name }}
                         - template: steps/terraform-install.yml
                           parameters:
                             version: ${{ parameters.terraformVersion }}
@@ -455,12 +478,24 @@ stages:
                             stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                             outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
                             script: |
-                              if ! terraform apply "$(Pipeline.Workspace)/tfplan_${{ env.name }}/tfplan" 2>&1 | tee apply.log; then
+                              # Der geprüfte Plan aus plan_<env>, abgelegt neben dem State (siehe dort)
+                              plan_blob="plans/${{ parameters.project }}/${{ env.name }}/$(Build.BuildId).tfplan"
+                              plan="$(Agent.TempDirectory)/tfplan"
+                              az storage blob download --auth-mode login --only-show-errors -o none \
+                                --account-name "${{ parameters.terraformState.storageAccount }}" \
+                                --container-name "${{ parameters.terraformState.container }}" \
+                                --name "$plan_blob" --file "$plan"
+                              if ! terraform apply "$plan" 2>&1 | tee apply.log; then
                                 if grep -q "Saved plan is stale" apply.log; then
                                   echo "##vso[task.logissue type=error]Der Plan ist veraltet, weil sich der State seit dem Plan geändert hat. Bitte einen neuen Lauf starten, damit ein frischer Plan zur Freigabe entsteht."
                                 fi
                                 exit 1
                               fi
+                              rm -f "$plan" apply.log
+                              az storage blob delete --auth-mode login --only-show-errors -o none \
+                                --account-name "${{ parameters.terraformState.storageAccount }}" \
+                                --container-name "${{ parameters.terraformState.container }}" \
+                                --name "$plan_blob"
                               mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                               cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
                         - publish: $(Build.ArtifactStagingDirectory)/tfoutputs

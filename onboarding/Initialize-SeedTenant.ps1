@@ -16,7 +16,9 @@
       3. Microsoft Graph: Application.ReadWrite.OwnedBy mit Admin-Consent (Modul sso)
       4. Terraform-State: Resource Group, Storage Account ohne Shared Key, Container;
          Storage Blob Data Contributor nur auf dem Container
-      5. Azure DevOps: Service Connection per Workload Identity Federation
+      5. Azure DevOps: Service Connection per Workload Identity Federation, mit Branch-Prüfung:
+         nur Läufe von -AllowedBranches (Standard main) bekommen die Identität (nicht mit
+         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy)
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
          (entfällt mit -SkipScaffold)
@@ -54,6 +56,12 @@
     Repo und Pipeline seed-scaffold weglassen: für Projekte, die migriert statt neu angelegt
     werden. Das bestehende Repo richtet danach onboarding/Initialize-SeedProject.ps1 ein.
 
+.PARAMETER AllowedBranches
+    Branches, deren Läufe die Azure-Service-Connection nutzen dürfen, Standard main. Ohne diese
+    Prüfung könnte jede Pipeline-Datei aus einem Feature-Branch die Deployment-Identität nutzen,
+    an allen Freigaben vorbei; die hängen an den Environments. Muster wie refs/heads/release/*
+    sind erlaubt. Ein erneuter Lauf mit anderen Branches aktualisiert die Prüfung.
+
 .PARAMETER PowerPlatformEnvironmentUrl
     Umgebungs-URL (Dataverse) jeder Power-Platform-Umgebung, in der Seed-Projekte mit
     features.customConnector einen Connector anlegen, z. B. https://org0000000.crm4.dynamics.com
@@ -82,6 +90,7 @@ param(
     [string[]] $Approvers = @(),
     [string] $SeedPipelinesVersion = 'v0.10.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
+    [string[]] $AllowedBranches = @('main'),
     [switch] $SkipScaffold,
     [switch] $DryRun
 )
@@ -162,6 +171,47 @@ function Get-OrNull([scriptblock] $Command) {
 function Get-Endpoint([string] $Name) {
     az devops service-endpoint list --org $Org --project $AzureDevOpsProject -o json 2>$null |
         ConvertFrom-Json | Where-Object name -eq $Name
+}
+
+# Branch-Prüfung (Check „Branch control“) an einer Service Connection: Läufe anderer Branches
+# bekommen sie nicht, auch keine PR-Läufe. Freigaben hängen an den Environments und hielten
+# eine geänderte Pipeline-Datei auf einem Feature-Branch nicht auf, die die Service Connection
+# direkt nutzt. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert.
+$BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
+$BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
+$AllowedBranchRefs = @($AllowedBranches | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+        ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) -join ','
+
+function Set-BranchControl([object] $Endpoint, [string] $ProjectId) {
+    $checks = "$Org/$ProjectId/_apis/pipelines/checks/configurations"
+    $title = "Branch-Prüfung an $($Endpoint.name): $AllowedBranchRefs"
+    $existing = (Invoke-AzDevOps get "$checks`?resourceType=endpoint&resourceId=$($Endpoint.id)&`$expand=settings&api-version=7.1-preview.1" $null).value |
+        Where-Object { $_.type.id -eq $BranchControlCheckType -and $_.settings.definitionRef.id -eq $BranchControlDefinition } |
+        Select-Object -First 1
+    $body = @{
+        type     = @{ id = $BranchControlCheckType; name = 'Task Check' }
+        resource = @{ type = 'endpoint'; id = "$($Endpoint.id)"; name = $Endpoint.name }
+        settings = @{
+            definitionRef = @{ id = $BranchControlDefinition; name = 'evaluatebranchProtection'; version = '0.0.1' }
+            displayName   = 'Sentinel Seed: nur freigegebene Branches'
+            inputs        = @{ allowedBranches = $AllowedBranchRefs; ensureProtectionOfBranch = 'false'; allowUnknownStatusBranch = 'false' }
+        }
+        timeout  = 1440
+    }
+    if ($existing -and $existing.settings.inputs.allowedBranches -ne $AllowedBranchRefs) {
+        if ($DryRun) {
+            Write-Host "  [alt]   $title (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Yellow
+            $missing.Add($title)
+            return
+        }
+        $body.id = $existing.id
+        Invoke-AzDevOps patch "$checks/$($existing.id)?api-version=7.1-preview.1" $body | Out-Null
+        Write-Host "  [neu]   $title (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Green
+        return
+    }
+    Invoke-Step $title { $existing } {
+        Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
+    } | Out-Null
 }
 
 function Invoke-Arm([string] $Method, [string] $Url, [string] $BodyFile) {
@@ -424,6 +474,15 @@ try {
             az ad app federated-credential create --id $app.appId --parameters $file -o none
             $true
         } | Out-Null
+    }
+    if ($SkipScaffold) {
+        Write-Host '          Branch-Prüfung folgt mit Initialize-SeedProject.ps1 -EnableBranchPolicy: bis zum Umschalten'
+        Write-Host '          testet die Migration auf einem eigenen Branch.'
+    } elseif ($endpoint) {
+        Set-BranchControl $endpoint $project.id
+    } else {
+        Write-Host "  [fehlt] Branch-Prüfung an $ServiceConnectionName" -ForegroundColor Yellow
+        $missing.Add("Branch-Prüfung an $ServiceConnectionName")
     }
 
     # --- 6. GitHub-Service-Connection ------------------------------------------------------

@@ -50,13 +50,19 @@ extends:
 | Stage | Inhalt |
 | --- | --- |
 | `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
-| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert. Ohne Änderungen die Outputs als Artefakt `tfoutputs_<env>` |
+| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>` |
 
 Ohne Infrastruktur-Änderungen entfällt `apply_<env>` samt Freigabe. Ein Plan, der nur Ressourcen im State verschiebt (`moved`-Blöcke nach einem Update von seed-terraform), zählt nicht als Änderung: Terraform wiederholt die Verschiebung bei jedem Plan und speichert sie mit dem nächsten echten Apply. `deploy_<env>` lässt sich nach einem Fehler einzeln neu starten, weil sie keinen Plan anwendet. Scheitert `apply_<env>` an einem veralteten Plan, braucht es einen neuen Lauf.
 
 Umgebungen laufen in der Reihenfolge der Liste nacheinander.
+
+### Plan neben dem State
+
+Eine Plan-Datei enthält den State samt aller sensiblen Werte im Klartext, etwa den Deployment-Token der Static Web App. Als Artefakt am Lauf könnte sie jeder laden, der die Pipeline lesen darf, und mit dem Token eigene Inhalte auf die Web-App deployen. Der Plan liegt deshalb im Container des Terraform-States unter `plans/<project>/<env>/<Build.BuildId>.tfplan`; dort kommt nur hin, wer auch den State lesen darf. `apply_<env>` lädt ihn von dort und löscht ihn nach dem Apply. Pläne, die nie angewendet werden (Freigabe abgelehnt oder abgelaufen), löscht der nächste Plan derselben Umgebung nach 31 Tagen. Die Deployment-Identität braucht dafür keine weiteren Rechte: `Storage Blob Data Contributor` auf dem Container hat sie aus dem Onboarding.
+
+Bis v0.10.0 lag der Plan als Artefakt `tfplan_<env>` am Lauf. Wer von dort umsteigt, setzt nach dem ersten Lauf mit der neuen Version die Deployment-Tokens der Static Web Apps zurück (`az staticwebapp secrets reset-api-key --name <swa> --resource-group <rg>`); der Deploy liest den Token jedes Mal neu. Die alten Artefakte enthalten dann nur noch ungültige Tokens. Die übrigen Schlüssel im State (Storage, Application Insights) sind ohne Wirkung, weil die Seed-Module Shared Key und lokale Anmeldung abschalten.
 
 ### Laufzeit
 
