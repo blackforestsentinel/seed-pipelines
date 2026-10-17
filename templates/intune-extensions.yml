@@ -1,0 +1,169 @@
+# Sentinel Seed: die eine Intune-Richtlinie für die Edge-Erweiterungen aller Seed-Projekte.
+#
+# Eine Pipeline je Tenant (Repo seed-tenant, Vorlage tenant/ in diesem Repo) bindet das Template
+# per extends ein. Intune erlaubt ExtensionInstallForcelist nur in einer Richtlinie; diese Pipeline
+# besitzt sie ganz und setzt sie auf die Einträge der Registerdatei, zugewiesen an alle Benutzer.
+#   plan   Registerdatei prüfen (Format, je Erweiterung updates.xml mit der richtigen ID), dann
+#          scripts/intune/intune.py plan gegen Intune; merkt sich, ob sich etwas ändert
+#   apply  nur bei Änderungen: Deployment-Job im Environment (dort hängt die Freigabe), wendet
+#          denselben Plan an und prüft danach die Richtlinie
+#
+# PR-Läufe (Build.Reason PullRequest, ausgelöst von der Branch-Policy in seed-tenant) und Läufe mit
+# validationOnly: true prüfen nur die Registerdatei: kein Plan, kein Apply, keine Service
+# Connection. Trigger gehören ins YAML des Tenants (trigger: mit paths), nicht ins Template.
+#
+# Die Service Connection (Identität mit DeviceManagementConfiguration.ReadWrite.All) richtet
+# onboarding/Initialize-SeedIntune.ps1 ein, mit den Checks „Branch control“ und „Required
+# template“ (dieses Template auf dem Tag aus resources): Nur Läufe von main, die dieses Template
+# einbinden, bekommen die Identität.
+#
+# Neues Muster: Das Template checkt neben self auch seed-pipelines aus (Repository-Ressource seed)
+# und ruft scripts/intune/intune.py auf, statt Python inline ins YAML zu schreiben. Die Logik ist
+# zu groß für einen Inline-Block (Graph, Übernahme, Konflikte, Prüfung nach dem Anwenden) und
+# lässt sich so mit Unit-Tests im CI von seed-pipelines prüfen. Skript und Template kommen dabei
+# immer aus demselben Tag.
+
+parameters:
+  # Azure-Resource-Manager-Service-Connection (Workload Identity Federation) der Identität mit
+  # DeviceManagementConfiguration.ReadWrite.All. Nur die Stages plan und apply nutzen sie.
+  - name: serviceConnection
+    type: string
+    default: sc-seed-intune
+
+  # Registerdatei im Repo des Tenants, relativ zu dessen Wurzel. Format: README, Abschnitt
+  # „Intune: Edge-Erweiterungen verteilen“.
+  - name: registry
+    type: string
+    default: extensions.yaml
+
+  # Azure-DevOps-Environment des Apply; dort hängt die Freigabe als Check.
+  - name: environment
+    type: string
+    default: seed-intune
+
+  # Name der Richtlinie in Intune. Eine Umbenennung hier legt eine neue an, außer der alte Name
+  # steht in adoptPolicies.
+  - name: policyName
+    type: string
+    default: 'Sentinel Seed: Edge-Erweiterungen'
+
+  # Namen alter Richtlinien, die übernommen statt neu angelegt werden, etwa
+  # ['Sentinel Link: Edge-Erweiterung']: Gibt es policyName noch nicht, aber genau eine davon,
+  # benennt apply sie um und gleicht sie an. Nie löschen und neu anlegen: Edge würde die
+  # Erweiterungen dazwischen deinstallieren. Mehrere Treffer brechen ab.
+  - name: adoptPolicies
+    type: object
+    default: []
+
+  # Leere Registerdatei anwenden: löscht die Richtlinie, Edge deinstalliert alle Erweiterungen.
+  # Ohne diese Bestätigung bricht der Plan bei einer leeren Registerdatei ab. Wie
+  # confirmDataDeletion in web-app.yml als Laufzeitparameter im YAML des Tenants durchreichen,
+  # damit nur ein bewusst von Hand gestarteter Lauf sie mitbringt.
+  - name: allowEmpty
+    type: boolean
+    default: false
+
+  # Nur prüfen wie im PR-Lauf (Registerdatei und updates.xml), ohne Intune.
+  - name: validationOnly
+    type: boolean
+    default: false
+
+  - name: vmImage
+    type: string
+    default: ubuntu-24.04
+
+stages:
+  - stage: plan
+    displayName: Plan
+    jobs:
+      - job: plan
+        displayName: Registerdatei und Plan
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        steps:
+          - checkout: self
+            path: tenant
+            fetchDepth: 1
+          # Skript aus seed-pipelines, derselbe Tag wie dieses Template (siehe Kopf). Die
+          # Repository-Ressource muss im YAML des Tenants seed heißen.
+          - checkout: seed
+            path: seed
+            fetchDepth: 1
+          - bash: >-
+              python3 "$(Pipeline.Workspace)/seed/scripts/intune/intune.py" check
+              --registry "$(Pipeline.Workspace)/tenant/${{ parameters.registry }}"
+            displayName: Registerdatei prüfen
+          - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
+              - task: AzureCLI@2
+                name: intune
+                displayName: Richtlinie prüfen (Plan)
+                env:
+                  SEED_POLICY_NAME: ${{ parameters.policyName }}
+                  SEED_ADOPT_POLICIES: ${{ convertToJson(parameters.adoptPolicies) }}
+                  SEED_MANAGED_BY: Pipeline $(Build.DefinitionName) (Registerdatei ${{ parameters.registry }} im Repo $(Build.Repository.Name))
+                inputs:
+                  azureSubscription: ${{ parameters.serviceConnection }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    args=(--registry "$(Pipeline.Workspace)/tenant/${{ parameters.registry }}"
+                      --policy-name "$SEED_POLICY_NAME" --adopt-json "$SEED_ADOPT_POLICIES"
+                      --managed-by "$SEED_MANAGED_BY")
+                    if [ "${{ lower(parameters.allowEmpty) }}" = true ]; then
+                      args+=(--allow-empty)
+                    fi
+                    python3 "$(Pipeline.Workspace)/seed/scripts/intune/intune.py" plan "${args[@]}"
+
+  # PR-Läufe enden nach der Prüfung: Apply entsteht gar nicht erst.
+  - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
+      - stage: apply
+        displayName: Apply
+        dependsOn: plan
+        # Ohne Änderungen entfällt die Stage und damit auch die Freigabe.
+        condition: and(succeeded(), eq(dependencies.plan.outputs['plan.intune.changes'], 'true'))
+        jobs:
+          - deployment: apply
+            displayName: Richtlinie anwenden
+            pool:
+              vmImage: ${{ parameters.vmImage }}
+            # Freigaben hängen als Check an diesem Environment.
+            environment: ${{ parameters.environment }}
+            variables:
+              # Kennung des freigegebenen Plans: apply bricht ab, wenn sich der Plan seither
+              # geändert hat, etwa weil jemand die Richtlinie in Intune bearbeitet hat.
+              planId: $[ stageDependencies.plan.plan.outputs['intune.planId'] ]
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                      path: tenant
+                      fetchDepth: 1
+                    - checkout: seed
+                      path: seed
+                      fetchDepth: 1
+                    - task: AzureCLI@2
+                      displayName: Richtlinie anwenden
+                      env:
+                        SEED_POLICY_NAME: ${{ parameters.policyName }}
+                        SEED_ADOPT_POLICIES: ${{ convertToJson(parameters.adoptPolicies) }}
+                        SEED_MANAGED_BY: Pipeline $(Build.DefinitionName) (Registerdatei ${{ parameters.registry }} im Repo $(Build.Repository.Name))
+                        SEED_PLAN_ID: $(planId)
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          if [ -z "$SEED_PLAN_ID" ]; then
+                            echo "##vso[task.logissue type=error]Die Kennung des Plans fehlt (Ausgabe planId der Stage Plan); ohne sie wird nichts angewendet."
+                            exit 1
+                          fi
+                          args=(--registry "$(Pipeline.Workspace)/tenant/${{ parameters.registry }}"
+                            --policy-name "$SEED_POLICY_NAME" --adopt-json "$SEED_ADOPT_POLICIES"
+                            --managed-by "$SEED_MANAGED_BY" --expect-plan "$SEED_PLAN_ID")
+                          if [ "${{ lower(parameters.allowEmpty) }}" = true ]; then
+                            args+=(--allow-empty)
+                          fi
+                          python3 "$(Pipeline.Workspace)/seed/scripts/intune/intune.py" apply "${args[@]}"
