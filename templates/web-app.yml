@@ -7,7 +7,8 @@
 #                 dann terraform apply des geprüften Plans
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test, mit
 #                 features.customConnector der Custom Connector der Power Platform, mit
-#                 extension das Paket der Browser-Erweiterung für diese Umgebung
+#                 extension das Paket der Browser-Erweiterung für diese Umgebung, mit
+#                 extension.signing als CRX signiert und für verwaltete Geräte veröffentlicht
 #                 (Environment <project>-<env>-app, lässt sich einzeln neu starten)
 # Mit frontend: false (Projekt ohne Frontend) entfallen alle Schritte der Static Web App.
 #
@@ -54,6 +55,16 @@ parameters:
   #                      [prod]. In deren Paket entfernt die Pipeline key aus dem Manifest, weil
   #                      der Store die ID selbst vergibt; in den übrigen bleibt key, damit die
   #                      entpackte Erweiterung ihre feste ID und damit ihre Redirect-URI behält.
+  #   signing            optional, selbst gehostet statt Store: Der Deploy signiert das Paket als
+  #                      CRX3 und veröffentlicht es im Container extension des Daten-Storage, von
+  #                      wo Bfs.Seed.Extension es verwalteten Geräten ausliefert (README:
+  #                      Browser-Erweiterung, Signieren und Veröffentlichen). Schlüssel:
+  #     secureFile       Secure File im Azure-DevOps-Projekt mit dem privaten RSA-Schlüssel (PEM),
+  #                      angelegt mit onboarding/New-SeedExtensionKey.ps1
+  #     id               erwartete Erweiterungs-ID (32 Zeichen a bis p). Ergibt der Schlüssel eine
+  #                      andere, bricht der Deploy vor dem Upload ab (falsche Secure File).
+  #     environments     Umgebungen, in denen signiert wird, Standard [prod]; deren Pakete
+  #                      bekommen wie die aus storeEnvironments kein key.
   - name: extension
     type: object
     default: {}
@@ -295,7 +306,7 @@ stages:
               - bash: |
                   set -euo pipefail
                   python3 -c '
-                  import json, re, sys
+                  import json, os, re, sys
                   path = sys.argv[1]
                   def fail(message):
                       print("##vso[task.logissue type=error]" + message)
@@ -314,8 +325,39 @@ stages:
                       fail(f"{path}: version ist „{version}“, erwartet bis zu vier Zahlen von 0 bis 65535 ohne führende Nullen, z. B. 1.2.0.")
                   name = manifest.get("name")
                   print(f"{path}: {name} {version}, Manifest V3")
-                  ' "${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}/manifest.json"
+
+                  # extension.signing (nur dann gesetzt): Fehler hier statt erst im Deploy der Umgebung.
+                  # Keine einfachen Anführungszeichen im Python: Es steht in einem davon in bash.
+                  signing = json.loads(os.environ.get("SEED_EXTENSION_SIGNING") or "null")
+                  if signing is not None:
+                      if not isinstance(signing, dict):
+                          fail("extension.signing: Objekt mit secureFile und id erwartet.")
+                      unknown = ", ".join(sorted(set(signing) - {"secureFile", "id", "environments"}))
+                      if unknown:
+                          fail(f"extension.signing: unbekannt {unknown}; erlaubt sind secureFile, id und environments.")
+                      secure_file = str(signing.get("secureFile") or "").strip()
+                      extension_id = str(signing.get("id") or "")
+                      if not secure_file:
+                          fail("extension.signing.secureFile fehlt: Name der Secure File mit dem privaten Schlüssel (PEM).")
+                      if not re.fullmatch(r"[a-p]{32}", extension_id):
+                          fail(f"extension.signing.id ist „{extension_id}“, erwartet die Erweiterungs-ID (32 Zeichen a bis p), die onboarding/New-SeedExtensionKey.ps1 nennt.")
+                      package = sys.argv[2]
+                      if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", package):
+                          fail(f"extension.name (Standard project) ist „{package}“; signierte Pakete brauchen Kleinbuchstaben, Ziffern und Bindestriche, wie Bfs.Seed.Extension.")
+                      wanted = signing.get("environments") or ["prod"]
+                      wanted = [str(e).strip() for e in (wanted.split(",") if isinstance(wanted, str) else wanted)]
+                      environments = [str(e.get("name")) for e in json.loads(os.environ["SEED_ENVIRONMENTS"])]
+                      missing = ", ".join(e for e in wanted if e not in environments)
+                      if missing:
+                          fail(f"extension.signing.environments nennt {missing}, die Pipeline hat nur " + ", ".join(environments) + ". Ohne passende Umgebung signiert sie nie.")
+                      print("Signieren und veröffentlichen in " + ", ".join(wanted) + f": {package}-<version>.crx, ID {extension_id}, Secure File {secure_file}")
+                  ' "${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}/manifest.json" \
+                    "${{ coalesce(parameters.extension.name, parameters.project) }}"
                 displayName: Manifest der Erweiterung prüfen
+                ${{ if parameters.extension.signing }}:
+                  env:
+                    SEED_EXTENSION_SIGNING: ${{ convertToJson(parameters.extension.signing) }}
+                    SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
 
           # Projektspezifische Schritte (Parameter extraBuildSteps), nach den Builds und vor dem
           # Artefakt web, damit sie Dateien ins Frontend legen können.
@@ -518,7 +560,8 @@ stages:
                   runOnce:
                     deploy:
                       # Kein Checkout und kein terraform init: Pakete, Outputs und project.yaml
-                      # kommen als Artefakte aus Build und Plan bzw. Apply.
+                      # kommen als Artefakte aus Build und Plan bzw. Apply. Nur mit
+                      # extension.signing checkt der Paketschritt seed-pipelines aus (Skript).
                       steps:
                         - download: current
                           artifact: api
@@ -705,7 +748,10 @@ stages:
                         # letzter Schritt nach dem Custom Connector: Pipeline-Artefakte lassen sich nicht
                         # überschreiben, auch nicht beim Neustart eines gescheiterten Jobs. Stünde das
                         # Paket davor, käme deploy_<env> nach einem Fehler des Connectors mit einem
-                        # Neustart nicht mehr durch.
+                        # Neustart nicht mehr durch. Mit extension.signing signiert und veröffentlicht der
+                        # Schritt das Paket in dessen Umgebungen (Standard prod). Die Liste darf wie
+                        # storeEnvironments auch ein einzelner Name sein: join macht aus beidem eine
+                        # Aufzählung, split wieder eine Liste.
                         - ${{ if parameters.extension.path }}:
                             - template: steps/extension-package.yml
                               parameters:
@@ -715,3 +761,8 @@ stages:
                                   storeEnvironments: ${{ parameters.extension.storeEnvironments }}
                                 outputsFile: $(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json
                                 buildDir: $(Pipeline.Workspace)/extension
+                                ${{ if parameters.extension.signing }}:
+                                  sign: ${{ and(parameters.extension.signing.secureFile, containsValue(split(replace(join(',', coalesce(parameters.extension.signing.environments, 'prod')), ' ', ''), ','), env.name)) }}
+                                  signing: ${{ parameters.extension.signing }}
+                                  serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                                  resourceGroup: $(tf_resource_group_name)

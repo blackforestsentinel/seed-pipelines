@@ -416,10 +416,14 @@ class PublishTests(KeyTestCase):
         self.assertFalse(release["published"])
         self.assertTrue((out / "my-ext-1.0.0.100.crx").exists())
 
-    def test_invalid_name_and_id(self):
-        for argv in (["--name", "My_Ext", "--expect-id", "a" * 32], ["--name", "my-ext", "--expect-id", "q" * 32]):
+    def test_invalid_arguments(self):
+        for argv in (["--name", "My_Ext", "--expect-id", "a" * 32], ["--name", "my-ext", "--expect-id", "q" * 32],
+                     # Im Deploy leer, wenn der Output resource_group_name fehlt: nicht still nur packen
+                     ["--name", "my-ext", "--expect-id", "a" * 32, "--resource-group", ""]):
             with self.subTest(argv=argv), self.assertRaises(publish.PublishError):
                 publish.main(["--zip", "x.zip", "--key", self.key, "--out", self.work.name, *argv])
+
+        self.assertEqual(self.azure.commands, [])
 
 
 if __name__ == "__main__":

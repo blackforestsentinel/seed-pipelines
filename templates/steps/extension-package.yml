@@ -4,7 +4,8 @@
 #                Erweiterung hat keine Bridge-Seite); ohne den Output nur die API-URL
 #   version      die ersten drei Zahlen aus manifest.json im Repo, die Build-ID als vierte, etwa
 #                1.2.0.2160. So steigt die Version mit jedem Lauf, wie der Store es verlangt.
-#   key          entfernt in den Umgebungen aus storeEnvironments, sonst unverändert
+#   key          entfernt in den Umgebungen aus storeEnvironments und in den signierten (sign),
+#                sonst unverändert
 #
 # Ausnahmsweise entsteht je Umgebung ein eigenes Paket: Der Grundsatz „ein Build für alle
 # Umgebungen“ gilt hier nicht, weil die Konfiguration im Paket steckt. Anders als das Frontend
@@ -12,6 +13,17 @@
 # trotzdem nur einmal; je Umgebung ändern sich nur config.json und manifest.json. Die Pakete lädt
 # ein Mensch von Hand in Edge Add-ons hoch bzw. entpackt sie für dev, eine Anbindung an die API
 # von Edge Add-ons gibt es nicht.
+#
+# Mit sign (extension.signing in web-app.yml, nur in dessen Umgebungen) signiert der Deploy das
+# Paket danach als CRX3 und veröffentlicht es im Container extension des Daten-Storage;
+# Bfs.Seed.Extension liefert es unter /api/extension/updates.xml an verwaltete Geräte aus (Intune,
+# ExtensionInstallForcelist). Das übernimmt scripts/extension/publish.py aus diesem Repo (README,
+# Browser-Erweiterung). CRX und release.json kommen als Artefakt extension_release_<env>.
+#
+# Die Artefakte entstehen erst am Ende: Pipeline-Artefakte lassen sich nicht überschreiben, auch
+# nicht beim Neustart eines gescheiterten Jobs. Scheitert das Signieren oder Veröffentlichen, kommt
+# deploy_<env> so mit einem Neustart durch; publish.py erkennt eine schon erfolgte Veröffentlichung
+# am Inhalt.
 parameters:
   # Dateiname des Pakets ohne Umgebung
   - name: name
@@ -29,14 +41,36 @@ parameters:
   # Build-Ergebnis der Erweiterung (Artefakt extension) mit manifest.json
   - name: buildDir
     type: string
+  # In dieser Umgebung signieren und veröffentlichen. web-app.yml entscheidet das aus
+  # extension.signing.environments, damit die Schritte in den übrigen Umgebungen gar nicht entstehen.
+  - name: sign
+    type: boolean
+    default: false
+  # Nur mit sign: extension.signing aus web-app.yml mit secureFile (Secure File mit dem privaten
+  # RSA-Schlüssel, PEM) und id (erwartete Erweiterungs-ID, 32 Zeichen a bis p)
+  - name: signing
+    type: object
+    default: {}
+  # Nur mit sign: Azure-Service-Connection der Umgebung (Deployment-Identität). Sie braucht Storage
+  # Blob Data Contributor auf dem Container extension (seed-terraform, Modul storage,
+  # extension_publisher_principal_id).
+  - name: serviceConnection
+    type: string
+    default: ''
+  # Nur mit sign: Resource Group der Umgebung (Output resource_group_name); darin der Storage Account
+  # mit dem Tag seed:module=storage
+  - name: resourceGroup
+    type: string
+    default: ''
 
 steps:
   - bash: |
       set -euo pipefail
       python3 -c '
       import json, os, re, shutil, sys, zipfile
-      build_dir, outputs_file, package, environment, store_environments, build_id, work_dir, staging_dir = sys.argv[1:]
+      build_dir, outputs_file, package, environment, store_environments, sign, build_id, work_dir, staging_dir = sys.argv[1:]
       store = environment in [name.strip() for name in store_environments.split(",")]
+      signed = sign == "true"
 
       def fail(message):
           print("##vso[task.logissue type=error]" + message)
@@ -69,7 +103,11 @@ steps:
       print(f"Version: {version} (manifest.json im Repo: {repo_version}, Build-ID {build_id})")
 
       # key: Der Store vergibt die ID selbst; die entpackte Erweiterung behält mit key ihre feste ID.
-      if not store:
+      # Im signierten Paket folgt die ID aus dem Signaturschlüssel; key entfernt auch publish.py.
+      if signed:
+          manifest.pop("key", None)
+          print("Paket zum Signieren, ohne key.")
+      elif not store:
           if "key" in manifest:
               print("Paket zum Entpacken, key bleibt.")
           else:
@@ -91,9 +129,50 @@ steps:
               zip_file.write(os.path.join(copy, path), path.replace(os.sep, "/"))
       print(f"{package}.zip: {len(files)} Dateien, {os.path.getsize(archive)} Bytes")
       ' "${{ parameters.buildDir }}" "${{ parameters.outputsFile }}" "${{ parameters.name }}-${{ parameters.environment }}" \
-        "${{ parameters.environment }}" "${{ join(',', parameters.storeEnvironments) }}" "$(Build.BuildId)" \
+        "${{ parameters.environment }}" "${{ join(',', parameters.storeEnvironments) }}" "${{ lower(parameters.sign) }}" "$(Build.BuildId)" \
         "$(Agent.TempDirectory)/extension" "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}"
     displayName: Browser-Erweiterung packen
-  - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
-    artifact: extension_${{ parameters.environment }}
-    displayName: Artefakt extension_${{ parameters.environment }}
+
+  - ${{ if parameters.sign }}:
+      # Das Skript liegt in seed-pipelines unter scripts/extension statt inline wie die übrigen
+      # Schritte: Signieren, Veröffentlichen und die Prüfung der Auslieferung sind zu viel für
+      # Inline-Python, und als Datei laufen sie in der CI dieses Repos durch Tests. Neu im Deploy ist
+      # deshalb ein Checkout, wie in intune-extensions.yml. Die Repository-Ressource heißt in allen
+      # Seed-Projekten seed (README) und hat die ref, aus der auch die Templates kommen, also passt
+      # das Skript zum Template. Der feste Pfad macht den Aufruf unabhängig davon, was sonst
+      # ausgecheckt ist.
+      - checkout: seed
+        path: seed
+        fetchDepth: 1
+        displayName: seed-pipelines auschecken (Skript der Erweiterung)
+      # Liegt nur für diesen Job auf dem Agent; der Task löscht die Datei am Ende des Jobs.
+      - task: DownloadSecureFile@1
+        name: extensionKey
+        displayName: Signaturschlüssel der Erweiterung
+        inputs:
+          secureFile: ${{ parameters.signing.secureFile }}
+      - task: AzureCLI@2
+        name: extensionRelease
+        displayName: Erweiterung signieren und veröffentlichen
+        inputs:
+          azureSubscription: ${{ parameters.serviceConnection }}
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: >-
+            python3 "$(Pipeline.Workspace)/seed/scripts/extension/publish.py"
+            --zip "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}/${{ parameters.name }}-${{ parameters.environment }}.zip"
+            --key "$(extensionKey.secureFilePath)"
+            --expect-id "${{ parameters.signing.id }}"
+            --name "${{ parameters.name }}"
+            --resource-group "${{ parameters.resourceGroup }}"
+            --out "$(Build.ArtifactStagingDirectory)/extension_release_${{ parameters.environment }}"
+      - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
+        artifact: extension_${{ parameters.environment }}
+        displayName: Artefakt extension_${{ parameters.environment }}
+      - publish: $(Build.ArtifactStagingDirectory)/extension_release_${{ parameters.environment }}
+        artifact: extension_release_${{ parameters.environment }}
+        displayName: Artefakt extension_release_${{ parameters.environment }}
+  - ${{ else }}:
+      - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
+        artifact: extension_${{ parameters.environment }}
+        displayName: Artefakt extension_${{ parameters.environment }}
