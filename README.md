@@ -322,15 +322,138 @@ Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das
 
 Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben Pfad, startet ein Push auf `main` auch die neue Pipeline, mit dem alten Inhalt. Diese Pipeline ist für die alten Service Connections und Environments nicht berechtigt und fragt nach Zugriff: solche Läufe abbrechen, den Zugriff nicht erlauben. `Initialize-SeedProject.ps1` weist darauf hin und listet die übrigen aktiven Pipelines des Repos.
 
+## Intune: Edge-Erweiterungen verteilen
+
+Auf verwalteten Windows-Geräten installiert Edge Erweiterungen außerhalb des Stores über die Richtlinie `ExtensionInstallForcelist` mit Einträgen `<id>;<update_url>`. Intune erlaubt diese Einstellung nur in **einer** Richtlinie: Setzen zwei Richtlinien sie, meldet Intune einen Konflikt, und auf den betroffenen Geräten wirkt keine. Deshalb gibt es je Tenant genau eine Pipeline, die genau eine Richtlinie besitzt: `seed-intune` im Repo `seed-tenant` des Azure-DevOps-Projekts, mit [`templates/intune-extensions.yml`](templates/intune-extensions.yml). Welche Erweiterungen dazugehören, steht in der Registerdatei `extensions.yaml` dieses Repos; Änderungen kommen per Pull Request, angewendet wird erst nach Freigabe. Signieren und Veröffentlichen der Erweiterung bleibt Sache des Projekts (Deploy); die Registerdatei nennt nur, wo sie liegt.
+
+```yaml
+# seed-tenant/azure-pipelines.yml (Startinhalt aus tenant/, angelegt vom Onboarding)
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [extensions.yaml, azure-pipelines.yml]
+pr: none
+
+parameters:
+  - name: allowEmpty
+    displayName: Alle Erweiterungen entfernen (leere Registerdatei anwenden)
+    type: boolean
+    default: false
+
+resources:
+  repositories:
+    - repository: seed                    # Name fest: das Template checkt das Repo aus
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/tags/v0.12.0
+      endpoint: github-blackforestsentinel
+
+extends:
+  template: templates/intune-extensions.yml@seed
+  parameters:
+    serviceConnection: sc-seed-intune
+    environment: seed-intune
+    registry: extensions.yaml
+    policyName: 'Sentinel Seed: Edge-Erweiterungen'
+    adoptPolicies: ['Kundenportal: Edge-Erweiterung']
+    allowEmpty: ${{ parameters.allowEmpty }}
+```
+
+| Stage | Inhalt |
+| --- | --- |
+| `plan` | Checkout von `seed-tenant` und `seed-pipelines` (derselbe Tag wie das Template). „Registerdatei prüfen“ (`scripts/intune/intune.py check`): Format und je Erweiterung `updates.xml`, ohne Anmeldung. Danach mit der Service Connection `intune.py plan`: Soll-Liste, Änderungen an der Richtlinie, Konfliktprüfung; setzt die Ausgabevariablen `changes` und `planId` |
+| `apply` | Nur bei Änderungen: Deployment-Job im Environment `seed-intune` (dort hängt die Freigabe), `intune.py apply` mit der Kennung des freigegebenen Plans, danach liest es die Richtlinie erneut und prüft sie |
+
+Die Pipeline läuft nach jedem Merge auf `main`, der `extensions.yaml` oder `azure-pipelines.yml` ändert (`trigger` mit `paths` im YAML des Tenants; ein Template darf keine Trigger setzen), und von Hand. PR-Läufe (Branch-Policy) und `validationOnly: true` bestehen nur aus „Registerdatei prüfen“: kein Plan, keine Service Connection, kein Environment.
+
+Neu gegenüber den übrigen Templates: Es checkt `seed-pipelines` selbst aus und ruft ein Skript auf, statt Python inline ins YAML zu schreiben. Graph, Übernahme, Konflikte und die Prüfung nach dem Anwenden wären als Inline-Block nicht testbar; so laufen Unit-Tests im CI dieses Repos (`python3 -m unittest discover -s scripts -p "test_*.py"`, nur Standardbibliothek), und Skript und Template kommen immer aus demselben Tag.
+
+### Registerdatei
+
+```yaml
+extensions:
+  - name: kundenportal                    # Projekt, wie in project.yaml
+    id: abcdefghijklmnopabcdefghijklmnop  # 32 Zeichen a bis p, folgt aus dem Signaturschlüssel
+    updateUrl: https://func-kundenportal-prod-1a2b3c.azurewebsites.net/api/extension/updates.xml
+    owner: it@example.org                    # optional
+    comment: Seitenleiste für den Support # optional
+```
+
+- **Format:** ein bewusst kleiner Ausschnitt aus YAML, den `intune.py` selbst liest: nur der Schlüssel `extensions`, eine Liste von Einträgen mit genau diesen fünf Schlüsseln, Kommentare, Werte ohne, in `'…'` oder in `"…"` Anführungszeichen; `extensions: []` für keinen Eintrag. Abgelehnt mit Zeilennummer werden Tabulatoren, mehrzeilige Werte, `{…}`, Anker, unbekannte oder doppelte Schlüssel und Werte, die YAML nicht als Text läse (`yes`, `2026-01-01`, Zahlen). Jede gültige Datei liest ein YAML-Parser genauso (die Tests prüfen das gegen PyYAML). PyYAML selbst kommt nicht in die Pipeline, weil es auf dem Agent nicht sicher vorhanden ist und ein `pip install` eine weitere Abhängigkeit aus dem Netz wäre. JSON ginge ohne eigenen Parser, kennt aber keine Kommentare; die Datei pflegen Menschen per Pull Request, und Seed nutzt YAML auch für `project.yaml`.
+- **Werte:** `name` 3 bis 40 Zeichen (`a-z`, `0-9`, `-`), `id` 32 Zeichen `a` bis `p`, beide eindeutig. `updateUrl` per `https`, ohne Anmeldedaten, Query, Fragment und `;`, endet auf `/api/extension/updates.xml`.
+- **Veröffentlicht?** „Registerdatei prüfen“ lädt jede `updateUrl` (bis zu drei Versuche) und verlangt ein Update-Manifest (`gupdate`, Namespace `http://www.google.com/update2/response`) mit `app/@appid` gleich `id` und einem `updatecheck` mit `version` und `https`-`codebase`. Sonst endet der Lauf mit „Erst veröffentlichen (Deploy des Projekts), dann eintragen“, im Pull Request also vor dem Merge.
+
+### Plan und Apply
+
+- **Soll:** alle Einträge der Registerdatei als `<id>;<updateUrl>`, sortiert. Die Pipeline besitzt die ganze Richtlinie: Einträge, die nicht in der Datei stehen, und andere Einstellungen in der Richtlinie entfernt sie; zugewiesen ist sie genau „alle Benutzer“. Für jede entfernte Erweiterung warnt der Plan, denn Edge deinstalliert sie auf allen Geräten.
+- **Leere Registerdatei:** Der Plan bricht ab, statt die Richtlinie zu leeren, denn das würde alle Erweiterungen deinstallieren. Ist genau das gewollt, die Pipeline von Hand mit „Alle Erweiterungen entfernen“ (`allowEmpty`, `--allow-empty`) starten; dann löscht sie die Richtlinie.
+- **Konflikte:** Setzt eine andere Richtlinie des Einstellungskatalogs ebenfalls `ExtensionInstallForcelist` und ist sie zugewiesen, endet der Plan mit einem Fehler, der sie nennt. Entschieden als Fehler, nicht als Warnung: Solange der Konflikt besteht, wirkt die Richtlinie der Pipeline auf den betroffenen Geräten nicht, und Anwenden änderte daran nichts; ein grüner Lauf würde etwas anderes behaupten. Ob sich die Zuweisungen tatsächlich überschneiden (Gruppen), prüft die Pipeline nicht, im Zweifel hält sie an. Eine Richtlinie ohne Zuweisung (oder nur mit Ausschlüssen) wirkt nirgends und ist nur eine Warnung. Abhilfe: deren Einträge in die Registerdatei übernehmen und die Richtlinie löschen.
+- **Freigegebener Plan:** `plan` gibt dem Plan eine Kennung (`planId`, Hash der Schritte). `apply` rechnet den Plan neu und bricht ohne Änderung ab, wenn die Kennung nicht mehr stimmt, etwa weil jemand die Richtlinie in Intune geändert hat oder ein zweiter Lauf schneller war. Dann einen neuen Lauf starten.
+- **Nach dem Apply** liest das Skript die Richtlinie erneut (bis zu drei Versuche) und endet mit Fehler, wenn noch etwas fehlt.
+- **Technik:** Graph beta, Einstellungskatalog (`windows10`, `mdm`), Setting-ID aus einer Liste bekannter Kandidaten (`SETTING_CANDIDATES`), die abhängige Liste aus der Definition; Wiederholungen bei 429 und 5xx. Den Graph-Token holt `az account get-access-token --resource-type ms-graph` im Kontext der Service Connection.
+
+### Übernahme einer bestehenden Richtlinie
+
+Gibt es die Richtlinie `policyName` noch nicht, aber genau eine aus `adoptPolicies`, benennt `apply` diese um und gleicht sie an (Plan: „übernehmen und umbenennen“). Sie wird nie gelöscht und neu angelegt: Dazwischen würde Edge die Erweiterungen deinstallieren und danach neu installieren; lokale Daten der Erweiterungen gingen dabei verloren. Passen mehrere, bricht der Plan mit ihrer Liste ab; übernommen wird nur genau eine, sonst ginge eine Liste verloren. Gibt es `policyName` schon, bleibt eine alte Richtlinie mit derselben Einstellung ein Konflikt (siehe oben).
+
+Beispiel: Ein Projekt verteilt seine Erweiterung bisher mit einer eigenen Pipeline und der Richtlinie „Kundenportal: Edge-Erweiterung“.
+
+1. Onboarding mit `-AdoptPolicies 'Kundenportal: Edge-Erweiterung'` (landet in `adoptPolicies`).
+2. Im Projekt den bisherigen Intune-Schritt entfernen oder dessen Pipeline anhalten, **bevor** `seed-intune` zum ersten Mal anwendet. Sonst findet er seine Richtlinie nach der Umbenennung nicht mehr, legt sie neu an, und beide stehen im Konflikt.
+3. Pull Request in `seed-tenant` mit dem Eintrag des Projekts (`id` und `updateUrl` wie bisher). Nach dem Merge zeigt der Plan „übernehmen und umbenennen“, mit derselben Liste ohne Entfernungen.
+4. Nach dem Apply der Identität `kundenportal-rollout` das Recht `DeviceManagementConfiguration.ReadWrite.All` entziehen; das Onboarding nennt alle weiteren Identitäten mit diesem Recht.
+
+### Rechte und Schutz
+
+- **Identität** `sentinel-seed-intune` (App-Registrierung ohne Secret, Workload Identity Federation): Microsoft Graph `DeviceManagementConfiguration.ReadWrite.All` als Anwendungsberechtigung mit Administratorzustimmung. Das Recht gilt für alle Konfigurationsrichtlinien des Tenants; die Pipeline fasst nur ihre eine an, die Checks unten sorgen dafür, dass nur sie die Identität bekommt. Sie ist die einzige Identität mit Intune-Schreibrecht; Projekte und die Deployment-Identitäten bekommen keins.
+- **Azure:** nur `Reader` auf der leeren Resource Group `rg-seed-intune`. Eine AzureRM-Service-Connection verlangt eine Subscription, und `AzureCLI@2` wählt sie nach der Anmeldung aus; das scheitert, wenn die Identität dort gar kein Recht hat. Reader auf einer leeren Resource Group macht die Subscription sichtbar und gibt auf nichts Zugriff. (Ein eigener Token-Tausch über die OIDC-Schnittstelle der Pipeline käme ohne Subscription aus, wäre aber ein Sonderweg neben `AzureCLI@2`, dessen Zusammenspiel mit den Checks der Service Connection nicht erprobt ist.) Die Resource Group nicht löschen, sonst scheitert die Anmeldung.
+- **Service Connection** `sc-seed-intune` mit zwei Checks: „Branch control“ (`refs/heads/main,refs/tags/v*`, wie bei den Projekten) und „Required template“ (`templates/intune-extensions.yml` aus `blackforestsentinel/seed-pipelines` auf dem verwendeten Tag). Eine geänderte Pipeline-Datei auf einem Branch oder ein anderes Template kommt damit nicht an die Identität. Service Connection und Environment sind nur für `seed-intune` freigegeben, nicht für alle Pipelines.
+- **Zwei Freigaben:** Branch-Policies auf `main` von `seed-tenant`: Build-Validierung mit `seed-intune` und mindestens eine Freigabe durch eine andere Person als die, die den Pull Request erstellt oder zuletzt gepusht hat (Stimmen werden bei neuen Pushes zurückgesetzt). Der Review prüft den Inhalt (welche Erweiterung, welche Adresse), die Freigabe im Environment danach den konkreten Plan gegen Intune. Wer „Bypass policies“ am Repo hat, käme am Review vorbei; das Recht nur Administratoren lassen.
+
+### Einrichtung
+
+[`onboarding/Initialize-SeedIntune.ps1`](onboarding/Initialize-SeedIntune.ps1), einmal je Tenant, nach `Initialize-SeedTenant.ps1` (GitHub-Service-Connection). Wie die übrigen Onboarding-Skripte prüft es jeden Schritt zuerst und legt nur an, was fehlt; `-DryRun` ändert nichts, auch nicht in Entra ID oder Azure.
+
+```powershell
+./onboarding/Initialize-SeedIntune.ps1 -SubscriptionId <id> `
+  -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject 'Sentinel Seed' `
+  -Approvers it@example.org -AdoptPolicies 'Alte Edge-Richtlinie' -DryRun
+```
+
+1. Identität `sentinel-seed-intune` mit Service Principal
+2. Graph `DeviceManagementConfiguration.ReadWrite.All` mit Administratorzustimmung; nennt weitere Identitäten mit diesem Recht
+3. Resource Group `rg-seed-intune` (leer) und Reader darauf
+4. Service Connection `sc-seed-intune` und Federated Credential
+5. Checks „Branch control“ und „Required template“ (vorhandene mit anderen Werten werden aktualisiert)
+6. Environment `seed-intune` mit Freigabe durch `-Approvers` (Pflicht)
+7. Repo `seed-tenant`; ohne `main` mit dem Startinhalt aus [`tenant/`](tenant/) (leere Registerdatei, `azure-pipelines.yml`, README). Ein vorhandenes Repo bleibt unverändert; geprüft wird nur, dass `azure-pipelines.yml` das Template auf `-SeedPipelinesVersion` einbindet.
+8. Pipeline `seed-intune`, berechtigt für Service Connection, Environment und GitHub-Service-Connection
+9. Branch-Policies auf `main`: Build-Validierung und `-MinimumReviewers` (Standard 1)
+
+Das Konto braucht Privileged Role Administrator (oder Global Administrator) für die Zustimmung zur Graph-Berechtigung, in der Subscription Owner (oder Contributor und User Access Administrator) und Projektadministrator in Azure DevOps. Für `-DryRun` reicht Lesezugriff.
+
+Das Skript startet die Pipeline nicht; mit leerer Registerdatei hätte sie nichts zu tun. Der erste Lauf folgt auf den Merge des ersten Pull Requests mit einem Eintrag.
+
+**Neue Version von seed-pipelines:** Erst das Onboarding mit der neuen `-SeedPipelinesVersion` ausführen (aktualisiert „Required template“), dann `ref` in `seed-tenant/azure-pipelines.yml` per Pull Request anheben. Dazwischen lehnt der Check Läufe mit dem alten Tag ab; PR-Läufe sind nicht betroffen, weil sie die Service Connection nicht nutzen.
+
+### Grenzen
+
+- Eine Richtlinie mit einer Zuweisung (alle Benutzer) für alle Erweiterungen; einzelne Erweiterungen nur für bestimmte Gruppen gibt es nicht.
+- Die Einstellungen der Erweiterungen selbst (`managed_schema.json`, unter Windows `HKLM\Software\Policies\Microsoft\Edge\3rdparty\extensions\<id>\policy`) sind nicht Teil davon; sie bleiben bei den Projekten.
+- Nur Windows (Einstellungskatalog, MDM). Die Konfliktprüfung sieht nur Richtlinien des Einstellungskatalogs, keine Administrative Templates und keine Custom-Profile (OMA-URI).
+- Änderungen von Hand in Intune setzt erst der nächste Lauf zurück; die Pipeline läuft nur bei Änderungen am Repo und von Hand, nicht nach Zeitplan.
+
 ## Release
 
 Neue Projekte bekommen die Versionen, die hier als Standard stehen. Vor jedem Tag deshalb anheben:
 
 - `onboarding/Initialize-SeedTenant.ps1`: `$SeedPipelinesVersion`, landet im Repo `seed-scaffold` und damit in jedem neuen Projekt;
 - `templates/scaffold.yml`: `pipelinesVersion` und `terraformModuleVersion` (Modul `ado-project`);
+- `onboarding/Initialize-SeedIntune.ps1`: `$SeedPipelinesVersion`, bestimmt die Prüfung „Required template“ und den Startinhalt von `seed-tenant`;
 - die Beispiele in dieser README.
 
-Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`.
+Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`. Für `seed-tenant` erst `Initialize-SeedIntune.ps1` mit dem neuen Tag ausführen, dann `ref` per Pull Request anheben (siehe Intune).
 
 ## Lizenz
 
