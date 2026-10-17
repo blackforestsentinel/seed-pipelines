@@ -17,7 +17,8 @@
          die GitHub-Service-Connection
       4. Nur mit -EnableBranchPolicy: Branch-Policy für die PR-Validierung
       5. Nur mit -EnableBranchPolicy: Branch-Prüfung an der Azure-Service-Connection, nur Läufe
-         von -AllowedBranches (Standard der Default-Branch) bekommen die Deployment-Identität
+         von -AllowedBranches (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs
+         (Standard refs/tags/v*) bekommen die Deployment-Identität
 
     Einstellungen wie in ado-project: Freigabe durch eine der genannten Personen, auch durch
     die, die den Lauf gestartet hat, 30 Tage Zeit; Policy blockierend, Ergebnis 12 Stunden
@@ -56,6 +57,13 @@
     Umschalten testet die Migration auf einem eigenen Branch. Gilt für alle Pipelines, die diese
     Service Connection nutzen. Muster wie refs/heads/release/* sind erlaubt.
 
+.PARAMETER TemplateRefs
+    Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
+    Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
+    Projekte über einen Tag einbinden. Ein Tag v… im Projekt-Repo und ein Lauf darauf kämen
+    deshalb ebenfalls durch: Im Projekt-Repo sollten nur Administratoren Tags anlegen dürfen
+    (README, Branch-Prüfung).
+
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts.
 
@@ -80,6 +88,7 @@ param(
     [string] $DefaultBranch = 'main',
     [switch] $EnableBranchPolicy,
     [string[]] $AllowedBranches = @(),
+    [string[]] $TemplateRefs = @('refs/tags/v*'),
     [switch] $DryRun
 )
 
@@ -95,7 +104,8 @@ $Approvers = Split-List $Approvers
 $AppApprovalEnvironments = Split-List $AppApprovalEnvironments
 $AllowedBranches = Split-List $AllowedBranches
 if (-not $AllowedBranches) { $AllowedBranches = @($DefaultBranch) }
-$AllowedBranchRefs = @($AllowedBranches | ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) -join ','
+$AllowedBranchRefs = @(@($AllowedBranches | ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) +
+    @(Split-List $TemplateRefs)) -join ','
 
 if ($SeedProjectName -cnotmatch '^[a-z][a-z0-9-]{1,18}[a-z0-9]$') {
     throw 'SeedProjectName: 3-20 Zeichen, Kleinbuchstaben, Ziffern und Bindestriche, beginnt mit einem Buchstaben.'

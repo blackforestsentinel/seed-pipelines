@@ -62,6 +62,13 @@
     an allen Freigaben vorbei; die hängen an den Environments. Muster wie refs/heads/release/*
     sind erlaubt. Ein erneuter Lauf mit anderen Branches aktualisiert die Prüfung.
 
+.PARAMETER TemplateRefs
+    Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
+    Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
+    Projekte über einen Tag einbinden. Ein Tag v… in einem Projekt-Repo und ein Lauf darauf kämen
+    deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts sollten nur Administratoren
+    Tags anlegen dürfen (README, Branch-Prüfung).
+
 .PARAMETER PowerPlatformEnvironmentUrl
     Umgebungs-URL (Dataverse) jeder Power-Platform-Umgebung, in der Seed-Projekte mit
     features.customConnector einen Connector anlegen, z. B. https://org0000000.crm4.dynamics.com
@@ -91,6 +98,7 @@ param(
     [string] $SeedPipelinesVersion = 'v0.11.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
+    [string[]] $TemplateRefs = @('refs/tags/v*'),
     [switch] $SkipScaffold,
     [switch] $DryRun
 )
@@ -176,11 +184,14 @@ function Get-Endpoint([string] $Name) {
 # Branch-Prüfung (Check „Branch control“) an einer Service Connection: Läufe anderer Branches
 # bekommen sie nicht, auch keine PR-Läufe. Freigaben hängen an den Environments und hielten
 # eine geänderte Pipeline-Datei auf einem Feature-Branch nicht auf, die die Service Connection
-# direkt nutzt. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert.
+# direkt nutzt. Die Prüfung gilt für jedes Repo des Laufs, auch für seed-pipelines; deshalb
+# stehen die Template-Refs mit in der Liste. Eine vorhandene Prüfung mit anderen Branches wird
+# aktualisiert.
 $BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
 $BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
-$AllowedBranchRefs = @($AllowedBranches | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
-        ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) -join ','
+$AllowedBranchRefs = @(@($AllowedBranches | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+            ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) +
+    @($TemplateRefs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) -join ','
 
 function Set-BranchControl([object] $Endpoint, [string] $ProjectId) {
     $checks = "$Org/$ProjectId/_apis/pipelines/checks/configurations"
