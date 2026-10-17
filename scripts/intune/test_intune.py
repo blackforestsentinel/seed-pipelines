@@ -472,6 +472,9 @@ class StateTests(unittest.TestCase):
         graph.add("Nur Ausschluss", [OTHER], assignments=[{"target": {"@odata.type": intune.EXCLUSION, "groupId": "g"}}])
         graph.add("Andere Einstellung", settings=[{"settingInstance": {"settingDefinitionId": "x"}}])
         graph.add("Mac", [OTHER], platforms="macOS")
+        # Chrome hat eine eigene Forcelist und stört Edge nicht.
+        graph.add("Chrome", settings=[{"settingInstance": {"settingDefinitionId":
+                  "device_vendor_msft_policy_config_chromeintunev1~policy~googlechrome~extensions_extensioninstallforcelist"}}])
         others = intune.read_state(graph, NAME, []).others
 
         errors, warnings = intune.find_conflicts(graph, others, IDS[0], [])
