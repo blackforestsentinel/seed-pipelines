@@ -1,0 +1,36 @@
+# Vorschau-Beispiel: normaler Lauf mit Browser-Erweiterung (extension). Erwartet: npm ci, npm test
+# und npm run build der Erweiterung samt Prüfung des Manifests nach dem Frontend-Build und vor den
+# eigenen Schritten (extraBuildSteps), das Artefakt extension nach dem Artefakt web; in
+# deploy_<umgebung> als letzte Schritte das Paket my-extension-<umgebung>.zip und sein Artefakt.
+# Platzhalter: __PROJECT__ und __ENVIRONMENT__ (die Environments <projekt>-<umgebung> und
+# <projekt>-<umgebung>-app müssen im Projekt existieren), __SERVICE_CONNECTION__ (ebenso),
+# __GITHUB_CONNECTION__.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: __PROJECT__
+    serviceConnection: __SERVICE_CONNECTION__
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    environments:
+      - name: __ENVIRONMENT__
+    extension:
+      path: extension
+      name: my-extension
+    extraBuildSteps:
+      - script: echo lint
+        displayName: Lint (Beispiel)
+        workingDirectory: frontend

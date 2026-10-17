@@ -1,0 +1,99 @@
+# Paket der Browser-Erweiterung (Parameter extension in web-app.yml) für eine Umgebung: Artefakt
+# extension_<env> mit <name>-<env>.zip. In einer Kopie des Build-Ergebnisses:
+#   config.json  Output frontend_config wie beim Frontend, ohne auth.redirectBridgePath (die
+#                Erweiterung hat keine Bridge-Seite); ohne den Output nur die API-URL
+#   version      die ersten drei Zahlen aus manifest.json im Repo, die Build-ID als vierte, etwa
+#                1.2.0.2160. So steigt die Version mit jedem Lauf, wie der Store es verlangt.
+#   key          entfernt in den Umgebungen aus storeEnvironments, sonst unverändert
+#
+# Ausnahmsweise entsteht je Umgebung ein eigenes Paket: Der Grundsatz „ein Build für alle
+# Umgebungen“ gilt hier nicht, weil die Konfiguration im Paket steckt. Anders als das Frontend
+# lädt die Erweiterung config.json nicht von einem Server der Umgebung. Gebaut und getestet wird
+# trotzdem nur einmal; je Umgebung ändern sich nur config.json und manifest.json. Die Pakete lädt
+# ein Mensch von Hand in Edge Add-ons hoch bzw. entpackt sie für dev, eine Anbindung an die API
+# von Edge Add-ons gibt es nicht.
+parameters:
+  # Dateiname des Pakets ohne Umgebung
+  - name: name
+    type: string
+  - name: environment
+    type: string
+  # Umgebungen, deren Paket in den Store geht: ohne key im Manifest. Eine Liste oder ein einzelner
+  # Name; join macht aus beidem eine Aufzählung.
+  - name: storeEnvironments
+    type: object
+    default: [prod]
+  # outputs.json aus Plan bzw. Apply
+  - name: outputsFile
+    type: string
+  # Build-Ergebnis der Erweiterung (Artefakt extension) mit manifest.json
+  - name: buildDir
+    type: string
+
+steps:
+  - bash: |
+      set -euo pipefail
+      python3 -c '
+      import json, os, re, shutil, sys, zipfile
+      build_dir, outputs_file, package, environment, store_environments, build_id, work_dir, staging_dir = sys.argv[1:]
+      store = environment in [name.strip() for name in store_environments.split(",")]
+
+      def fail(message):
+          print("##vso[task.logissue type=error]" + message)
+          sys.exit(1)
+
+      copy = os.path.join(work_dir, package)
+      shutil.rmtree(copy, ignore_errors=True)
+      shutil.copytree(build_dir, copy)
+
+      # config.json wie beim Frontend, ohne Bridge-Seite
+      outputs = json.load(open(outputs_file, encoding="utf-8"))
+      config = outputs.get("frontend_config") or {"apiBaseUrl": outputs["function_app_url"]}
+      if isinstance(config.get("auth"), dict):
+          config["auth"].pop("redirectBridgePath", None)
+      with open(os.path.join(copy, "config.json"), "w", encoding="utf-8") as file:
+          json.dump(config, file, indent=2)
+      print("config.json:")
+      print(json.dumps(config, indent=2))
+
+      # Version: Edge erlaubt bis zu vier Zahlen von 0 bis 65535.
+      manifest_file = os.path.join(copy, "manifest.json")
+      manifest = json.load(open(manifest_file, encoding="utf-8"))
+      repo_version = manifest.get("version", "")
+      if not isinstance(repo_version, str) or not re.fullmatch(r"(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){0,3}", repo_version) or max(map(int, repo_version.split("."))) > 65535:
+          fail(f"manifest.json: version ist „{repo_version}“, erwartet bis zu vier Zahlen von 0 bis 65535 ohne führende Nullen, z. B. 1.2.0.")
+      if not build_id.isdigit() or int(build_id) > 65535:
+          fail(f"Die Build-ID {build_id} passt nicht in die vierte Zahl der Version (höchstens 65535). Das Versionsschema der Erweiterung (README von seed-pipelines, Browser-Erweiterung) muss dann geändert werden.")
+      version = ".".join((repo_version.split(".") + ["0", "0"])[:3] + [build_id])
+      manifest["version"] = version
+      print(f"Version: {version} (manifest.json im Repo: {repo_version}, Build-ID {build_id})")
+
+      # key: Der Store vergibt die ID selbst; die entpackte Erweiterung behält mit key ihre feste ID.
+      if not store:
+          if "key" in manifest:
+              print("Paket zum Entpacken, key bleibt.")
+          else:
+              print("##vso[task.logissue type=warning]manifest.json hat keinen key: Die entpackte Erweiterung bekommt eine ID aus ihrem Ordnerpfad, eine Redirect-URI mit fester ID passt dann nicht.")
+      elif "key" in manifest:
+          del manifest["key"]
+          print("Paket für Edge Add-ons, key entfernt.")
+      else:
+          print("Paket für Edge Add-ons, ohne key.")
+      with open(manifest_file, "w", encoding="utf-8") as file:
+          json.dump(manifest, file, indent=2, ensure_ascii=False)
+
+      # manifest.json im Wurzelverzeichnis des Zips, wie Edge Add-ons es verlangt
+      os.makedirs(staging_dir, exist_ok=True)
+      archive = os.path.join(staging_dir, package + ".zip")
+      files = sorted(os.path.relpath(os.path.join(root, name), copy) for root, _, names in os.walk(copy) for name in names)
+      with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+          for path in files:
+              zip_file.write(os.path.join(copy, path), path.replace(os.sep, "/"))
+      print(f"{package}.zip: {len(files)} Dateien, {os.path.getsize(archive)} Bytes")
+      ' "${{ parameters.buildDir }}" "${{ parameters.outputsFile }}" "${{ parameters.name }}-${{ parameters.environment }}" \
+        "${{ parameters.environment }}" "${{ join(',', parameters.storeEnvironments) }}" "$(Build.BuildId)" \
+        "$(Agent.TempDirectory)/extension" "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}"
+    displayName: Browser-Erweiterung packen
+  - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
+    artifact: extension_${{ parameters.environment }}
+    displayName: Artefakt extension_${{ parameters.environment }}
