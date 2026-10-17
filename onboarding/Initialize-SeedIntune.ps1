@@ -32,7 +32,8 @@
          Pipelines freigegeben sein; eine solche Freigabe nimmt das Skript zurück.
       9. Branch-Policies auf main von seed-tenant: Build-Validierung mit seed-intune (prüft die
          Registerdatei ohne Service Connection) und mindestens -MinimumReviewers Freigaben durch
-         andere als die Person, die den PR erstellt oder zuletzt gepusht hat
+         andere als die Person, die den PR erstellt oder zuletzt gepusht hat (mit
+         -AllowSelfApproval auch durch sie)
 
     Ausführen mit einem az-Login, das
       - Anwendungsberechtigungen für Microsoft Graph zustimmen darf (Privileged Role
@@ -73,7 +74,12 @@
 
 .PARAMETER MinimumReviewers
     Freigaben, die ein Pull Request auf main von seed-tenant braucht, Standard 1. Die Person, die
-    ihn erstellt oder zuletzt gepusht hat, zählt nicht.
+    ihn erstellt oder zuletzt gepusht hat, zählt nicht (außer mit -AllowSelfApproval).
+
+.PARAMETER AllowSelfApproval
+    Auch die Person des Pull Requests darf ihn freigeben. Für Teams, in denen nur eine Person die
+    Erweiterungen verantwortet; die Freigabe bleibt ein bewusster Schritt, ist aber kein
+    Vier-Augen-Prinzip mehr. Ohne den Schalter setzt ein erneuter Lauf es wieder.
 
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts, auch nicht in Entra ID oder Azure.
@@ -103,6 +109,7 @@ param(
     [string[]] $AllowedBranches = @(),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
     [ValidateRange(1, 10)] [int] $MinimumReviewers = 1,
+    [switch] $AllowSelfApproval,
     [switch] $DryRun
 )
 
@@ -636,7 +643,8 @@ try {
     # konkreten Plan gegen Intune. Als Pflicht-Policies sperren beide direkte Pushes auf main.
     Write-Host "9. Branch-Policies auf $DefaultBranch von $Repository"
     $buildTitle = "Build-Validierung mit $PipelineName"
-    $reviewTitle = "Mindestens $MinimumReviewers Freigabe(n), nicht durch die Person des PRs"
+    $selfApproval = [bool] $AllowSelfApproval
+    $reviewTitle = if ($selfApproval) { "Mindestens $MinimumReviewers Freigabe(n), auch durch die Person des PRs" } else { "Mindestens $MinimumReviewers Freigabe(n), nicht durch die Person des PRs" }
     if (-not $repo -or -not $hasBranch) {
         Write-Missing $buildTitle "Branch $DefaultBranch in $Repository fehlt noch."
         Write-Missing $reviewTitle "Branch $DefaultBranch in $Repository fehlt noch."
@@ -665,12 +673,13 @@ try {
             } | Out-Null
         }
         $reviewers = Get-Policy $ReviewerPolicyType { param($Policy) $true }
-        if ($reviewers -and ($reviewers.settings.minimumApproverCount -lt $MinimumReviewers -or $reviewers.settings.creatorVoteCounts -or -not $reviewers.isBlocking)) {
+        if ($reviewers -and ($reviewers.settings.minimumApproverCount -lt $MinimumReviewers -or [bool] $reviewers.settings.creatorVoteCounts -ne $selfApproval -or -not $reviewers.isBlocking)) {
             Update-Step $reviewTitle "$($reviewers.settings.minimumApproverCount), eigene Stimme zählt: $($reviewers.settings.creatorVoteCounts), Pflicht: $($reviewers.isBlocking)" {
                 $reviewers.isBlocking = $true
                 $reviewers.isEnabled = $true
                 $reviewers.settings.minimumApproverCount = [Math]::Max($MinimumReviewers, [int] $reviewers.settings.minimumApproverCount)
-                $reviewers.settings.creatorVoteCounts = $false
+                $reviewers.settings.creatorVoteCounts = $selfApproval
+                $reviewers.settings.blockLastPusherVote = -not $selfApproval
                 Invoke-AzDevOps put "$api/policy/configurations/$($reviewers.id)?api-version=7.1" $reviewers
             }
         } else {
@@ -681,8 +690,8 @@ try {
                     type       = @{ id = $ReviewerPolicyType }
                     settings   = @{
                         minimumApproverCount = $MinimumReviewers
-                        creatorVoteCounts    = $false
-                        blockLastPusherVote  = $true
+                        creatorVoteCounts    = $selfApproval
+                        blockLastPusherVote  = -not $selfApproval
                         allowDownvotes       = $false
                         # Eine Freigabe gilt nur für den Stand, den die Person gesehen hat.
                         resetOnSourcePush    = $true
