@@ -1,0 +1,51 @@
+# Sentinel Seed: Edge-Erweiterungen auf die von Intune verwalteten Geräte.
+# Angelegt vom Onboarding (onboarding/Initialize-SeedIntune.ps1 in seed-pipelines). Die eigentliche
+# Pipeline liegt in github.com/blackforestsentinel/seed-pipelines (templates/intune-extensions.yml):
+# Sie hält die Intune-Richtlinie mit ExtensionInstallForcelist gleich der Registerdatei
+# extensions.yaml. Ändert sich etwas, wartet der Lauf auf die Freigabe im Environment
+# __ENVIRONMENT__. Pull Requests prüfen nur die Registerdatei.
+name: intune-$(Date:yyyyMMdd)$(Rev:.r)
+
+# Läuft nach jedem Merge auf main, der die Registerdatei oder diese Datei ändert, und von Hand.
+# Wer registry unten ändert, passt auch den Pfad hier an.
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - extensions.yaml
+      - azure-pipelines.yml
+
+# PR-Läufe startet die Branch-Policy auf main, nicht dieser Trigger.
+pr: none
+
+# Nur von Hand ankreuzen: Eine leere Registerdatei löscht dann die Richtlinie, und Edge
+# deinstalliert alle Erweiterungen. Ohne Bestätigung bricht der Plan bei leerer Datei ab.
+parameters:
+  - name: allowEmpty
+    displayName: Alle Erweiterungen entfernen (leere Registerdatei anwenden)
+    type: boolean
+    default: false
+
+resources:
+  repositories:
+    # Der Name seed ist fest: Das Template checkt dieses Repo aus (Skript scripts/intune/intune.py).
+    # Ein neuer Tag braucht vorher das Onboarding mit derselben -SeedPipelinesVersion, sonst
+    # lehnt die Prüfung „Required template“ an der Service Connection den Lauf ab.
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/tags/__SEED_PIPELINES_VERSION__
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/intune-extensions.yml@seed
+  parameters:
+    serviceConnection: __SERVICE_CONNECTION__
+    environment: __ENVIRONMENT__
+    registry: extensions.yaml
+    policyName: __POLICY_NAME__
+    # Alte Richtlinien, die beim ersten Lauf übernommen (umbenannt) statt neu angelegt werden
+    adoptPolicies: __ADOPT_POLICIES__
+    allowEmpty: ${{ parameters.allowEmpty }}
