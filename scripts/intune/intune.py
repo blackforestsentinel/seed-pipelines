@@ -55,6 +55,8 @@ SETTING_CANDIDATES = (
     "device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensioninstallforcelist",
 )
 FORCELIST_SUFFIX = "extensions_extensioninstallforcelist"
+# Nur Edge zählt als Konflikt; Chrome (…~policy~googlechrome~…) hat eine eigene Forcelist.
+EDGE_POLICY_MARKER = "~policy~microsoft_edge~"
 ALL_USERS = "#microsoft.graph.allLicensedUsersAssignmentTarget"
 EXCLUSION = "#microsoft.graph.exclusionGroupAssignmentTarget"
 
@@ -518,7 +520,7 @@ def entries_in(settings: list[dict], ids: tuple[str, str, str]) -> tuple[list[st
 
 def sets_forcelist(settings: list[dict], setting_id: str) -> bool:
     ids = {s.get("settingInstance", {}).get("settingDefinitionId", "") for s in settings}
-    return setting_id in ids or any(i.endswith(FORCELIST_SUFFIX) for i in ids)
+    return setting_id in ids or any(i.endswith(FORCELIST_SUFFIX) and EDGE_POLICY_MARKER in i for i in ids)
 
 
 def active_targets(assignments: list[dict]) -> list[dict]:
