@@ -15,7 +15,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.10.0
+      ref: refs/tags/v0.11.0
       endpoint: github-blackforestsentinel
 
 extends:
@@ -50,13 +50,19 @@ extends:
 | Stage | Inhalt |
 | --- | --- |
 | `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
-| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`, Plan als Artefakt; merkt sich, ob sich die Infrastruktur ändert. Ohne Änderungen die Outputs als Artefakt `tfoutputs_<env>` |
+| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>` |
 
 Ohne Infrastruktur-Änderungen entfällt `apply_<env>` samt Freigabe. Ein Plan, der nur Ressourcen im State verschiebt (`moved`-Blöcke nach einem Update von seed-terraform), zählt nicht als Änderung: Terraform wiederholt die Verschiebung bei jedem Plan und speichert sie mit dem nächsten echten Apply. `deploy_<env>` lässt sich nach einem Fehler einzeln neu starten, weil sie keinen Plan anwendet. Scheitert `apply_<env>` an einem veralteten Plan, braucht es einen neuen Lauf.
 
 Umgebungen laufen in der Reihenfolge der Liste nacheinander.
+
+### Plan neben dem State
+
+Eine Plan-Datei enthält den State samt aller sensiblen Werte im Klartext, etwa den Deployment-Token der Static Web App. Als Artefakt am Lauf könnte sie jeder laden, der die Pipeline lesen darf, und mit dem Token eigene Inhalte auf die Web-App deployen. Der Plan liegt deshalb im Container des Terraform-States unter `plans/<project>/<env>/<Build.BuildId>.tfplan`; dort kommt nur hin, wer auch den State lesen darf. `apply_<env>` lädt ihn von dort und löscht ihn nach dem Apply. Pläne, die nie angewendet werden (Freigabe abgelehnt oder abgelaufen), löscht der nächste Plan derselben Umgebung nach 31 Tagen. Die Deployment-Identität braucht dafür keine weiteren Rechte: `Storage Blob Data Contributor` auf dem Container hat sie aus dem Onboarding.
+
+Bis v0.10.0 lag der Plan als Artefakt `tfplan_<env>` am Lauf. Wer von dort umsteigt, setzt nach dem ersten Lauf mit der neuen Version die Deployment-Tokens der Static Web Apps zurück (`az staticwebapp secrets reset-api-key --name <swa> --resource-group <rg>`); der Deploy liest den Token jedes Mal neu. Die alten Artefakte enthalten dann nur noch ungültige Tokens. Die übrigen Schlüssel im State (Storage, Application Insights) sind ohne Wirkung, weil die Seed-Module Shared Key und lokale Anmeldung abschalten.
 
 ### Laufzeit
 
@@ -238,7 +244,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 [`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal je Subscription und Azure-DevOps-Projekt alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
-git clone --branch v0.10.0 https://github.com/blackforestsentinel/seed-pipelines.git
+git clone --branch v0.11.0 https://github.com/blackforestsentinel/seed-pipelines.git
 cd seed-pipelines
 ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
   -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
@@ -249,13 +255,19 @@ cd seed-pipelines
 2. Azure: `Contributor` und `Role Based Access Control Administrator` auf der Subscription. Die Bedingung erlaubt nur die Rollen, die Seed-Module vergeben: Storage-Datenrollen, `Key Vault Secrets User` und `Key Vault Secrets Officer`, `Monitoring Metrics Publisher`. Nach einem Seed-Update mit neuen Rollen das Skript erneut ausführen; es ersetzt dann die ältere Bedingung. Dazu kommt die eigene Rolle `Sentinel Seed Lock Contributor`, die nur Löschsperren lesen, setzen und entfernen darf (Modul `storage`); Contributor allein darf das nicht.
 3. Microsoft Graph: `Application.ReadWrite.OwnedBy` mit Admin-Consent (Modul `sso`)
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
-5. Service Connection per Workload Identity Federation
+5. Service Connection per Workload Identity Federation, mit Branch-Prüfung (siehe unten)
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
 7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
 8. GitHub-Service-Connection für alle Pipelines
 9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen.
 
 **Weitere Subscription im selben Tenant:** Das Skript erneut ausführen, mit eigener Identität und Service Connection (`-IdentityName`, `-ServiceConnectionName`). Der State-Account bekommt nach Default je Subscription einen eigenen Namen. Die Rolle `Sentinel Seed Lock Contributor` gibt es im Tenant nur einmal: Das Skript sucht sie in allen Subscriptions, die das Konto sieht, und nimmt die neue Subscription in ihre `assignableScopes` auf (im DryRun `[alt]`). Dafür braucht das Konto auch in den Subscriptions, in denen die Rolle schon zuweisbar ist, Owner oder User Access Administrator. Bestehende Identitäten fasst das Skript nicht an.
+
+**Branch-Prüfung:** An der Azure-Service-Connection hängt der Check „Branch control“: Nur Läufe von `-AllowedBranches` (Standard `main`, Muster wie `release/*` erlaubt) bekommen die Deployment-Identität, PR-Läufe und Feature-Branches nicht. Freigaben allein reichen dafür nicht, denn sie hängen an den Environments: Eine geänderte Pipeline-Datei auf einem Feature-Branch, die die Service Connection direkt nutzt, käme ohne die Prüfung an der Freigabe vorbei und hätte die Rechte der Identität auf der ganzen Subscription. Ein erneuter Lauf mit anderen Branches aktualisiert die Prüfung.
+
+Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed-pipelines`, das Projekte über einen Tag einbinden. Deshalb erlaubt sie zusätzlich `-TemplateRefs` (Standard `refs/tags/v*`); ohne sie scheitert jeder Lauf auf `main`. Die Kehrseite: Ein Tag `v…` im Projekt-Repo und ein Lauf darauf kämen ebenfalls durch. In den Projekt-Repos sollten deshalb nur Administratoren Tags anlegen dürfen: unter Project Settings → Repositories → Security „Create tag“ auf Deny für Contributors, Build Administrators, `<Projekt> Build Service` und `Project Collection Build Service`. Seed-Pipelines legen selbst keine Tags an. Wer Seed-Änderungen in einem Testprojekt vor dem Release prüft, nimmt die Branches von seed-pipelines in `-TemplateRefs` auf, etwa `refs/heads/feat/*`.
+
+Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1 -EnableBranchPolicy`. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` mit `-EnableBranchPolicy` bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
 `-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)); der PAT entfällt dann.
 
@@ -281,7 +293,7 @@ Ein Projekt mit eigenem Repo und eigenen Pipelines zieht ohne neues Repo auf See
 - Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`
 - die Pipeline-Definition für die YAML-Datei (Default `azure-pipelines.yml`), ohne sie zu starten
 - die Berechtigungen der Pipeline für die Environments, die Azure- und die GitHub-Service-Connection; das „Permit“ beim ersten Lauf entfällt
-- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung
+- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch)
 
 Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das Onboarding prüft es jeden Schritt zuerst, und `-DryRun` zeigt nur an, was fehlt. Die Reihenfolge:
 
@@ -306,7 +318,7 @@ Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das
 4. **Pipeline auf dem Branch** von Hand starten (`az pipelines run --name <pipeline> --branch <branch>`) und Plan, Deploy und Smoke-Test prüfen. Ein Lauf auf einem Branch deployt wie einer auf `main`, mit denselben Freigaben; wer zuerst nur die erste Umgebung prüfen will, lehnt die Freigabe der nächsten ab.
 5. **Alte Pipelines deaktivieren**, bevor der Branch nach `main` geht (Pipeline-Einstellungen, „Disabled“). Sonst startet der Merge sie mit: eine alte Pipeline auf derselben YAML-Datei mit dem neuen Inhalt, andere mit ihren alten Dateien, solange es diese noch gibt.
 6. **Mergen.** Ab dann deployt die Seed-Pipeline bei jedem Push auf `main`.
-7. **Branch-Policy nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern und `-EnableBranchPolicy`. Das Skript prüft vorher, dass die YAML-Datei auf `main` `web-app.yml` ab v0.5.0 einbindet; mit der alten Datei würden PR-Läufe deployen. Danach gehen Änderungen an `main` nur noch per PR.
+7. **Branch-Policy nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern und `-EnableBranchPolicy`. Das Skript prüft vorher, dass die YAML-Datei auf `main` `web-app.yml` ab v0.5.0 einbindet; mit der alten Datei würden PR-Läufe deployen. Danach gehen Änderungen an `main` nur noch per PR, und nur Läufe von `main` bekommen die Azure-Service-Connection.
 
 Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben Pfad, startet ein Push auf `main` auch die neue Pipeline, mit dem alten Inhalt. Diese Pipeline ist für die alten Service Connections und Environments nicht berechtigt und fragt nach Zugriff: solche Läufe abbrechen, den Zugriff nicht erlauben. `Initialize-SeedProject.ps1` weist darauf hin und listet die übrigen aktiven Pipelines des Repos.
 

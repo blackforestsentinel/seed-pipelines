@@ -16,6 +16,9 @@
       3. Berechtigungen der Pipeline für die Environments, die Azure-Service-Connection und
          die GitHub-Service-Connection
       4. Nur mit -EnableBranchPolicy: Branch-Policy für die PR-Validierung
+      5. Nur mit -EnableBranchPolicy: Branch-Prüfung an der Azure-Service-Connection, nur Läufe
+         von -AllowedBranches (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs
+         (Standard refs/tags/v*) bekommen die Deployment-Identität
 
     Einstellungen wie in ado-project: Freigabe durch eine der genannten Personen, auch durch
     die, die den Lauf gestartet hat, 30 Tage Zeit; Policy blockierend, Ergebnis 12 Stunden
@@ -48,6 +51,19 @@
     Default-Branch web-app.yml aus seed-pipelines ab v0.5.0 einbindet; mit der alten Datei
     oder einer älteren Version würden PR-Läufe deployen.
 
+.PARAMETER AllowedBranches
+    Branches, deren Läufe die Azure-Service-Connection nutzen dürfen (Check „Branch control“),
+    Standard der Default-Branch. Gesetzt wird die Prüfung erst mit -EnableBranchPolicy: Bis zum
+    Umschalten testet die Migration auf einem eigenen Branch. Gilt für alle Pipelines, die diese
+    Service Connection nutzen. Muster wie refs/heads/release/* sind erlaubt.
+
+.PARAMETER TemplateRefs
+    Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
+    Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
+    Projekte über einen Tag einbinden. Ein Tag v… im Projekt-Repo und ein Lauf darauf kämen
+    deshalb ebenfalls durch: Im Projekt-Repo sollten nur Administratoren Tags anlegen dürfen
+    (README, Branch-Prüfung).
+
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts.
 
@@ -71,6 +87,8 @@ param(
     [string] $PipelineName = '',
     [string] $DefaultBranch = 'main',
     [switch] $EnableBranchPolicy,
+    [string[]] $AllowedBranches = @(),
+    [string[]] $TemplateRefs = @('refs/tags/v*'),
     [switch] $DryRun
 )
 
@@ -84,6 +102,10 @@ function Split-List([string[]] $Values) {
 $Environments = Split-List $Environments
 $Approvers = Split-List $Approvers
 $AppApprovalEnvironments = Split-List $AppApprovalEnvironments
+$AllowedBranches = Split-List $AllowedBranches
+if (-not $AllowedBranches) { $AllowedBranches = @($DefaultBranch) }
+$AllowedBranchRefs = @(@($AllowedBranches | ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) +
+    @(Split-List $TemplateRefs)) -join ','
 
 if ($SeedProjectName -cnotmatch '^[a-z][a-z0-9-]{1,18}[a-z0-9]$') {
     throw 'SeedProjectName: 3-20 Zeichen, Kleinbuchstaben, Ziffern und Bindestriche, beginnt mit einem Buchstaben.'
@@ -102,6 +124,8 @@ $Identities = "https://vssps.dev.azure.com/$orgName/_apis/identities"
 $AzureDevOpsResource = '499b84ac-1321-427f-aa17-267ca6975798'
 $ApprovalCheckType = '8c6f20a7-a545-4486-9777-f762fafe0d4d'
 $BuildPolicyType = '0609b952-1397-4640-95ec-e00a01b2c241'
+$BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
+$BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
 $BranchRef = "refs/heads/$DefaultBranch"
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-project-$(Get-Random)")
@@ -362,6 +386,48 @@ try {
             } | Out-Null
             $true
         } | Out-Null
+    }
+
+    # --- 5. Branch-Prüfung ------------------------------------------------------------------
+    # Freigaben hängen an den Environments. Eine geänderte Pipeline-Datei auf einem Feature-Branch,
+    # die die Service Connection direkt nutzt, hielten sie nicht auf; die Branch-Prüfung schon.
+    # Wie die Branch-Policy erst nach dem Umschalten, weil die Migration vorher auf einem Branch
+    # testet. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert.
+    Write-Host '5. Branch-Prüfung an der Azure-Service-Connection'
+    $branchTitle = "Branch-Prüfung an ${ServiceConnectionName}: $AllowedBranchRefs"
+    if (-not $EnableBranchPolicy) {
+        Write-Host "          entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
+    } elseif (-not $azure) {
+        Write-Missing $branchTitle 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.'
+    } else {
+        $checks = "$api/pipelines/checks/configurations"
+        $existing = (Invoke-AzDevOps get "$checks`?resourceType=endpoint&resourceId=$($azure.id)&`$expand=settings&api-version=7.1-preview.1").value |
+            Where-Object { $_.type.id -eq $BranchControlCheckType -and $_.settings.definitionRef.id -eq $BranchControlDefinition } |
+            Select-Object -First 1
+        $body = @{
+            type     = @{ id = $BranchControlCheckType; name = 'Task Check' }
+            resource = @{ type = 'endpoint'; id = "$($azure.id)"; name = $azure.name }
+            settings = @{
+                definitionRef = @{ id = $BranchControlDefinition; name = 'evaluatebranchProtection'; version = '0.0.1' }
+                displayName   = 'Sentinel Seed: nur freigegebene Branches'
+                inputs        = @{ allowedBranches = $AllowedBranchRefs; ensureProtectionOfBranch = 'false'; allowUnknownStatusBranch = 'false' }
+            }
+            timeout  = 1440
+        }
+        if ($existing -and $existing.settings.inputs.allowedBranches -ne $AllowedBranchRefs) {
+            if ($DryRun) {
+                Write-Host "  [alt]   $branchTitle (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Yellow
+                $missing.Add($branchTitle)
+            } else {
+                $body.id = $existing.id
+                Invoke-AzDevOps patch "$checks/$($existing.id)?api-version=7.1-preview.1" $body | Out-Null
+                Write-Host "  [neu]   $branchTitle (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Green
+            }
+        } else {
+            Invoke-Step $branchTitle { $existing } {
+                Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
+            } | Out-Null
+        }
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------
