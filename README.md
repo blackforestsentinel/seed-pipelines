@@ -52,7 +52,7 @@ extends:
 | `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
-| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>` |
+| `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
 
 Ohne Infrastruktur-Änderungen entfällt `apply_<env>` samt Freigabe. Ein Plan, der nur Ressourcen im State verschiebt (`moved`-Blöcke nach einem Update von seed-terraform), zählt nicht als Änderung: Terraform wiederholt die Verschiebung bei jedem Plan und speichert sie mit dem nächsten echten Apply. `deploy_<env>` lässt sich nach einem Fehler einzeln neu starten, weil sie keinen Plan anwendet. Scheitert `apply_<env>` an einem veralteten Plan, braucht es einen neuen Lauf.
 
@@ -163,9 +163,20 @@ $common = @{
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
   -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
   -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
+# Erweiterung ohne signing: im Deploy nur Paket und Artefakt
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
+  -ExpectDeploySteps 'Custom Connector', 'Browser-Erweiterung packen', "Artefakt extension_$($common.Replace.ENVIRONMENT)" `
+  -AbsentDeploySteps 'Erweiterung signieren und veröffentlichen'
+# Erweiterung mit signing: Checkout, Schlüssel, Veröffentlichen, danach erst die Artefakte
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension-signing.yml `
+  -ExpectBuildSteps 'Manifest der Erweiterung prüfen' `
+  -ExpectDeploySteps 'Browser-Erweiterung packen', 'seed-pipelines auschecken (Skript der Erweiterung)', `
+    'Signaturschlüssel der Erweiterung', 'Erweiterung signieren und veröffentlichen', `
+    "Artefakt extension_$($common.Replace.ENVIRONMENT)", "Artefakt extension_release_$($common.Replace.ENVIRONMENT)"
 ```
 
 - `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
+- `-ExpectDeploySteps` und `-AbsentDeploySteps` prüfen die erste Stage `deploy_<umgebung>` wie die Build-Schritte. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
 - Die Pipeline-ID dient nur als Rahmen (Projekt, GitHub-Service-Connection); ihre eigene YAML-Datei spielt keine Rolle. Service Connections und Environments, die das YAML nennt, müssen im Projekt existieren, sonst lehnt Azure DevOps schon die Vorschau ab. Deshalb nennt das Beispiel für den normalen Lauf ein vorhandenes Seed-Projekt und eine seiner Umgebungen; der Prüflauf braucht beides nicht.
 - Ebenso lässt sich das YAML eines Projekts vor dem Umstellen prüfen, etwa bei einer Migration, deren Projekt in Azure DevOps noch keine Seed-Service-Connection hat: `-Replace` bzw. eine angepasste Kopie mit einer Service Connection des Rahmenprojekts.
 
@@ -205,14 +216,60 @@ extends:
       # outputPath: dist             # Build-Ausgabe relativ zu path, dort liegt manifest.json
       # name: my-extension           # Dateiname der Pakete, Standard project
       # storeEnvironments: [prod]    # Pakete für Edge Add-ons, ohne key
+      # signing:                     # selbst gehostet für verwaltete Geräte, siehe unten
+      #   secureFile: my-extension.pem
+      #   id: abcdefghijklmnopabcdefghijklmnop
 ```
 
 - **Build**, auch im PR-Lauf und mit `validationOnly`: nach dem Frontend-Build und vor `extraBuildSteps` `npm ci`, `npm test` und `npm run build` in `path`, mit Node in `nodeVersion`. Danach muss `<path>/<outputPath>/manifest.json` Manifest V3 sein und eine gültige `version` haben. Im Hauptlauf wird die Build-Ausgabe zum Artefakt `extension`.
 - **Deploy:** Als letzter Schritt von `deploy_<env>`, nach Smoke-Test und Custom Connector, entsteht aus einer Kopie das Paket `<name>-<env>.zip` (Artefakt `extension_<env>`, `manifest.json` im Wurzelverzeichnis). Darin `config.json` wie beim Frontend aus dem Output `frontend_config`, aber ohne `auth.redirectBridgePath`, denn die Erweiterung hat keine Bridge-Seite. Anders als sonst gibt es also je Umgebung ein eigenes Paket, weil die Konfiguration im Paket steckt; gebaut und getestet wird trotzdem nur einmal.
 - **Version:** die ersten drei Zahlen aus `version` im `manifest.json` des Repos (fehlende als 0, eine vierte wird ersetzt), dazu die Build-ID als vierte, etwa `1.2.0.2160`. So steigt die Version mit jedem Lauf, wie der Store es verlangt; die ersten drei Stellen pflegt das Team im Repo. Edge erlaubt je Stelle höchstens 65535, eine größere Build-ID bricht ab.
 - **`key`:** Im Paket für die Umgebungen aus `storeEnvironments` entfernt die Pipeline `key` aus dem Manifest, denn Edge Add-ons vergibt die ID selbst. In den übrigen bleibt `key`, damit die entpackte Erweiterung ihre feste ID und damit ihre Redirect-URI behält; fehlt er dort, warnt die Pipeline.
-- **Veröffentlichen von Hand:** Das Paket der Store-Umgebung lädt ein Mensch in Edge Add-ons hoch, die übrigen werden für Tests entpackt geladen. Eine Anbindung an die API von Edge Add-ons gibt es nicht.
+- **Veröffentlichen von Hand:** Das Paket der Store-Umgebung lädt ein Mensch in Edge Add-ons hoch, die übrigen werden für Tests entpackt geladen. Eine Anbindung an die API von Edge Add-ons gibt es nicht. Ohne Store geht es mit `signing` (unten).
 - Redirect-URI und CORS für die Erweiterung setzt das Projekt in `project.yaml` (README von seed-template, „Browser-Erweiterungen“).
+
+#### Signieren und Veröffentlichen für verwaltete Geräte
+
+Statt über Edge Add-ons kann das Projekt die Erweiterung selbst ausliefern: Mit `extension.signing` signiert `deploy_<env>` das Paket als CRX3 und legt es im Daten-Storage des Projekts ab. Die API liefert es mit [`Bfs.Seed.Extension`](https://github.com/blackforestsentinel/seed-packages/tree/main/dotnet/src/Bfs.Seed.Extension) unter `/api/extension/updates.xml` aus; verwaltete Geräte installieren es von dort per Intune-Richtlinie (`ExtensionInstallForcelist`) und holen Updates selbst, alle paar Stunden.
+
+```yaml
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    # ...
+    extension:
+      path: extension
+      name: my-extension
+      signing:
+        secureFile: my-extension.pem           # Secure File mit dem privaten Schlüssel (PEM)
+        id: abcdefghijklmnopabcdefghijklmnop   # Erweiterungs-ID, die aus dem Schlüssel folgt
+        # environments: [prod]                 # Standard [prod], auch ein einzelner Name
+```
+
+- **Ablauf** in den Umgebungen aus `signing.environments`, nach dem Paket `<name>-<env>.zip`: [`scripts/extension/publish.py`](scripts/extension/publish.py) setzt im Manifest `update_url` auf `<apiBaseUrl>/api/extension/updates.xml`, packt das Zip deterministisch und signiert es mit dem Schlüssel aus der Secure File. Ergibt der Schlüssel eine andere ID als `signing.id`, bricht der Schritt vor dem Upload ab. Danach lädt er in den Container `extension` des Storage Accounts mit dem Tag `seed:module=storage` (Resource Group der Umgebung) zuerst `<name>-<version>.crx` und dann `current.json` hoch. Zuletzt fragt er `updates.xml` ab, bis die API die neue Version mit dem passenden CRX ausliefert, bis zu drei Minuten lang; jede Instanz hält `current.json` eine Minute im Speicher. CRX und `release.json` (ID, Version, Datei, SHA-256, `updateUrl`) kommen als Artefakt `extension_release_<env>`.
+- **Unveränderter Inhalt:** Ist der Inhalt ohne die Version derselbe wie der veröffentlichte, lädt der Schritt nichts hoch und prüft nur die Auslieferung. Sonst bekämen die Geräte mit jedem Lauf ein Update, weil die Version mit der Build-ID steigt.
+- **Downgrade-Schutz:** Eine kleinere oder gleiche Version mit anderem Inhalt bricht ab, etwa wenn `deploy_<env>` eines älteren Laufs neu gestartet wird. Browser installieren keine kleinere Version, und ein altes Paket unter derselben Version wäre ein anderes als das, was Browser schon haben. Einen alten Stand bringt ein neuer Lauf mit zurückgenommener Änderung.
+- **`key`:** Das Paket einer signierten Umgebung hat wie die Store-Pakete kein `key`; die ID folgt aus dem Signaturschlüssel. In den übrigen Umgebungen bleibt `key` für die entpackte Erweiterung.
+- **Rechte:** Der Schritt läuft mit der Service Connection der Umgebung und schreibt mit `az storage blob … --auth-mode login`. Die Deployment-Identität braucht dafür `Storage Blob Data Contributor` auf dem Container `extension`; das vergibt das Modul `storage` aus seed-terraform mit `extension_publisher_principal_id`, seed-template übergibt die Identität, mit der Terraform läuft. Eine neue Rolle wirkt erst nach einigen Minuten; bis dahin wiederholt der Schritt den Zugriff bis zu 10 Minuten lang.
+- **Im Projekt** (README von seed-template, „Browser-Erweiterungen“): `features.storage` mit dem Container `extension` in `storage.containers`, das Paket `Bfs.Seed.Extension` mit `builder.AddSeedExtensionUpdates()` in `Program.cs`, Redirect-URI und CORS mit der ID aus dem Schlüssel. Weicht `extension.name` vom Projektnamen ab, braucht die API das App-Setting `Extension__PackageName`. Fehlt der Container, nennt der Schritt ihn; liefert `updates.xml` nichts, fragt er nach `AddSeedExtensionUpdates()`.
+- **Checkout im Deploy:** Für das Skript checkt `deploy_<env>` seed-pipelines selbst aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates), wie `intune-extensions.yml`; bisher kam der Deploy ohne Checkout aus. So steht die Logik nicht als Inline-Python im Template, sondern ist mit Tests abgedeckt (`python3 -m unittest discover -s scripts -p "test_*.py"`, braucht openssl; läuft in der GitHub-CI dieses Repos). Die Repository-Ressource muss dafür `seed` heißen, wie in allen Beispielen.
+- **Neustart:** Die Artefakte entstehen erst nach dem Veröffentlichen. Scheitert ein Schritt davor, kommt `deploy_<env>` mit einem Neustart durch; was schon hochgeladen ist, erkennt der Schritt am Inhalt.
+- **Intune:** Die Richtlinie (`ExtensionInstallForcelist` mit `<id>;<update_url>`) pflegt die zentrale Pipeline `seed-intune` je Tenant (siehe [Intune: Edge-Erweiterungen verteilen](#intune-edge-erweiterungen-verteilen)). Nach dem ersten erfolgreichen Veröffentlichen kommt die Erweiterung per Pull Request in deren Registerdatei; `id` und `updateUrl` stehen in `release.json` (Artefakt `extension_release_<env>`). Vorher lehnt die Prüfung dort den Eintrag ab, weil `updates.xml` die ID noch nicht ausliefert. Edge installiert Erweiterungen außerhalb des Stores nur auf verwalteten Geräten.
+
+#### Schlüssel der Erweiterung
+
+Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 16 Byte als `a` bis `p`). [`onboarding/New-SeedExtensionKey.ps1`](onboarding/New-SeedExtensionKey.ps1) erzeugt lokal einen RSA-Schlüssel (2048 Bit, PEM, PKCS#8), zeigt die ID, lädt den Schlüssel als Secure File ins Azure-DevOps-Projekt und berechtigt die Pipeline dafür. Es läuft mit dem `az`-Login einer Person, die im Projekt Secure Files anlegen darf; `-DryRun` zeigt nur an, was fehlt.
+
+```powershell
+./onboarding/New-SeedExtensionKey.ps1 -KeyFile C:\keys\my-extension.pem `
+  -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
+  -PipelineName <pipeline> -DryRun
+```
+
+- **Ausgabe:** die Werte für `extension.signing` und für `project.yaml` je signierter Umgebung, `auth.extraRedirectUris` (`https://<id>.chromiumapp.org/`) und `hosting.corsAllowedOrigins` (`chrome-extension://<id>`).
+- **Den Schlüssel sicher offline ablegen** (Passwortmanager, Tresor) und die Datei danach löschen. Azure DevOps gibt Secure Files nicht wieder heraus, und ein neuer Schlüssel ergibt eine neue ID: Browser sehen eine neue Erweiterung, Redirect-URI, CORS und die Intune-Richtlinie brauchen die neue ID.
+- **Wiederholen:** Gibt es die Secure File schon, entsteht kein neuer Schlüssel. Mit `-ExistingKey -KeyFile <pem>` lädt das Skript einen vorhandenen Schlüssel hoch, falls die Secure File fehlt, und prüft ihn sonst gegen die ID, die es beim Hochladen an der Secure File vermerkt hat (Eigenschaft `extensionId`).
+- Der private Schlüssel erscheint in keiner Ausgabe. Im Deploy liegt er nur für die Dauer des Jobs auf dem Agent (`DownloadSecureFile@1`).
 
 ### Voraussetzungen
 
@@ -324,7 +381,7 @@ Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben
 
 ## Intune: Edge-Erweiterungen verteilen
 
-Auf verwalteten Windows-Geräten installiert Edge Erweiterungen außerhalb des Stores über die Richtlinie `ExtensionInstallForcelist` mit Einträgen `<id>;<update_url>`. Intune erlaubt diese Einstellung nur in **einer** Richtlinie: Setzen zwei Richtlinien sie, meldet Intune einen Konflikt, und auf den betroffenen Geräten wirkt keine. Deshalb gibt es je Tenant genau eine Pipeline, die genau eine Richtlinie besitzt: `seed-intune` im Repo `seed-tenant` des Azure-DevOps-Projekts, mit [`templates/intune-extensions.yml`](templates/intune-extensions.yml). Welche Erweiterungen dazugehören, steht in der Registerdatei `extensions.yaml` dieses Repos; Änderungen kommen per Pull Request, angewendet wird erst nach Freigabe. Signieren und Veröffentlichen der Erweiterung bleibt Sache des Projekts (Deploy); die Registerdatei nennt nur, wo sie liegt.
+Auf verwalteten Windows-Geräten installiert Edge Erweiterungen außerhalb des Stores über die Richtlinie `ExtensionInstallForcelist` mit Einträgen `<id>;<update_url>`. Intune erlaubt diese Einstellung nur in **einer** Richtlinie: Setzen zwei Richtlinien sie, meldet Intune einen Konflikt, und auf den betroffenen Geräten wirkt keine. Deshalb gibt es je Tenant genau eine Pipeline, die genau eine Richtlinie besitzt: `seed-intune` im Repo `seed-tenant` des Azure-DevOps-Projekts, mit [`templates/intune-extensions.yml`](templates/intune-extensions.yml). Welche Erweiterungen dazugehören, steht in der Registerdatei `extensions.yaml` dieses Repos; Änderungen kommen per Pull Request, angewendet wird erst nach Freigabe. Signieren und Veröffentlichen der Erweiterung bleibt Sache des Projekts (Deploy mit `extension.signing`, siehe [Signieren und Veröffentlichen für verwaltete Geräte](#signieren-und-veröffentlichen-für-verwaltete-geräte)); die Registerdatei nennt nur, wo sie liegt.
 
 ```yaml
 # seed-tenant/azure-pipelines.yml (Startinhalt aus tenant/, angelegt vom Onboarding)

@@ -1,0 +1,37 @@
+# Vorschau-Beispiel: Browser-Erweiterung mit extension.signing. Erwartet: im Build wie extension.yml;
+# in deploy_<umgebung> nach dem Paket der Checkout von seed-pipelines, der Signaturschlüssel, das
+# Signieren und Veröffentlichen und erst danach die Artefakte extension_<umgebung> und
+# extension_release_<umgebung>.
+# Platzhalter: __PROJECT__ und __ENVIRONMENT__ (die Environments <projekt>-<umgebung> und
+# <projekt>-<umgebung>-app müssen im Projekt existieren), __SERVICE_CONNECTION__ (ebenso),
+# __GITHUB_CONNECTION__. Die Secure File muss es nicht geben; die Vorschau sucht sie nicht.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: __PROJECT__
+    serviceConnection: __SERVICE_CONNECTION__
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    environments:
+      - name: __ENVIRONMENT__
+    extension:
+      path: extension
+      name: my-extension
+      signing:
+        secureFile: my-extension.pem
+        id: abcdefghijklmnopabcdefghijklmnop
+        # Ein einzelner Name statt einer Liste, wie bei storeEnvironments erlaubt
+        environments: __ENVIRONMENT__

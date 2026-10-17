@@ -432,6 +432,9 @@ def main(argv: list[str]) -> int:
         fail(f"--name „{args.name}“: Kleinbuchstaben, Ziffern und Bindestriche, höchstens 63 Zeichen (wie Bfs.Seed.Extension).")
     if not ID_PATTERN.fullmatch(args.expect_id):
         fail(f"--expect-id „{args.expect_id}“: 32 Zeichen a bis p erwartet.")
+    # Leer heißt im Deploy: Output resource_group_name fehlt. Dann nicht still nur packen.
+    if args.resource_group == "" or args.storage_account == "":
+        fail("--resource-group bzw. --storage-account ist leer (Output resource_group_name von Terraform?).")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
