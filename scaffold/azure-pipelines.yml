@@ -62,6 +62,8 @@ extends:
     appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
     startFirstRun: ${{ parameters.startFirstRun }}
     pipelinesVersion: __SEED_PIPELINES_VERSION__
+    # Eigener Agent-Pool, etwa Default; leer: Microsoft-gehostete Agents
+    pool: '__POOL__'
     serviceConnection: __SERVICE_CONNECTION__
     githubConnection: __GITHUB_CONNECTION__
     terraformState:

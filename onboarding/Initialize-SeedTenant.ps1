@@ -69,6 +69,10 @@
     deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts sollten nur Administratoren
     Tags anlegen dürfen (README, Branch-Prüfung).
 
+.PARAMETER Pool
+    Agent-Pool für seed-scaffold, etwa Default für eigene Agents; leer: Microsoft-gehostete
+    Agents. Landet in azure-pipelines.yml im Repo seed-scaffold (README, Eigene Agents).
+
 .PARAMETER PowerPlatformEnvironmentUrl
     Umgebungs-URL (Dataverse) jeder Power-Platform-Umgebung, in der Seed-Projekte mit
     features.customConnector einen Connector anlegen, z. B. https://org0000000.crm4.dynamics.com
@@ -99,6 +103,7 @@ param(
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [string] $Pool = '',
     [switch] $SkipScaffold,
     [switch] $DryRun
 )
@@ -537,7 +542,8 @@ try {
                     Replace('__SERVICE_CONNECTION__', $ServiceConnectionName).
                     Replace('__STATE_RESOURCE_GROUP__', $StateResourceGroup).
                     Replace('__STATE_STORAGE_ACCOUNT__', $StateStorageAccount).
-                    Replace('__STATE_CONTAINER__', $StateContainer)
+                    Replace('__STATE_CONTAINER__', $StateContainer).
+                    Replace('__POOL__', $Pool)
                 Invoke-AzDevOps post "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1" @{
                     refUpdates = @(@{ name = 'refs/heads/main'; oldObjectId = '0000000000000000000000000000000000000000' })
                     commits    = @(@{

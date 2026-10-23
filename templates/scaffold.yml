@@ -62,9 +62,15 @@ parameters:
   - name: terraformVersion
     type: string
     default: '1.15.3'
+  # Microsoft-gehosteter Agent; gilt nur, solange pool leer ist.
   - name: vmImage
     type: string
     default: ubuntu-24.04
+  # Eigener Agent-Pool statt Microsoft-gehosteter Agents, z. B. Default. Linux-Agents mit bash,
+  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents).
+  - name: pool
+    type: string
+    default: ''
 
 stages:
   - stage: scaffold
@@ -73,7 +79,10 @@ stages:
       - job: scaffold
         displayName: Repo, Environments, Pipeline
         pool:
-          vmImage: ${{ parameters.vmImage }}
+          ${{ if eq(parameters.pool, '') }}:
+            vmImage: ${{ parameters.vmImage }}
+          ${{ else }}:
+            name: ${{ parameters.pool }}
         workspace:
           clean: all
         steps:
