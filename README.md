@@ -283,7 +283,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
-- **Was die Agents brauchen:** Linux (x64) mit bash, curl, unzip, tar, git, python3 und der Azure CLI; für `extension.signing` zusätzlich openssl.
+- **Was die Agents brauchen:** Linux (x64) mit bash, curl, unzip, tar, git, python3 und der Azure CLI. Für `features.customConnector` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl.
 - **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents.
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
