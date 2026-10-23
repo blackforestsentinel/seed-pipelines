@@ -10,7 +10,9 @@
     im Zielprojekt Rechte; dieses Skript gibt sie ihr, über eine eigene Gruppe statt über
     Project Administrators. Jeder Schritt prüft zuerst und legt nur an, was fehlt.
 
-      1. Gruppe "Sentinel Seed Scaffold" im Projekt, Mitglied: die Build-Service-Identität
+      1. Gruppe "Sentinel Seed Scaffold" im Projekt, Mitglied: die Build-Service-Identität;
+         Recht View project-level information (ohne es sieht ein Token aus einem anderen
+         Projekt hier gar nichts)
       2. Git (alle Repos des Projekts): Read, Contribute, Create branch, Edit policies
       3. Pipelines (alle des Projekts): View, Create und Edit build pipeline, Queue builds
       4. Environments: Rolle Creator (wer ein Environment anlegt, wird dessen Administrator)
@@ -60,6 +62,7 @@ $Vssps = "https://vssps.dev.azure.com/$orgName"
 $AzureDevOpsResource = '499b84ac-1321-427f-aa17-267ca6975798'
 $GitNamespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'
 $BuildNamespace = '33344d9c-fc72-4d6f-aba5-fa317101a7e9'
+$ProjectNamespace = '52d39943-cb85-4d7f-8fa8-c6baac873819'
 $missing = [Collections.Generic.List[string]]::new()
 
 function Get-AuthHeader {
@@ -184,6 +187,11 @@ if ($group) {
 # --- 2.–5. Rechte der Gruppe ----------------------------------------------------------------
 if ($group) {
     $groupIdentity = Get-Identity $group.descriptor
+    # Ohne dieses Recht sieht das Job-Token aus einem anderen Projekt hier nichts, auch kein Repo
+    # mit Leserecht (Microsoft: Zugriff eines Projekts auf ein anderes).
+    Write-Host '1b. Projekt'
+    Set-Allow 'View project-level information' $ProjectNamespace "`$PROJECT:vstfs:///Classification/TeamProject/$($project.id)" $groupIdentity `
+        (Get-ActionBits $ProjectNamespace @('GENERIC_READ'))
     Write-Host '2. Git'
     Set-Allow 'Read, Contribute, Create branch, Edit policies' $GitNamespace "repoV2/$($project.id)" $groupIdentity `
         (Get-ActionBits $GitNamespace @('GenericRead', 'GenericContribute', 'CreateBranch', 'EditPolicies'))
