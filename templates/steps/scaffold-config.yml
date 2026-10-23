@@ -1,0 +1,132 @@
+# Schreibt die Terraform-Konfiguration für seed-scaffold: das Modul seed-terraform//ado-project
+# und die Werte als JSON, nicht als HCL-Text, damit Sonderzeichen nichts aufbrechen.
+# adoProject darf ein Makro wie $(System.TeamProject) sein, aber nie eine Eingabe der startenden
+# Person: Makros landen als Text im Skript.
+parameters:
+  - name: adoProject
+    type: string
+  - name: createRepository
+    type: boolean
+  - name: repository
+    type: string
+  - name: authorizeServiceConnections
+    type: boolean
+  - name: name
+    type: string
+  - name: sso
+    type: boolean
+  - name: mcp
+    type: boolean
+  - name: storage
+    type: boolean
+  - name: frontend
+    type: boolean
+  - name: environments
+    type: object
+  - name: approvers
+    type: object
+  - name: approverGroups
+    type: object
+  - name: requesterCanApprove
+    type: boolean
+  - name: minReviewers
+    type: number
+  - name: appApprovalEnvironments
+    type: object
+  - name: serviceConnection
+    type: string
+  - name: githubConnection
+    type: string
+  - name: terraformState
+    type: object
+  - name: pipelinesVersion
+    type: string
+  - name: projectPool
+    type: string
+  - name: terraformModuleVersion
+    type: string
+
+steps:
+  - bash: |
+      set -euo pipefail
+      dir="$(Agent.TempDirectory)/scaffold"
+      mkdir -p "$dir"
+      cat > "$dir/main.tf" <<'EOF'
+      terraform {
+        required_providers {
+          azuredevops = {
+            source  = "microsoft/azuredevops"
+            version = "1.16.0"
+          }
+        }
+        backend "azurerm" {}
+      }
+
+      provider "azuredevops" {}
+
+      variable "project" {
+        type = any
+      }
+
+      module "project" {
+        source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
+
+        ado_project                   = var.project.ado_project
+        create_repository             = var.project.create_repository
+        repository                    = var.project.repository
+        authorize_service_connections = var.project.authorize_service_connections
+        name                          = var.project.name
+        features                      = var.project.features
+        frontend                      = var.project.frontend
+        environments                  = var.project.environments
+        approvers                     = var.project.approvers
+        approver_groups               = var.project.approver_groups
+        requester_can_approve         = var.project.requester_can_approve
+        min_reviewers                 = var.project.min_reviewers
+        app_approval_environments     = var.project.app_approval_environments
+        service_connection            = var.project.service_connection
+        github_connection             = var.project.github_connection
+        terraform_state               = var.project.terraform_state
+        pipelines_version             = var.project.pipelines_version
+        pool                          = var.project.pool
+      }
+
+      output "repository_web_url" {
+        value = module.project.repository_web_url
+      }
+
+      output "pipeline_id" {
+        value = module.project.pipeline_id
+      }
+      EOF
+      cat > "$dir/terraform.tfvars.json" <<'EOF'
+      {
+        "project": {
+          "ado_project": ${{ convertToJson(parameters.adoProject) }},
+          "create_repository": ${{ lower(parameters.createRepository) }},
+          "repository": ${{ convertToJson(parameters.repository) }},
+          "authorize_service_connections": ${{ lower(parameters.authorizeServiceConnections) }},
+          "name": ${{ convertToJson(parameters.name) }},
+          "features": { "sso": ${{ lower(parameters.sso) }}, "mcp": ${{ lower(parameters.mcp) }}, "storage": ${{ lower(parameters.storage) }} },
+          "frontend": ${{ lower(parameters.frontend) }},
+          "environments": ${{ convertToJson(parameters.environments) }},
+          "approvers": ${{ convertToJson(parameters.approvers) }},
+          "approver_groups": ${{ convertToJson(parameters.approverGroups) }},
+          "requester_can_approve": ${{ lower(parameters.requesterCanApprove) }},
+          "min_reviewers": ${{ parameters.minReviewers }},
+          "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
+          "service_connection": ${{ convertToJson(parameters.serviceConnection) }},
+          "github_connection": ${{ convertToJson(parameters.githubConnection) }},
+          "terraform_state": {
+            "resource_group": ${{ convertToJson(parameters.terraformState.resourceGroup) }},
+            "storage_account": ${{ convertToJson(parameters.terraformState.storageAccount) }},
+            "container": ${{ convertToJson(parameters.terraformState.container) }}
+          },
+          "pipelines_version": ${{ convertToJson(parameters.pipelinesVersion) }},
+          "pool": ${{ convertToJson(parameters.projectPool) }}
+        }
+      }
+      EOF
+      sed -i 's/^      //' "$dir/main.tf" "$dir/terraform.tfvars.json"
+      python3 -m json.tool "$dir/terraform.tfvars.json"
+    displayName: Terraform-Konfiguration schreiben

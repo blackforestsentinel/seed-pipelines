@@ -4,7 +4,7 @@
   check    prüft vor jeder Änderung die Eingaben, das Zielprojekt (Muster; erreichbar heißt
            freigeschaltet), die Mitgliedschaft der startenden Person, das Repo je Modus und die
            Namen der Service Connections im Zielprojekt. Setzt in Azure Pipelines die Variablen
-           seedProjectId, seedRepositoryId und seedDefaultBranch.
+           seedProjectId, seedProjectName, seedRepositoryId und seedDefaultBranch.
   reserve  prüft, dass der Projektname frei ist, und trägt ihn in die Registry im Container des
            Terraform-States ein (scaffold/registry/<name>.json); ein erneuter Lauf für dasselbe
            Azure-DevOps-Projekt ist in Ordnung. Braucht az, angemeldet mit Storage Blob Data
@@ -259,6 +259,9 @@ def run_check(ado: AzureDevOps, options: CheckOptions, central_id: str) -> int:
         fail(*problems)
     log(f"Repo {repo['name']} ({repo['defaultBranch']}), Service Connections: {', '.join(options.connections)}")
     set_variable("seedProjectId", project["id"])
+    # Der Name aus der API darf in Skripte (Terraform-Werte): Azure DevOps lässt in Projektnamen
+    # weder Anführungszeichen noch Steuerzeichen zu.
+    set_variable("seedProjectName", project["name"])
     set_variable("seedRepositoryId", repo["id"])
     set_variable("seedDefaultBranch", repo["defaultBranch"].removeprefix("refs/heads/"))
     return 0
