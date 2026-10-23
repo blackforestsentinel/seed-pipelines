@@ -16,7 +16,7 @@ Pipeline besitzt deshalb die ganze Richtlinie; Einträge, die nicht in der Regis
 entfernt sie.
 
 Übernahme: Fehlt die Richtlinie --policy-name, gibt es aber genau eine aus --adopt (etwa die alte
-„Sentinel Link: Edge-Erweiterung“), wird diese umbenannt und angeglichen, nie gelöscht und neu
+„Kundenportal: Edge-Erweiterung“), wird diese umbenannt und angeglichen, nie gelöscht und neu
 angelegt: Edge würde die Erweiterungen dazwischen deinstallieren.
 
 Braucht für plan und apply az, angemeldet als Identität mit der Graph-Berechtigung
@@ -24,7 +24,7 @@ DeviceManagementConfiguration.ReadWrite.All (Anwendung, onboarding/Initialize-Se
 Nur Standardbibliothek, Python ab 3.10.
 
   python3 scripts/intune/intune.py check --registry extensions.yaml
-  python3 scripts/intune/intune.py plan --registry extensions.yaml --adopt "Sentinel Link: Edge-Erweiterung"
+  python3 scripts/intune/intune.py plan --registry extensions.yaml --adopt "Kundenportal: Edge-Erweiterung"
 """
 
 from __future__ import annotations
@@ -110,8 +110,8 @@ def set_output(name: str, value: str) -> None:
 # Ein bewusst kleiner Ausschnitt aus YAML, den das Skript ohne PyYAML selbst liest:
 #
 #   extensions:
-#     - name: sentinel-link                     # Projekt
-#       id: flpkgokniclbiocmpjpmficmfcdghfgd
+#     - name: kundenportal                      # Projekt
+#       id: ponmlkjihgfedcbaponmlkjihgfedcba
 #       updateUrl: https://func-….azurewebsites.net/api/extension/updates.xml
 #       owner: team@example.com                 # optional
 #       comment: Startseite und Seitenleiste    # optional
@@ -792,7 +792,7 @@ def parse_args(argv: list[str]) -> tuple[str, Options]:
         except ValueError as error:
             fail(f"--adopt-json ist kein JSON: {error}")
         if not isinstance(extra, list) or not all(isinstance(n, str) for n in extra):
-            fail("--adopt-json: erwartet eine Liste von Namen, z. B. [\"Sentinel Link: Edge-Erweiterung\"].")
+            fail("--adopt-json: erwartet eine Liste von Namen, z. B. [\"Kundenportal: Edge-Erweiterung\"].")
         adopt += extra
     adopt = [n.strip() for n in adopt if n.strip()]
     if not args.policy_name.strip():

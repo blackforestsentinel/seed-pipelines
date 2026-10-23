@@ -56,7 +56,7 @@
 
 .PARAMETER AdoptPolicies
     Namen alter Intune-Richtlinien mit ExtensionInstallForcelist, die die Pipeline beim ersten
-    Lauf übernimmt (umbenennt) statt eine neue anzulegen, etwa 'Sentinel Link: Edge-Erweiterung'.
+    Lauf übernimmt (umbenennt) statt eine neue anzulegen, etwa 'Kundenportal: Edge-Erweiterung'.
     Landen nur im Startinhalt von azure-pipelines.yml; danach dort pflegen.
 
 .PARAMETER SeedPipelinesVersion

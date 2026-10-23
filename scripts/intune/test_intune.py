@@ -29,11 +29,11 @@ except ImportError:
 # Fehler sind hier gewollt; ohne TF_BUILD erscheinen sie nicht als Annotation im Lauf.
 os.environ.pop("TF_BUILD", None)
 
-LINK_ID = "flpkgokniclbiocmpjpmficmfcdghfgd"
-LINK_URL = "https://func-sentinel-link-prod-f08084.azurewebsites.net/api/extension/updates.xml"
+PORTAL_ID = "ponmlkjihgfedcbaponmlkjihgfedcba"
+PORTAL_URL = "https://func-kundenportal-prod-1a2b3c.azurewebsites.net/api/extension/updates.xml"
 OTHER_ID = "abcdefghijklmnopabcdefghijklmnop"
 OTHER_URL = "https://func-demo-prod.azurewebsites.net/api/extension/updates.xml"
-LINK = f"{LINK_ID};{LINK_URL}"
+PORTAL = f"{PORTAL_ID};{PORTAL_URL}"
 OTHER = f"{OTHER_ID};{OTHER_URL}"
 IDS = ("device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist",
        "device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist_1",
@@ -46,15 +46,15 @@ DEFINITION = {
     ],
 }
 NAME = intune.POLICY_NAME
-OLD = "Sentinel Link: Edge-Erweiterung"
+OLD = "Kundenportal: Edge-Erweiterung"
 
 REGISTRY = f"""\
 # Edge-Erweiterungen dieses Tenants
 extensions:
-  - name: sentinel-link            # Projekt
-    id: {LINK_ID}
-    updateUrl: {LINK_URL}
-    owner: ian.winter@blackforestsentinel.de
+  - name: kundenportal            # Projekt
+    id: {PORTAL_ID}
+    updateUrl: {PORTAL_URL}
+    owner: team@example.org
     comment: 'Startseite: Kacheln # und Suche'
 
   - name: demo
@@ -63,7 +63,7 @@ extensions:
 """
 
 
-def manifest(appid=LINK_ID, codebase="https://example.org/a.crx", version="1.0.0.1", ns=True):
+def manifest(appid=PORTAL_ID, codebase="https://example.org/a.crx", version="1.0.0.1", ns=True):
     xmlns = ' xmlns="http://www.google.com/update2/response"' if ns else ""
     check = f'<updatecheck codebase="{codebase}" version="{version}"/>' if codebase else ""
     return f'<?xml version="1.0"?><gupdate protocol="2.0"{xmlns}><app appid="{appid}">{check}</app></gupdate>'.encode()
@@ -137,17 +137,17 @@ class RegistryTests(unittest.TestCase):
     def test_parses_entries_with_comments_and_quotes(self):
         extensions = intune.parse_registry(REGISTRY)
 
-        self.assertEqual([e.name for e in extensions], ["sentinel-link", "demo"])
+        self.assertEqual([e.name for e in extensions], ["kundenportal", "demo"])
         self.assertEqual(extensions[0].comment, "Startseite: Kacheln # und Suche")
-        self.assertEqual(extensions[0].owner, "ian.winter@blackforestsentinel.de")
+        self.assertEqual(extensions[0].owner, "team@example.org")
         self.assertEqual(extensions[1].id, OTHER_ID)
-        self.assertEqual(intune.desired_entries(extensions), sorted([LINK, OTHER]))
+        self.assertEqual(intune.desired_entries(extensions), sorted([PORTAL, OTHER]))
 
     @unittest.skipUnless(yaml, "PyYAML nicht installiert")
     def test_reads_like_yaml(self):
         samples = [REGISTRY, "extensions: []\n", "extensions:\n", "# nur Kommentar\nextensions:  # leer\n",
-                   f"extensions:\n- name: abc\n  id: {LINK_ID}\n  updateUrl: '{LINK_URL}'\n  comment: \"It's x\"\n",
-                   f"extensions:\n    - name: abc\n      id: {LINK_ID}\n      updateUrl: {LINK_URL}\n      owner: 'a ''b'''\n"]
+                   f"extensions:\n- name: abc\n  id: {PORTAL_ID}\n  updateUrl: '{PORTAL_URL}'\n  comment: \"It's x\"\n",
+                   f"extensions:\n    - name: abc\n      id: {PORTAL_ID}\n      updateUrl: {PORTAL_URL}\n      owner: 'a ''b'''\n"]
         for sample in samples:
             with self.subTest(sample=sample):
                 expected = (yaml.safe_load(sample) or {}).get("extensions") or []
@@ -170,7 +170,7 @@ class RegistryTests(unittest.TestCase):
         return raised.exception.problems
 
     def entry(self, **fields):
-        values = {"name": "abc", "id": LINK_ID, "updateUrl": LINK_URL, **fields}
+        values = {"name": "abc", "id": PORTAL_ID, "updateUrl": PORTAL_URL, **fields}
         lines = [f"{k}: {v}" for k, v in values.items() if v is not None]
         return "extensions:\n  - " + "\n    ".join(lines) + "\n"
 
@@ -183,8 +183,8 @@ class RegistryTests(unittest.TestCase):
             "extensions: []\n  - name: abc\n": "nach „extensions: []“",
             "extensions:\n\t- name: abc\n": "Tabulator",
             "extensions:\n  -name: abc\n": "genau ein Leerzeichen",
-            f"extensions:\n  - name: abc\n      id: {LINK_ID}\n": "4 Leerzeichen",
-            f"extensions:\n  - name: abc\n    id: {LINK_ID}\n - name: x\n": "einheitlich mit 2 Leerzeichen",
+            f"extensions:\n  - name: abc\n      id: {PORTAL_ID}\n": "4 Leerzeichen",
+            f"extensions:\n  - name: abc\n    id: {PORTAL_ID}\n - name: x\n": "einheitlich mit 2 Leerzeichen",
             "extensions:\n  - name: abc\nother: 1\n": "oberster Ebene",
             "extensions:\n  - name: abc\n    updateURL: x\n": "unbekannter Schlüssel „updateURL“",
             "extensions:\n  - name: abc\n    name: def\n": "doppelt",
@@ -213,11 +213,11 @@ class RegistryTests(unittest.TestCase):
         cases = [
             (self.entry(name="Sentinel_Link"), "name „Sentinel_Link“"),
             (self.entry(name="ab"), "3 bis 40 Zeichen"),
-            (self.entry(id="flpkgokniclbiocmpjpmficmfcdghfgz"), "32 Kleinbuchstaben von a bis p"),
-            (self.entry(id=LINK_ID[:-1]), "id „"),
-            (self.entry(updateUrl=LINK_URL.replace("https", "http")), "https://"),
+            (self.entry(id="ponmlkjihgfedcbaponmlkjihgfedcbz"), "32 Kleinbuchstaben von a bis p"),
+            (self.entry(id=PORTAL_ID[:-1]), "id „"),
+            (self.entry(updateUrl=PORTAL_URL.replace("https", "http")), "https://"),
             (self.entry(updateUrl="https://example.org/updates.xml"), f"auf {intune.UPDATES_PATH} enden"),
-            (self.entry(updateUrl=LINK_URL + "?v=1"), "?… noch #…"),
+            (self.entry(updateUrl=PORTAL_URL + "?v=1"), "?… noch #…"),
             (self.entry(updateUrl="https://user:pw@example.org/api/extension/updates.xml"), "Anmeldedaten"),
             (self.entry(updateUrl="'https://example.org/a;b/api/extension/updates.xml'"), "„;“"),
         ]
@@ -226,10 +226,10 @@ class RegistryTests(unittest.TestCase):
                 self.assertProblem(text, fragment)
 
     def test_rejects_duplicates(self):
-        text = (f"extensions:\n  - name: abc\n    id: {LINK_ID}\n    updateUrl: {LINK_URL}\n"
-                f"  - name: abc\n    id: {LINK_ID}\n    updateUrl: {OTHER_URL}\n")
+        text = (f"extensions:\n  - name: abc\n    id: {PORTAL_ID}\n    updateUrl: {PORTAL_URL}\n"
+                f"  - name: abc\n    id: {PORTAL_ID}\n    updateUrl: {OTHER_URL}\n")
 
-        self.assertProblem(text, "name „abc“ steht schon im Eintrag ab Zeile 2", f"id „{LINK_ID}“ steht schon")
+        self.assertProblem(text, "name „abc“ steht schon im Eintrag ab Zeile 2", f"id „{PORTAL_ID}“ steht schon")
 
     def test_tenant_template_is_valid(self):
         template = Path(__file__).resolve().parents[2] / "tenant" / "extensions.yaml"
@@ -249,22 +249,22 @@ class RegistryTests(unittest.TestCase):
 
 
 class PublishedTests(unittest.TestCase):
-    extension = intune.Extension("sentinel-link", LINK_ID, LINK_URL)
+    extension = intune.Extension("kundenportal", PORTAL_ID, PORTAL_URL)
 
     def test_manifest_with_matching_id_passes(self):
-        self.assertIsNone(intune.manifest_problem(manifest(), LINK_ID))
+        self.assertIsNone(intune.manifest_problem(manifest(), PORTAL_ID))
 
     def test_real_manifest_from_sentinel_link(self):
         xml = (b'<?xml version="1.0" encoding="utf-8"?>\n<gupdate protocol="2.0" xmlns="http://www.google.com/update2/response">\n'
-               b'  <app appid="flpkgokniclbiocmpjpmficmfcdghfgd">\n    <updatecheck codebase="https://func-sentinel-link-prod-f08084'
-               b'.azurewebsites.net/api/extension/packages/sentinel-link-1.1.0.2185.crx" version="1.1.0.2185" hash_sha256="fb67" />\n'
+               b'  <app appid="ponmlkjihgfedcbaponmlkjihgfedcba">\n    <updatecheck codebase="https://func-kundenportal-prod-1a2b3c'
+               b'.azurewebsites.net/api/extension/packages/kundenportal-1.1.0.2185.crx" version="1.1.0.2185" hash_sha256="fb67" />\n'
                b'  </app>\n</gupdate>')
 
-        self.assertIsNone(intune.manifest_problem(xml, LINK_ID))
+        self.assertIsNone(intune.manifest_problem(xml, PORTAL_ID))
 
     def test_manifest_problems(self):
         cases = [
-            (manifest(appid=OTHER_ID), f"nennt nicht die ID {LINK_ID} (app/@appid: {OTHER_ID})"),
+            (manifest(appid=OTHER_ID), f"nennt nicht die ID {PORTAL_ID} (app/@appid: {OTHER_ID})"),
             (manifest(ns=False), "kein Update-Manifest"),
             (manifest(codebase=""), "kein Paket"),
             (manifest(codebase="http://example.org/a.crx"), "Edge braucht https"),
@@ -272,7 +272,7 @@ class PublishedTests(unittest.TestCase):
         ]
         for xml, fragment in cases:
             with self.subTest(fragment=fragment):
-                self.assertIn(fragment, intune.manifest_problem(xml, LINK_ID))
+                self.assertIn(fragment, intune.manifest_problem(xml, PORTAL_ID))
 
     def test_check_published_says_publish_first(self):
         def missing(url):
@@ -286,7 +286,7 @@ class PublishedTests(unittest.TestCase):
         self.assertIn("Erst veröffentlichen", problems[0])
 
     def test_check_published_retries_transient_errors(self):
-        answers = [OSError("timeout"), urllib.error.HTTPError(LINK_URL, 503, "x", {}, None), manifest()]
+        answers = [OSError("timeout"), urllib.error.HTTPError(PORTAL_URL, 503, "x", {}, None), manifest()]
         calls = []
 
         def flaky(url):
@@ -304,7 +304,7 @@ class PublishedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             registry = Path(work, "extensions.yaml")
             registry.write_text(REGISTRY, encoding="utf-8")
-            served = {LINK_URL: manifest(LINK_ID), OTHER_URL: manifest(LINK_ID)}
+            served = {PORTAL_URL: manifest(PORTAL_ID), OTHER_URL: manifest(PORTAL_ID)}
 
             with quiet(), self.assertRaises(intune.IntuneError) as raised:
                 intune.main(["check", "--registry", str(registry)], get=served.__getitem__)
@@ -340,34 +340,34 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(intune.setting_ids(DEFINITION), IDS)
 
     def test_creates_missing_policy(self):
-        plan = intune.make_plan(self.state(policy=False), IDS, [LINK, OTHER])
+        plan = intune.make_plan(self.state(policy=False), IDS, [PORTAL, OTHER])
 
         self.assertTrue(plan.create and plan.assign)
         self.assertEqual(len(plan.steps), 2)
         self.assertIn(f"+ {OTHER}", plan.steps[0])
 
     def test_nothing_to_do_when_policy_matches(self):
-        plan = intune.make_plan(self.state([LINK, OTHER]), IDS, [LINK, OTHER])
+        plan = intune.make_plan(self.state([PORTAL, OTHER]), IDS, [PORTAL, OTHER])
 
         self.assertEqual(plan.steps, [])
 
     def test_lists_added_and_removed_entries(self):
-        plan = intune.make_plan(self.state([LINK]), IDS, [OTHER])
+        plan = intune.make_plan(self.state([PORTAL]), IDS, [OTHER])
 
         self.assertTrue(plan.replace_settings)
-        self.assertEqual((plan.added, plan.removed), ([OTHER], [LINK]))
-        self.assertIn(f"- {LINK} (Edge deinstalliert sie)", plan.steps[0])
+        self.assertEqual((plan.added, plan.removed), ([OTHER], [PORTAL]))
+        self.assertIn(f"- {PORTAL} (Edge deinstalliert sie)", plan.steps[0])
 
     def test_order_and_duplicates_count_as_change(self):
-        plan = intune.make_plan(self.state([OTHER, LINK, LINK]), IDS, sorted([LINK, OTHER]))
+        plan = intune.make_plan(self.state([OTHER, PORTAL, PORTAL]), IDS, sorted([PORTAL, OTHER]))
 
         self.assertIn("Reihenfolge", plan.steps[0])
         self.assertEqual(plan.removed, [])
 
     def test_disabled_setting_and_other_settings(self):
-        settings = settings_for([LINK], enabled=False) + [{"settingInstance": {"settingDefinitionId": "anderes"}}]
+        settings = settings_for([PORTAL], enabled=False) + [{"settingInstance": {"settingDefinitionId": "anderes"}}]
 
-        plan = intune.make_plan(self.state(settings=settings), IDS, [LINK])
+        plan = intune.make_plan(self.state(settings=settings), IDS, [PORTAL])
 
         self.assertIn("bisher nicht aktiviert", plan.steps[0])
         self.assertIn("1 weitere Einstellungen entfernen", plan.steps[0])
@@ -375,42 +375,42 @@ class PlanTests(unittest.TestCase):
     def test_replaces_assignments(self):
         assignments = [{"target": {"@odata.type": "#microsoft.graph.groupAssignmentTarget", "groupId": "g"}}]
 
-        plan = intune.make_plan(self.state([LINK], assignments=assignments), IDS, [LINK])
+        plan = intune.make_plan(self.state([PORTAL], assignments=assignments), IDS, [PORTAL])
 
         self.assertTrue(plan.assign)
         self.assertEqual(plan.steps, ["Zuweisung ersetzen: groupAssignmentTarget -> alle Benutzer"])
 
     def test_adoption_renames(self):
-        plan = intune.make_plan(self.state([LINK], adopted_from=OLD), IDS, [LINK, OTHER])
+        plan = intune.make_plan(self.state([PORTAL], adopted_from=OLD), IDS, [PORTAL, OTHER])
 
         self.assertTrue(plan.rename and plan.replace_settings)
         self.assertIn(f"„{OLD}“ übernehmen", plan.steps[0])
         self.assertEqual(plan.added, [OTHER])
 
     def test_empty_registry_stops_without_switch(self):
-        for state in (self.state([LINK]), self.state(policy=False)):
+        for state in (self.state([PORTAL]), self.state(policy=False)):
             with self.subTest(state=state), self.assertRaises(intune.IntuneError) as raised:
                 intune.make_plan(state, IDS, [])
             self.assertIn("deinstallieren", str(raised.exception))
 
     def test_empty_registry_with_switch_deletes_policy(self):
-        plan = intune.make_plan(self.state([LINK, OTHER]), IDS, [], allow_empty=True)
+        plan = intune.make_plan(self.state([PORTAL, OTHER]), IDS, [], allow_empty=True)
 
         self.assertTrue(plan.delete)
-        self.assertEqual(plan.removed, [LINK, OTHER])
+        self.assertEqual(plan.removed, [PORTAL, OTHER])
         self.assertEqual(intune.make_plan(self.state(policy=False), IDS, [], allow_empty=True).steps, [])
 
     def test_plan_id_follows_steps(self):
-        first = intune.make_plan(self.state([LINK]), IDS, [LINK, OTHER])
-        same = intune.make_plan(self.state([LINK]), IDS, [LINK, OTHER])
-        other = intune.make_plan(self.state([OTHER]), IDS, [LINK, OTHER])
+        first = intune.make_plan(self.state([PORTAL]), IDS, [PORTAL, OTHER])
+        same = intune.make_plan(self.state([PORTAL]), IDS, [PORTAL, OTHER])
+        other = intune.make_plan(self.state([OTHER]), IDS, [PORTAL, OTHER])
 
         self.assertEqual(first.id, same.id)
         self.assertNotEqual(first.id, other.id)
         self.assertRegex(first.id, "^[0-9a-f]{16}$")
 
     def test_desired_policy_shape(self):
-        body = intune.desired_policy(IDS, [LINK, OTHER], NAME, "Pipeline seed-intune")
+        body = intune.desired_policy(IDS, [PORTAL, OTHER], NAME, "Pipeline seed-intune")
         instance = body["settings"][0]["settingInstance"]
 
         self.assertEqual((body["name"], body["platforms"], body["technologies"]), (NAME, "windows10", "mdm"))
@@ -418,15 +418,15 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(instance["choiceSettingValue"]["value"], IDS[1])
         child = instance["choiceSettingValue"]["children"][0]
         self.assertEqual(child["settingDefinitionId"], IDS[2])
-        self.assertEqual([v["value"] for v in child["simpleSettingCollectionValue"]], [LINK, OTHER])
+        self.assertEqual([v["value"] for v in child["simpleSettingCollectionValue"]], [PORTAL, OTHER])
         json.dumps(body)
 
 
 class StateTests(unittest.TestCase):
     def test_finds_own_policy(self):
         graph = FakeGraph()
-        own = graph.add(NAME, [LINK])
-        graph.add(OLD, [LINK])
+        own = graph.add(NAME, [PORTAL])
+        graph.add(OLD, [PORTAL])
 
         state = intune.read_state(graph, NAME, [OLD])
 
@@ -435,17 +435,17 @@ class StateTests(unittest.TestCase):
 
     def test_adopts_exactly_one_old_policy(self):
         graph = FakeGraph()
-        old = graph.add(OLD, [LINK])
+        old = graph.add(OLD, [PORTAL])
         graph.add("Fremd", [])
 
         state = intune.read_state(graph, NAME, [OLD, "Gibt es nicht"])
 
         self.assertEqual((state.policy["id"], state.adopted_from), (old, OLD))
-        self.assertEqual(intune.entries_in(state.settings, IDS), ([LINK], 0))
+        self.assertEqual(intune.entries_in(state.settings, IDS), ([PORTAL], 0))
 
     def test_refuses_several_candidates(self):
         graph = FakeGraph()
-        graph.add(OLD, [LINK])
+        graph.add(OLD, [PORTAL])
         graph.add("Alt 2", [OTHER])
 
         with self.assertRaises(intune.IntuneError) as raised:
@@ -454,13 +454,13 @@ class StateTests(unittest.TestCase):
 
     def test_refuses_duplicate_names_and_wrong_platform(self):
         graph = FakeGraph()
-        graph.add(NAME, [LINK])
-        graph.add(NAME, [LINK])
+        graph.add(NAME, [PORTAL])
+        graph.add(NAME, [PORTAL])
         with self.assertRaises(intune.IntuneError):
             intune.read_state(graph, NAME, [])
 
         graph = FakeGraph()
-        graph.add(OLD, [LINK], platforms="macOS")
+        graph.add(OLD, [PORTAL], platforms="macOS")
         with self.assertRaises(intune.IntuneError) as raised:
             intune.read_state(graph, NAME, [OLD])
         self.assertIn("windows10/mdm", str(raised.exception))
@@ -485,8 +485,8 @@ class StateTests(unittest.TestCase):
 
     def test_conflict_names_adopt_hint(self):
         graph = FakeGraph()
-        graph.add(NAME, [LINK])
-        graph.add(OLD, [LINK])
+        graph.add(NAME, [PORTAL])
+        graph.add(OLD, [PORTAL])
         state = intune.read_state(graph, NAME, [OLD])
 
         errors, _ = intune.find_conflicts(graph, state.others, IDS[0], [OLD])
@@ -521,7 +521,7 @@ class CommandTests(unittest.TestCase):
         return re.search(r"Plan ([0-9a-f]{16})", out)[1]
 
     def test_plan_reads_only(self):
-        self.graph.add(OLD, [LINK])
+        self.graph.add(OLD, [PORTAL])
 
         code, out = self.run_command("plan", "--adopt", OLD)
 
@@ -530,8 +530,8 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.graph.writes(), [])
 
     def test_plan_fails_on_assigned_conflict(self):
-        self.graph.add(NAME, sorted([LINK, OTHER]))
-        self.graph.add("Testrichtlinie", [LINK])
+        self.graph.add(NAME, sorted([PORTAL, OTHER]))
+        self.graph.add("Testrichtlinie", [PORTAL])
 
         with self.assertRaises(intune.IntuneError) as raised:
             self.run_command("plan")
@@ -543,23 +543,23 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         (policy,) = self.graph.policies.values()
         self.assertEqual(policy["name"], NAME)
-        self.assertEqual(intune.entries_in(policy["settings"], IDS), (sorted([LINK, OTHER]), 0))
+        self.assertEqual(intune.entries_in(policy["settings"], IDS), (sorted([PORTAL, OTHER]), 0))
         self.assertEqual(policy["assignments"], [{"target": {"@odata.type": intune.ALL_USERS}}])
         self.assertIn("Richtlinie entspricht dem Soll", out)
 
     def test_apply_adopts_without_delete(self):
-        old = self.graph.add(OLD, [LINK], assignments=[{"target": {"@odata.type": "#microsoft.graph.groupAssignmentTarget"}}])
+        old = self.graph.add(OLD, [PORTAL], assignments=[{"target": {"@odata.type": "#microsoft.graph.groupAssignmentTarget"}}])
 
         self.apply("--adopt-json", json.dumps([OLD]))
 
         self.assertEqual(list(self.graph.policies), [old])
         self.assertEqual(self.graph.policies[old]["name"], NAME)
-        self.assertEqual(intune.entries_in(self.graph.policies[old]["settings"], IDS), (sorted([LINK, OTHER]), 0))
+        self.assertEqual(intune.entries_in(self.graph.policies[old]["settings"], IDS), (sorted([PORTAL, OTHER]), 0))
         self.assertNotIn("DELETE", [m for m, _ in self.graph.writes()])
         self.assertEqual([m for m, _ in self.graph.writes()], ["PUT", "POST"])
 
     def test_apply_without_changes_writes_nothing(self):
-        self.graph.add(NAME, sorted([LINK, OTHER]))
+        self.graph.add(NAME, sorted([PORTAL, OTHER]))
 
         code, out = self.apply()
 
@@ -568,7 +568,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.graph.writes(), [])
 
     def test_apply_checks_approved_plan(self):
-        self.graph.add(NAME, [LINK])
+        self.graph.add(NAME, [PORTAL])
         approved = self.plan_id()
         self.registry.write_text(REGISTRY.replace("  - name: demo", "  - name: demo2"), encoding="utf-8")
         self.assertEqual(self.plan_id(), approved, "Der Name zählt nicht, nur die Einträge")
@@ -591,7 +591,7 @@ class CommandTests(unittest.TestCase):
                 return super().request(method, path, body, missing_ok)
 
         self.graph = Stubborn()
-        self.graph.add(NAME, [LINK])
+        self.graph.add(NAME, [PORTAL])
 
         with self.assertRaises(intune.IntuneError) as raised:
             self.apply()
@@ -599,8 +599,8 @@ class CommandTests(unittest.TestCase):
 
     def test_empty_registry(self):
         self.registry.write_text("extensions: []\n", encoding="utf-8")
-        policy = self.graph.add(NAME, [LINK])
-        self.graph.add(OLD, [LINK])
+        policy = self.graph.add(NAME, [PORTAL])
+        self.graph.add(OLD, [PORTAL])
 
         with self.assertRaises(intune.IntuneError):
             self.apply("--adopt", OLD)

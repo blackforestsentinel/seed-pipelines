@@ -48,7 +48,7 @@ parameters:
     default: 'Sentinel Seed: Edge-Erweiterungen'
 
   # Namen alter Richtlinien, die übernommen statt neu angelegt werden, etwa
-  # ['Sentinel Link: Edge-Erweiterung']: Gibt es policyName noch nicht, aber genau eine davon,
+  # ['Kundenportal: Edge-Erweiterung']: Gibt es policyName noch nicht, aber genau eine davon,
   # benennt apply sie um und gleicht sie an. Nie löschen und neu anlegen: Edge würde die
   # Erweiterungen dazwischen deinstallieren. Mehrere Treffer brechen ab.
   - name: adoptPolicies

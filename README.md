@@ -495,7 +495,7 @@ extends:
     environment: seed-intune
     registry: extensions.yaml
     policyName: 'Sentinel Seed: Edge-Erweiterungen'
-    adoptPolicies: ['Sentinel Link: Edge-Erweiterung']
+    adoptPolicies: ['Kundenportal: Edge-Erweiterung']
     allowEmpty: ${{ parameters.allowEmpty }}
 ```
 
@@ -530,18 +530,18 @@ extensions:
 - **Konflikte:** Setzt eine andere Richtlinie des Einstellungskatalogs ebenfalls `ExtensionInstallForcelist` und ist sie zugewiesen, endet der Plan mit einem Fehler, der sie nennt. Entschieden als Fehler, nicht als Warnung: Solange der Konflikt besteht, wirkt die Richtlinie der Pipeline auf den betroffenen Geräten nicht, und Anwenden änderte daran nichts; ein grüner Lauf würde etwas anderes behaupten. Ob sich die Zuweisungen tatsächlich überschneiden (Gruppen), prüft die Pipeline nicht, im Zweifel hält sie an. Eine Richtlinie ohne Zuweisung (oder nur mit Ausschlüssen) wirkt nirgends und ist nur eine Warnung. Abhilfe: deren Einträge in die Registerdatei übernehmen und die Richtlinie löschen.
 - **Freigegebener Plan:** `plan` gibt dem Plan eine Kennung (`planId`, Hash der Schritte). `apply` rechnet den Plan neu und bricht ohne Änderung ab, wenn die Kennung nicht mehr stimmt, etwa weil jemand die Richtlinie in Intune geändert hat oder ein zweiter Lauf schneller war. Dann einen neuen Lauf starten.
 - **Nach dem Apply** liest das Skript die Richtlinie erneut (bis zu drei Versuche) und endet mit Fehler, wenn noch etwas fehlt.
-- **Technik** wie bei Sentinel Link: Graph beta, Einstellungskatalog (`windows10`, `mdm`), Setting-ID aus einer Liste bekannter Kandidaten (`SETTING_CANDIDATES`), die abhängige Liste aus der Definition; Wiederholungen bei 429 und 5xx. Den Graph-Token holt `az account get-access-token --resource-type ms-graph` im Kontext der Service Connection.
+- **Technik:** Graph beta, Einstellungskatalog (`windows10`, `mdm`), Setting-ID aus einer Liste bekannter Kandidaten (`SETTING_CANDIDATES`), die abhängige Liste aus der Definition; Wiederholungen bei 429 und 5xx. Den Graph-Token holt `az account get-access-token --resource-type ms-graph` im Kontext der Service Connection.
 
 ### Übernahme einer bestehenden Richtlinie
 
 Gibt es die Richtlinie `policyName` noch nicht, aber genau eine aus `adoptPolicies`, benennt `apply` diese um und gleicht sie an (Plan: „übernehmen und umbenennen“). Sie wird nie gelöscht und neu angelegt: Dazwischen würde Edge die Erweiterungen deinstallieren und danach neu installieren; lokale Daten der Erweiterungen gingen dabei verloren. Passen mehrere, bricht der Plan mit ihrer Liste ab; übernommen wird nur genau eine, sonst ginge eine Liste verloren. Gibt es `policyName` schon, bleibt eine alte Richtlinie mit derselben Einstellung ein Konflikt (siehe oben).
 
-Für Sentinel Link („Sentinel Link: Edge-Erweiterung“, bisher von `rollout.yml` in Sentinel-Link gepflegt):
+Beispiel: Ein Projekt verteilt seine Erweiterung bisher mit einer eigenen Pipeline und der Richtlinie „Kundenportal: Edge-Erweiterung“.
 
-1. Onboarding mit `-AdoptPolicies 'Sentinel Link: Edge-Erweiterung'` (landet in `adoptPolicies`).
-2. In Sentinel-Link die Stage `intune` aus `rollout.yml` entfernen (oder die Pipeline `sentinel-link-rollout` anhalten), **bevor** `seed-intune` zum ersten Mal anwendet. Sonst findet `rollout/intune.py` seine Richtlinie nach der Umbenennung nicht mehr, legt sie neu an, und beide stehen im Konflikt.
-3. Pull Request in `seed-tenant` mit dem Eintrag von Sentinel Link (`id` und `updateUrl` wie bisher). Nach dem Merge zeigt der Plan „übernehmen und umbenennen“, mit derselben Liste ohne Entfernungen.
-4. Nach dem Apply der Identität `sentinel-link-rollout` das Recht `DeviceManagementConfiguration.ReadWrite.All` entziehen; das Onboarding nennt alle weiteren Identitäten mit diesem Recht.
+1. Onboarding mit `-AdoptPolicies 'Kundenportal: Edge-Erweiterung'` (landet in `adoptPolicies`).
+2. Im Projekt den bisherigen Intune-Schritt entfernen oder dessen Pipeline anhalten, **bevor** `seed-intune` zum ersten Mal anwendet. Sonst findet er seine Richtlinie nach der Umbenennung nicht mehr, legt sie neu an, und beide stehen im Konflikt.
+3. Pull Request in `seed-tenant` mit dem Eintrag des Projekts (`id` und `updateUrl` wie bisher). Nach dem Merge zeigt der Plan „übernehmen und umbenennen“, mit derselben Liste ohne Entfernungen.
+4. Nach dem Apply der bisherigen Identität das Recht `DeviceManagementConfiguration.ReadWrite.All` entziehen; das Onboarding nennt alle weiteren Identitäten mit diesem Recht.
 
 ### Rechte und Schutz
 
