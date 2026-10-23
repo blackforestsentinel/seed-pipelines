@@ -110,7 +110,7 @@ def set_output(name: str, value: str) -> None:
 # Ein bewusst kleiner Ausschnitt aus YAML, den das Skript ohne PyYAML selbst liest:
 #
 #   extensions:
-#     - name: kundenportal                     # Projekt
+#     - name: kundenportal                      # Projekt
 #       id: ponmlkjihgfedcbaponmlkjihgfedcba
 #       updateUrl: https://func-….azurewebsites.net/api/extension/updates.xml
 #       owner: team@example.com                 # optional
