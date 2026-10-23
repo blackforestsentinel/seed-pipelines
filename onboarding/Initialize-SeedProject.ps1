@@ -58,6 +58,10 @@
 .PARAMETER PipelineName
     Name der Pipeline-Definition; ohne Angabe der Seed-Projektname.
 
+.PARAMETER Pool
+    Eigener Agent-Pool, den azure-pipelines.yml des Projekts nennt (pool). Die Pipeline wird für
+    dessen Queue berechtigt; sonst fragt der erste Lauf danach ("Permit").
+
 .PARAMETER EnableBranchPolicy
     Branch-Policy für die PR-Validierung setzen. Erst nach dem Umschalten: Die Policy ist
     Pflicht und sperrt direkte Pushes. Vorher prüft das Skript, dass die YAML-Datei auf dem
@@ -109,6 +113,7 @@ param(
     [string] $YamlPath = 'azure-pipelines.yml',
     [string] $PipelineName = '',
     [string] $DefaultBranch = 'main',
+    [string] $Pool = '',
     [switch] $EnableBranchPolicy,
     [ValidateRange(0, 10)] [int] $MinReviewers = 0,
     [switch] $SkipBranchControl,
@@ -383,6 +388,10 @@ try {
         foreach ($name in $environmentIds.Keys) { @{ Title = "Environment $name"; Type = 'environment'; Id = $environmentIds[$name] } }
         @{ Title = "Service Connection $ServiceConnectionName"; Type = 'endpoint'; Id = $azure.id; Reason = 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
         @{ Title = "GitHub-Service-Connection $GitHubConnectionName"; Type = 'endpoint'; Id = $github.id; Reason = 'GitHub-Service-Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
+        if ($Pool) {
+            $poolQueue = (Invoke-AzDevOps get "$api/distributedtask/queues?queueNames=$([uri]::EscapeDataString($Pool))&api-version=7.1").value | Select-Object -First 1
+            @{ Title = "Agent-Queue $Pool"; Type = 'queue'; Id = $poolQueue.id; Reason = "Agent-Queue $Pool fehlt im Projekt." }
+        }
     )
     foreach ($resource in $resources) {
         $title = "Pipeline berechtigt für $($resource.Title)"

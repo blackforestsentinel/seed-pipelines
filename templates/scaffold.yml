@@ -418,6 +418,7 @@ stages:
                           ServiceConnectionName   = $env:SEED_SERVICE_CONNECTION
                           GitHubConnectionName    = $env:SEED_GITHUB_CONNECTION
                           MinReviewers            = [int] $env:SEED_MIN_REVIEWERS
+                          Pool                    = $env:SEED_PROJECT_POOL
                           # Die Branch-Prüfung hängt zentral an der geteilten Service Connection.
                           SkipBranchControl       = $true
                       }
@@ -440,5 +441,6 @@ stages:
                       SEED_SERVICE_CONNECTION: ${{ parameters.serviceConnection }}
                       SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
                       SEED_MIN_REVIEWERS: ${{ parameters.minReviewers }}
+                      SEED_PROJECT_POOL: ${{ parameters.projectPool }}
                       SEED_REQUESTER_CAN_APPROVE: ${{ lower(parameters.requesterCanApprove) }}
                       SEED_DRY_RUN: ${{ lower(parameters.dryRun) }}
