@@ -127,7 +127,7 @@ param(
     [string] $StateStorageAccount = '',
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
-    [string] $SeedPipelinesVersion = 'v0.13.0',
+    [string] $SeedPipelinesVersion = 'v0.14.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
