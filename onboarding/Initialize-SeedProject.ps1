@@ -28,6 +28,12 @@
     Connections). Ausführen mit einem Konto, das Projektadministrator in Azure DevOps ist und
     die Service Connections verwalten darf.
 
+    Das zentrale Scaffold (templates/scaffold.yml, mode migrate und enableBranchPolicy) ruft das
+    Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI, die
+    Service Connections hat es vorher ins Projekt geteilt, und mit -SkipBranchControl bleibt die
+    Branch-Prüfung unberührt; sie hängt zentral an der geteilten Service Connection. Fehlen am
+    Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
+
 .PARAMETER SeedProjectName
     Projektname wie in project.yaml und im Parameter project von web-app.yml, Präfix der
     Environments. 3-20 Zeichen, Kleinbuchstaben, Ziffern und Bindestriche.
@@ -39,17 +45,36 @@
     Principal Names (E-Mail) der Personen, die Infrastruktur-Änderungen freigeben. Leer:
     keine Freigabe.
 
+.PARAMETER ApproverGroups
+    Gruppen der Organisation (Anzeigename), deren Mitglieder Infrastruktur-Änderungen ebenfalls
+    freigeben, zusätzlich zu -Approvers.
+
+.PARAMETER RequesterCannotApprove
+    Wer einen Lauf ausgelöst hat, darf dessen Infrastruktur-Änderung nicht selbst freigeben.
+
 .PARAMETER AppApprovalEnvironments
     Umgebungen, in denen auch der App-Deploy eine Freigabe braucht, z. B. prod.
 
 .PARAMETER PipelineName
     Name der Pipeline-Definition; ohne Angabe der Seed-Projektname.
 
+.PARAMETER Pool
+    Eigener Agent-Pool, den azure-pipelines.yml des Projekts nennt (pool). Die Pipeline wird für
+    dessen Queue berechtigt; sonst fragt der erste Lauf danach ("Permit").
+
 .PARAMETER EnableBranchPolicy
     Branch-Policy für die PR-Validierung setzen. Erst nach dem Umschalten: Die Policy ist
     Pflicht und sperrt direkte Pushes. Vorher prüft das Skript, dass die YAML-Datei auf dem
     Default-Branch web-app.yml aus seed-pipelines ab v0.5.0 einbindet; mit der alten Datei
     oder einer älteren Version würden PR-Läufe deployen.
+
+.PARAMETER MinReviewers
+    Nur mit -EnableBranchPolicy: Pull Requests brauchen so viele Zustimmungen anderer Personen,
+    die eigene Stimme zählt nicht. 0 (Standard): keine Pflicht.
+
+.PARAMETER SkipBranchControl
+    Branch-Prüfung an der Service Connection nicht anfassen, etwa weil sie zentral an einer
+    geteilten Service Connection hängt und dort für alle Projekte gilt.
 
 .PARAMETER AllowedBranches
     Branches, deren Läufe die Azure-Service-Connection nutzen dürfen (Check „Branch control“),
@@ -80,13 +105,18 @@ param(
     [Parameter(Mandatory)] [string] $SeedProjectName,
     [string[]] $Environments = @('dev'),
     [string[]] $Approvers = @(),
+    [string[]] $ApproverGroups = @(),
+    [switch] $RequesterCannotApprove,
     [string[]] $AppApprovalEnvironments = @(),
     [string] $ServiceConnectionName = 'sc-seed',
     [string] $GitHubConnectionName = 'github-blackforestsentinel',
     [string] $YamlPath = 'azure-pipelines.yml',
     [string] $PipelineName = '',
     [string] $DefaultBranch = 'main',
+    [string] $Pool = '',
     [switch] $EnableBranchPolicy,
+    [ValidateRange(0, 10)] [int] $MinReviewers = 0,
+    [switch] $SkipBranchControl,
     [string[]] $AllowedBranches = @(),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
     [switch] $DryRun
@@ -101,6 +131,7 @@ function Split-List([string[]] $Values) {
 }
 $Environments = Split-List $Environments
 $Approvers = Split-List $Approvers
+$ApproverGroups = Split-List $ApproverGroups
 $AppApprovalEnvironments = Split-List $AppApprovalEnvironments
 $AllowedBranches = Split-List $AllowedBranches
 if (-not $AllowedBranches) { $AllowedBranches = @($DefaultBranch) }
@@ -120,7 +151,9 @@ $Org = $AzureDevOpsOrganization.TrimEnd('/')
 $orgName = if ($Org -match '^https://dev\.azure\.com/([^/]+)$') { $Matches[1] }
     elseif ($Org -match '^https://([^./]+)\.visualstudio\.com$') { $Matches[1] }
     else { throw 'AzureDevOpsOrganization: https://dev.azure.com/<organisation> erwartet.' }
-$Identities = "https://vssps.dev.azure.com/$orgName/_apis/identities"
+$Vssps = "https://vssps.dev.azure.com/$orgName"
+$Identities = "$Vssps/_apis/identities"
+$MinReviewersPolicyType = 'fa4e907d-c16b-4a4c-9dfa-4906e5d171dd'
 $AzureDevOpsResource = '499b84ac-1321-427f-aa17-267ca6975798'
 $ApprovalCheckType = '8c6f20a7-a545-4486-9777-f762fafe0d4d'
 $BuildPolicyType = '0609b952-1397-4640-95ec-e00a01b2c241'
@@ -165,14 +198,36 @@ function Write-Missing([string] $Title, [string] $Reason) {
 function Invoke-AzDevOps([string] $Method, [string] $Url, [object] $Body) {
     # Direkt per HTTP: URLs mit & überstehen den Umweg über az.cmd nicht. Bodies gehen als
     # UTF-8-Datei raus, damit weder Quoting noch Kodierung etwas verändern.
-    if (-not $script:token) {
-        $script:token = az account get-access-token --resource $AzureDevOpsResource --query accessToken -o tsv
-    }
-    $request = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $script:token" }; ContentType = 'application/json' }
+    $request = @{ Method = $Method; Uri = $Url; Headers = (Get-AuthHeader); ContentType = 'application/json' }
     if ($null -ne $Body) {
         $request.InFile = Save-Json $Body "body-$(Get-Random).json"
     }
     Invoke-RestMethod @request
+}
+
+# In der Pipeline das Job-Token aus SEED_AZDO_TOKEN, sonst die Anmeldung der Azure CLI.
+function Get-AuthHeader {
+    if (-not $script:token) {
+        $script:token = if ($env:SEED_AZDO_TOKEN) { $env:SEED_AZDO_TOKEN }
+        else { az account get-access-token --resource $AzureDevOpsResource --query accessToken -o tsv }
+    }
+    @{ Authorization = "Bearer $script:token" }
+}
+
+# Wie data.azuredevops_group ohne project_id: Gruppen der Organisation, auch aus Entra ID, aber
+# keine Gruppen einzelner Projekte. Liefert die Identitäts-ID für die Freigabe.
+function Find-OrganizationGroup([string] $Name) {
+    $found = @()
+    $continuation = $null
+    do {
+        $url = "$Vssps/_apis/graph/groups?api-version=7.1-preview.1"
+        if ($continuation) { $url += "&continuationToken=$([uri]::EscapeDataString($continuation))" }
+        $response = Invoke-RestMethod -Uri $url -Headers (Get-AuthHeader) -ResponseHeadersVariable headers
+        $found += @($response.value | Where-Object { $_.displayName -eq $Name -and $_.domain -notlike 'vstfs:///Classification/TeamProject/*' })
+        $continuation = if ($headers['x-ms-continuationtoken']) { @($headers['x-ms-continuationtoken'])[0] }
+    } while ($continuation)
+    if ($found.Count -ne 1) { throw "Freigabe: Zur Gruppe $Name gibt es $($found.Count) Gruppen der Organisation, erwartet ist genau eine." }
+    (Invoke-AzDevOps get "$Vssps/_apis/graph/storagekeys/$($found[0].descriptor)?api-version=7.1-preview.1").value
 }
 
 # Für Prüfungen: Fehler (etwa 404 für eine fehlende Ressource) bedeuten "nicht vorhanden".
@@ -206,11 +261,12 @@ try {
                     Where-Object { $_.isActive -and ($_.properties.Account.'$value' -eq $mail -or $_.properties.Mail.'$value' -eq $mail) })
             if ($found.Count -ne 1) { throw "Freigabe: Zu $mail gibt es $($found.Count) Personen in Azure DevOps, erwartet ist genau eine." }
             $found[0].id
-        })
+        }
+        foreach ($group in $ApproverGroups) { Find-OrganizationGroup $group })
 
     Write-Host "Sentinel Seed Projekt-Einrichtung$(if ($DryRun) { ' (DryRun, keine Änderungen)' })"
     Write-Host "  Azure DevOps $Org/$($project.name), Repo $($repo.name), Branch $DefaultBranch, Pipeline $PipelineName ($YamlPath)"
-    Write-Host ("  Seed-Projekt $SeedProjectName, Umgebungen $($Environments -join ', '), Freigabe $(if ($Approvers) { $Approvers -join ', ' } else { 'keine' })" +
+    Write-Host ("  Seed-Projekt $SeedProjectName, Umgebungen $($Environments -join ', '), Freigabe $(if ($Approvers -or $ApproverGroups) { @($Approvers + $ApproverGroups) -join ', ' } else { 'keine' })" +
         $(if ($AppApprovalEnvironments) { ", App-Freigabe in $($AppApprovalEnvironments -join ', ')" }))
     Write-Host ''
 
@@ -245,7 +301,7 @@ try {
                     approvers                 = @($approverIds | ForEach-Object { @{ id = $_ } })
                     executionOrder            = 'anyOrder'
                     minRequiredApprovers      = 1
-                    requesterCannotBeApprover = $false
+                    requesterCannotBeApprover = [bool] $RequesterCannotApprove
                     instructions              = 'Plan im Log der Stage Plan prüfen, dann freigeben.'
                     blockedApprovers          = @()
                 }
@@ -332,6 +388,10 @@ try {
         foreach ($name in $environmentIds.Keys) { @{ Title = "Environment $name"; Type = 'environment'; Id = $environmentIds[$name] } }
         @{ Title = "Service Connection $ServiceConnectionName"; Type = 'endpoint'; Id = $azure.id; Reason = 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
         @{ Title = "GitHub-Service-Connection $GitHubConnectionName"; Type = 'endpoint'; Id = $github.id; Reason = 'GitHub-Service-Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
+        if ($Pool) {
+            $poolQueue = (Invoke-AzDevOps get "$api/distributedtask/queues?queueNames=$([uri]::EscapeDataString($Pool))&api-version=7.1").value | Select-Object -First 1
+            @{ Title = "Agent-Queue $Pool"; Type = 'queue'; Id = $poolQueue.id; Reason = "Agent-Queue $Pool fehlt im Projekt." }
+        }
     )
     foreach ($resource in $resources) {
         $title = "Pipeline berechtigt für $($resource.Title)"
@@ -388,6 +448,36 @@ try {
         } | Out-Null
     }
 
+    # Pflicht-Reviewer: Die Stage Plan nutzt die Service Connection vor jeder Freigabe; ohne Review
+    # könnte eine Person ihre eigene Pipeline-Änderung mergen. Wie ado-project (min_reviewers).
+    if ($MinReviewers -gt 0) {
+        $reviewTitle = "Mindestens $MinReviewers Reviewer auf $DefaultBranch"
+        if (-not $EnableBranchPolicy) {
+            Write-Host "          $reviewTitle entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
+        } else {
+            Invoke-Step $reviewTitle {
+                (Invoke-AzDevOps get "$api/policy/configurations?policyType=$MinReviewersPolicyType&api-version=7.1").value | Where-Object {
+                    $_.type.id -eq $MinReviewersPolicyType -and ($_.settings.scope | Where-Object { $_.repositoryId -eq $repo.id -and $_.refName -eq $BranchRef })
+                } | Select-Object -First 1
+            } {
+                Invoke-AzDevOps post "$api/policy/configurations?api-version=7.1" @{
+                    isEnabled  = $true
+                    isBlocking = $true
+                    type       = @{ id = $MinReviewersPolicyType }
+                    settings   = @{
+                        minimumApproverCount = $MinReviewers
+                        creatorVoteCounts    = $false
+                        blockLastPusherVote  = $true
+                        resetOnSourcePush    = $true
+                        allowDownvotes       = $false
+                        scope                = @(@{ repositoryId = $repo.id; refName = $BranchRef; matchKind = 'Exact' })
+                    }
+                } | Out-Null
+                $true
+            } | Out-Null
+        }
+    }
+
     # --- 5. Branch-Prüfung ------------------------------------------------------------------
     # Freigaben hängen an den Environments. Eine geänderte Pipeline-Datei auf einem Feature-Branch,
     # die die Service Connection direkt nutzt, hielten sie nicht auf; die Branch-Prüfung schon.
@@ -395,7 +485,9 @@ try {
     # testet. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert.
     Write-Host '5. Branch-Prüfung an der Azure-Service-Connection'
     $branchTitle = "Branch-Prüfung an ${ServiceConnectionName}: $AllowedBranchRefs"
-    if (-not $EnableBranchPolicy) {
+    if ($SkipBranchControl) {
+        Write-Host '          entfällt (-SkipBranchControl): Sie hängt zentral an der Service Connection.'
+    } elseif (-not $EnableBranchPolicy) {
         Write-Host "          entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
     } elseif (-not $azure) {
         Write-Missing $branchTitle 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.'
@@ -445,3 +537,5 @@ try {
 finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
+# Für die Pipeline: Fehlende Schritte lassen den Lauf scheitern, im DryRun nicht.
+if ($missing.Count -and -not $DryRun) { exit 1 }
