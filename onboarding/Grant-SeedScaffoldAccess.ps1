@@ -14,7 +14,9 @@
          Recht View project-level information (ohne es sieht ein Token aus einem anderen
          Projekt hier gar nichts)
       2. Git (alle Repos des Projekts): Read, Contribute, Create branch, Edit policies
-      3. Pipelines (alle des Projekts): View, Create und Edit build pipeline, Queue builds
+      3. Pipelines (alle des Projekts): View, Create und Edit build pipeline, Queue builds;
+         Agent-Queues des Projekts: Rolle User (eine neue Pipeline-Definition braucht "Use" an
+         ihrer Standard-Queue)
       4. Environments: Rolle Creator (wer ein Environment anlegt, wird dessen Administrator)
       5. Service Connections: Rolle Creator (nötig, um Service Connections ins Projekt zu teilen;
          wer teilt, wird dort Administrator der Service Connection)
@@ -198,6 +200,9 @@ if ($group) {
     Write-Host '3. Pipelines'
     Set-Allow 'View, Create und Edit build pipeline, Queue builds' $BuildNamespace $project.id $groupIdentity `
         (Get-ActionBits $BuildNamespace @('ViewBuilds', 'ViewBuildDefinition', 'CreateBuildDefinition', 'EditBuildDefinition', 'QueueBuilds'))
+    # Eine Pipeline-Definition anzulegen verlangt "Use" an ihrer Standard-Queue (Azure Pipelines),
+    # auch wenn die YAML-Datei einen anderen Pool nennt; vererbt an alle Queues des Projekts.
+    Set-Role 'Agent-Queues: Rolle User' 'distributedtask.agentqueuerole' $project.id $groupIdentity.id 'User'
     Write-Host '4. Environments'
     Set-Role 'Rolle Creator' 'distributedtask.globalenvironmentreferencerole' $project.id $groupIdentity.id 'Creator'
     Write-Host '5. Service Connections'
