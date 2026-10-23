@@ -1,18 +1,32 @@
 # Sentinel Seed: Projekt anlegen (seed-scaffold).
 #
-# Legt in diesem Azure-DevOps-Projekt ein neues Seed-Projekt an: Repo aus seed-template,
-# project.yaml und azure-pipelines.yml, Environments mit Freigaben, Pipeline und deren
-# Berechtigungen, Branch-Policy für die PR-Validierung auf main. Grundlage ist das
-# Terraform-Modul seed-terraform//ado-project; der State liegt unter scaffold/<name>.tfstate,
-# ein erneuter Lauf ändert nur, was fehlt.
+# Legt ein Seed-Projekt in Azure DevOps an: project.yaml und azure-pipelines.yml, Environments mit
+# Freigaben, Pipeline und deren Berechtigungen, Branch-Policies auf main. Grundlage ist das
+# Terraform-Modul seed-terraform//ado-project; ein erneuter Lauf ändert nur, was fehlt.
 #
-# Anmeldung bei Azure DevOps mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat
-# (Scopes: Code read/write/manage, Build read/execute, Environment read/manage, Graph read,
-# Project and Team read, Pipeline Resources use/manage). Das Job-Token reicht nicht, solange
-# "Protect access to repositories in YAML pipelines" an ist: Es darf keine Repos anlegen.
-# Für die Branch-Policy braucht die Person hinter dem PAT "Edit policies" am Repo.
-# Die Azure-Service-Connection berechtigt die Pipeline nicht selbst: Beim ersten Lauf des
-# neuen Projekts gibt eine Administratorin oder ein Administrator sie frei ("Permit").
+# azureDevOpsAuth pat (Standard, wie bisher): im eigenen Projekt, Repo aus seed-template,
+# Anmeldung mit einem PAT aus der geheimen Pipeline-Variable SeedScaffoldPat (Scopes: Code
+# read/write/manage, Build read/execute, Environment read/manage, Graph read, Project and Team
+# read, Pipeline Resources use/manage). Die Person hinter dem PAT braucht "Edit policies" am Repo.
+# Die Azure-Service-Connection gibt beim ersten Lauf ein Admin frei ("Permit"). State unter
+# scaffold/<name>.tfstate.
+#
+# azureDevOpsAuth jobToken (zentrales Scaffold, Selbstbedienung): Anmeldung mit dem Job-Token,
+# also der Build-Service-Identität dieses Projekts, ohne PAT und ohne Lizenz. Sie legt Projekte
+# auch in anderen Azure-DevOps-Projekten an (adoProject), sobald ein Projektadmin sie dort
+# freischaltet (onboarding/Grant-SeedScaffoldAccess.ps1). Repos legt sie nicht an: Unter "Protect
+# access to repositories in YAML pipelines" sieht das Token nur Repos, die der Lauf auscheckt.
+# Die Person legt deshalb das Repo vorher an (mit README) und gibt es als repository an.
+#   mode new                 seed-template per Merge ins Repo, dann wie oben; Service Connections
+#                            ins Zielprojekt geteilt und berechtigt, kein "Permit"
+#   mode migrate             vorhandenes Repo einrichten wie onboarding/Initialize-SeedProject.ps1
+#   mode enableBranchPolicy  nach dem Umschalten: Branch-Policies (PR-Validierung, Reviewer)
+# Vorher prüft scripts/scaffold/scaffold.py Eingaben, Zielprojekt, Mitgliedschaft der startenden
+# Person, Repo und den Namen (Registry im State-Container). State unter
+# scaffold/<projekt-id>/<name>.tfstate. dryRun prüft nur.
+#
+# Eingaben der startenden Person (name, adoProject, repository, Listen) erreichen Skripte nur
+# über die Umgebung, nie als Text im Skript.
 
 parameters:
   - name: name
@@ -39,23 +53,73 @@ parameters:
   - name: approvers
     type: object
     default: []
+  # Gruppen der Organisation (Name), deren Mitglieder ebenfalls freigeben.
+  - name: approverGroups
+    type: object
+    default: []
+  # Darf die auslösende Person ihre eigene Infrastruktur-Änderung freigeben?
+  - name: requesterCanApprove
+    type: boolean
+    default: true
+  # Pflicht-Reviewer für Pull Requests auf main, ohne die eigene Stimme; 0: keine.
+  - name: minReviewers
+    type: number
+    default: 0
   # Umgebungen, in denen auch der App-Deploy eine Freigabe braucht.
   - name: appApprovalEnvironments
     type: object
     default: []
+  # Azure-Service-Connection der Projekte (Deployment-Identität); jobToken teilt sie ins Zielprojekt.
   - name: serviceConnection
     type: string
   - name: githubConnection
     type: string
+  # Service Connection, mit der das Scaffold den State liest und schreibt; leer: serviceConnection.
+  - name: stateServiceConnection
+    type: string
+    default: ''
   - name: terraformState
     type: object
   # Erster Lauf der neuen Pipeline direkt im Anschluss.
   - name: startFirstRun
     type: boolean
     default: true
+  - name: azureDevOpsAuth
+    type: string
+    default: pat
+    values: [pat, jobToken]
+  # Nur jobToken: Zielprojekt (leer: dieses), Repo darin und Modus.
+  - name: adoProject
+    type: string
+    default: ''
+  - name: repository
+    type: string
+    default: ''
+  - name: mode
+    type: string
+    default: new
+    values: [new, migrate, enableBranchPolicy]
+  - name: dryRun
+    type: boolean
+    default: false
+  # Nur jobToken: erlaubte Zielprojekte (regulärer Ausdruck, leer: alle freigeschalteten) und die
+  # Gruppe im Zielprojekt, in der die startende Person Mitglied sein muss.
+  - name: allowedProjects
+    type: string
+    default: ''
+  - name: memberGroup
+    type: string
+    default: Contributors
+  # Agent-Pool der neuen Projekt-Pipeline; leer: Microsoft-gehostete Agents.
+  - name: projectPool
+    type: string
+    default: ''
+  - name: templateUrl
+    type: string
+    default: https://github.com/blackforestsentinel/seed-template.git
   - name: terraformModuleVersion
     type: string
-    default: v0.12.0
+    default: v0.14.0
   - name: pipelinesVersion
     type: string
     default: v0.13.0
@@ -67,14 +131,21 @@ parameters:
     type: string
     default: ubuntu-24.04
   # Eigener Agent-Pool statt Microsoft-gehosteter Agents, z. B. Default. Linux-Agents mit bash,
-  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents).
+  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents); jobToken mit migrate
+  # oder enableBranchPolicy zusätzlich PowerShell 7.
   - name: pool
     type: string
     default: ''
 
 stages:
   - stage: scaffold
-    displayName: Projekt ${{ parameters.name }} anlegen
+    ${{ if eq(parameters.mode, 'new') }}:
+      displayName: Projekt ${{ parameters.name }} anlegen
+    ${{ else }}:
+      displayName: Projekt ${{ parameters.name }} (${{ parameters.mode }})
+    variables:
+      # Zielprojekt für Checkout und Terraform; leer heißt dieses Projekt.
+      seedTargetProject: ${{ coalesce(parameters.adoProject, variables['System.TeamProject']) }}
     jobs:
       - job: scaffold
         displayName: Repo, Environments, Pipeline
@@ -86,7 +157,6 @@ stages:
         workspace:
           clean: all
         steps:
-          - checkout: none
           # Prüfungen vor allem anderen, damit kein halbes Projekt entsteht.
           # Den Namen gibt die startende Person ein. Skripte bekommen ihn nur über die Umgebung,
           # nie als Text im Skript; die Meldung nennt ihn nicht, damit er keine Logging-Befehle
@@ -99,119 +169,275 @@ stages:
             displayName: Name prüfen
             env:
               SEED_NAME: ${{ parameters.name }}
-          - ${{ if and(parameters.mcp, not(parameters.sso)) }}:
+          - ${{ if and(eq(parameters.mode, 'new'), parameters.mcp, not(parameters.sso)) }}:
               - bash: |
                   echo "##vso[task.logissue type=error]mcp setzt sso voraus: Die MCP-Anmeldung läuft über die App-Registrierung des Features sso."
                   exit 1
                 displayName: Features prüfen
-          - template: steps/terraform-install.yml
-            parameters:
-              version: ${{ parameters.terraformVersion }}
-
-          - bash: |
-              set -euo pipefail
-              dir="$(Agent.TempDirectory)/scaffold"
-              mkdir -p "$dir"
-              cat > "$dir/main.tf" <<'EOF'
-              terraform {
-                required_providers {
-                  azuredevops = {
-                    source  = "microsoft/azuredevops"
-                    version = "1.16.0"
-                  }
-                }
-                backend "azurerm" {}
-              }
-
-              provider "azuredevops" {}
-
-              variable "project" {
-                type = any
-              }
-
-              module "project" {
-                source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
-
-                ado_project                   = var.project.ado_project
-                authorize_service_connections = false
-                name                      = var.project.name
-                features                  = var.project.features
-                frontend                  = var.project.frontend
-                environments              = var.project.environments
-                approvers                 = var.project.approvers
-                app_approval_environments = var.project.app_approval_environments
-                service_connection        = var.project.service_connection
-                github_connection         = var.project.github_connection
-                terraform_state           = var.project.terraform_state
-                pipelines_version         = var.project.pipelines_version
-              }
-
-              output "repository_web_url" {
-                value = module.project.repository_web_url
-              }
-
-              output "pipeline_id" {
-                value = module.project.pipeline_id
-              }
-              EOF
-              # Parameter als JSON, nicht als HCL-Text: Sonderzeichen können nichts aufbrechen.
-              cat > "$dir/terraform.tfvars.json" <<'EOF'
-              {
-                "project": {
-                  "ado_project": "$(System.TeamProject)",
-                  "name": ${{ convertToJson(parameters.name) }},
-                  "features": { "sso": ${{ lower(parameters.sso) }}, "mcp": ${{ lower(parameters.mcp) }}, "storage": ${{ lower(parameters.storage) }} },
-                  "frontend": ${{ lower(parameters.frontend) }},
-                  "environments": ${{ convertToJson(parameters.environments) }},
-                  "approvers": ${{ convertToJson(parameters.approvers) }},
-                  "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
-                  "service_connection": ${{ convertToJson(parameters.serviceConnection) }},
-                  "github_connection": ${{ convertToJson(parameters.githubConnection) }},
-                  "terraform_state": {
-                    "resource_group": ${{ convertToJson(parameters.terraformState.resourceGroup) }},
-                    "storage_account": ${{ convertToJson(parameters.terraformState.storageAccount) }},
-                    "container": ${{ convertToJson(parameters.terraformState.container) }}
-                  },
-                  "pipelines_version": ${{ convertToJson(parameters.pipelinesVersion) }}
-                }
-              }
-              EOF
-              sed -i 's/^              //' "$dir/main.tf" "$dir/terraform.tfvars.json"
-              python3 -m json.tool "$dir/terraform.tfvars.json"
-            displayName: Terraform-Konfiguration schreiben
-
-          - template: steps/terraform.yml
-            parameters:
-              name: scaffold
-              displayName: terraform apply
-              serviceConnection: ${{ parameters.serviceConnection }}
-              workingDirectory: $(Agent.TempDirectory)/scaffold
-              terraformState: ${{ parameters.terraformState }}
-              stateKey: scaffold/${{ parameters.name }}.tfstate
-              env:
-                SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
-              script: |
-                export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
-                # PAT aus der geheimen Variable; ohne sie bleibt der Wert als "$(SeedScaffoldPat)" stehen.
-                if [ -z "${SEED_SCAFFOLD_PAT:-}" ] || [[ "$SEED_SCAFFOLD_PAT" == '$('* ]]; then
-                  echo "##vso[task.logissue type=error]Geheime Pipeline-Variable SeedScaffoldPat fehlt (PAT für Azure DevOps)."
+          - ${{ if and(eq(parameters.azureDevOpsAuth, 'pat'), or(ne(parameters.adoProject, ''), ne(parameters.mode, 'new'), parameters.dryRun)) }}:
+              - bash: |
+                  echo "##vso[task.logissue type=error]adoProject, mode und dryRun gehen nur mit azureDevOpsAuth jobToken (zentrales Scaffold)."
                   exit 1
-                fi
-                # Ein PAT hat beim Provider Vorrang vor OIDC; OIDC bleibt für den State zuständig.
-                export AZDO_PERSONAL_ACCESS_TOKEN="$SEED_SCAFFOLD_PAT"
-                terraform apply -auto-approve
-                echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
-                echo "Repo: $(terraform output -raw repository_web_url)"
+                displayName: Modus prüfen
 
-          - ${{ if parameters.startFirstRun }}:
+          # --- PAT: wie bisher ---------------------------------------------------------------
+          - ${{ if eq(parameters.azureDevOpsAuth, 'pat') }}:
+              - checkout: none
+              - template: steps/terraform-install.yml
+                parameters:
+                  version: ${{ parameters.terraformVersion }}
+              - template: steps/scaffold-config.yml
+                parameters:
+                  adoProject: $(System.TeamProject)
+                  createRepository: true
+                  repository: ''
+                  authorizeServiceConnections: false
+                  name: ${{ parameters.name }}
+                  sso: ${{ parameters.sso }}
+                  mcp: ${{ parameters.mcp }}
+                  storage: ${{ parameters.storage }}
+                  frontend: ${{ parameters.frontend }}
+                  environments: ${{ parameters.environments }}
+                  approvers: ${{ parameters.approvers }}
+                  approverGroups: ${{ parameters.approverGroups }}
+                  requesterCanApprove: ${{ parameters.requesterCanApprove }}
+                  minReviewers: ${{ parameters.minReviewers }}
+                  appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
+                  serviceConnection: ${{ parameters.serviceConnection }}
+                  githubConnection: ${{ parameters.githubConnection }}
+                  terraformState: ${{ parameters.terraformState }}
+                  pipelinesVersion: ${{ parameters.pipelinesVersion }}
+                  projectPool: ${{ parameters.projectPool }}
+                  terraformModuleVersion: ${{ parameters.terraformModuleVersion }}
+              - template: steps/terraform.yml
+                parameters:
+                  name: scaffold
+                  displayName: terraform apply
+                  serviceConnection: ${{ parameters.serviceConnection }}
+                  workingDirectory: $(Agent.TempDirectory)/scaffold
+                  terraformState: ${{ parameters.terraformState }}
+                  stateKey: scaffold/${{ parameters.name }}.tfstate
+                  env:
+                    SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
+                  script: |
+                    export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
+                    # PAT aus der geheimen Variable; ohne sie bleibt der Wert als "$(SeedScaffoldPat)" stehen.
+                    if [ -z "${SEED_SCAFFOLD_PAT:-}" ] || [[ "$SEED_SCAFFOLD_PAT" == '$('* ]]; then
+                      echo "##vso[task.logissue type=error]Geheime Pipeline-Variable SeedScaffoldPat fehlt (PAT für Azure DevOps)."
+                      exit 1
+                    fi
+                    # Ein PAT hat beim Provider Vorrang vor OIDC; OIDC bleibt für den State zuständig.
+                    export AZDO_PERSONAL_ACCESS_TOKEN="$SEED_SCAFFOLD_PAT"
+                    terraform apply -auto-approve
+                    echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
+                    echo "Repo: $(terraform output -raw repository_web_url)"
+              - ${{ if parameters.startFirstRun }}:
+                  - bash: |
+                      set -euo pipefail
+                      url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1"
+                      curl --fail --silent --show-error -X POST \
+                        -u ":$SEED_SCAFFOLD_PAT" -H "Content-Type: application/json" \
+                        --data '{}' "$url" \
+                        | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
+                      echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Service Connection (Permit) und danach auf die Freigabe der Infrastruktur."
+                    displayName: Ersten Lauf starten
+                    env:
+                      SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
+
+          # --- Job-Token: zentrales Scaffold -------------------------------------------------
+          - ${{ if eq(parameters.azureDevOpsAuth, 'jobToken') }}:
+              - bash: |
+                  if [[ ! "$SEED_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+                    echo "##vso[task.logissue type=error]repository: Name des Repos im Zielprojekt (bei new vorher anlegen, mit README)."
+                    exit 1
+                  fi
+                displayName: Repo-Namen prüfen
+                env:
+                  SEED_REPOSITORY: ${{ parameters.repository }}
+              - checkout: seed
+                path: seed
+              # Erst diese Referenz gibt dem Job-Token Zugriff auf das Repo im Zielprojekt
+              # (Protect access to repositories). Inline, weil resources.repositories keine
+              # Template-Ausdrücke erlaubt; das Repo braucht mindestens einen Commit.
+              - checkout: git://${{ coalesce(parameters.adoProject, variables['System.TeamProject']) }}/${{ parameters.repository }}
+                path: target
+                fetchDepth: 0
+                persistCredentials: true
+
               - bash: |
                   set -euo pipefail
-                  url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/pipelines/$(pipelineId)/runs?api-version=7.1"
-                  curl --fail --silent --show-error -X POST \
-                    -u ":$SEED_SCAFFOLD_PAT" -H "Content-Type: application/json" \
-                    --data '{}' "$url" \
-                    | python3 -c "import json,sys; r=json.load(sys.stdin); print('Erster Lauf:', r['_links']['web']['href'])"
-                  echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Service Connection (Permit) und danach auf die Freigabe der Infrastruktur."
-                displayName: Ersten Lauf starten
+                  python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" check \
+                    --name "$SEED_NAME" --mode "$SEED_MODE" --ado-project "$SEED_ADO_PROJECT" \
+                    --repository "$SEED_REPOSITORY" --allowed-projects "$SEED_ALLOWED_PROJECTS" \
+                    --member-group "$SEED_MEMBER_GROUP" \
+                    --connection "$SEED_SERVICE_CONNECTION" --connection "$SEED_GITHUB_CONNECTION"
+                displayName: Zielprojekt, Person und Repo prüfen
                 env:
-                  SEED_SCAFFOLD_PAT: $(SeedScaffoldPat)
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                  SEED_NAME: ${{ parameters.name }}
+                  SEED_MODE: ${{ parameters.mode }}
+                  SEED_ADO_PROJECT: $(seedTargetProject)
+                  SEED_REPOSITORY: ${{ parameters.repository }}
+                  SEED_ALLOWED_PROJECTS: ${{ parameters.allowedProjects }}
+                  SEED_MEMBER_GROUP: ${{ parameters.memberGroup }}
+                  SEED_SERVICE_CONNECTION: ${{ parameters.serviceConnection }}
+                  SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
+
+              - task: AzureCLI@2
+                displayName: Namen prüfen und eintragen
+                env:
+                  SEED_NAME: ${{ parameters.name }}
+                  SEED_MODE: ${{ parameters.mode }}
+                  SEED_PROJECT_ID: $(seedProjectId)
+                  SEED_PROJECT_NAME: $(seedProjectName)
+                  SEED_REPOSITORY: ${{ parameters.repository }}
+                  SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+                  SEED_STORAGE_ACCOUNT: ${{ parameters.terraformState.storageAccount }}
+                  SEED_CONTAINER: ${{ parameters.terraformState.container }}
+                  SEED_DRY_RUN: ${{ lower(parameters.dryRun) }}
+                inputs:
+                  azureSubscription: ${{ coalesce(parameters.stateServiceConnection, parameters.serviceConnection) }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    args=(--name "$SEED_NAME" --mode "$SEED_MODE" --project-id "$SEED_PROJECT_ID"
+                          --project-name "$SEED_PROJECT_NAME" --repository "$SEED_REPOSITORY"
+                          --environments-json "$SEED_ENVIRONMENTS"
+                          --storage-account "$SEED_STORAGE_ACCOUNT" --container "$SEED_CONTAINER")
+                    if [ "$SEED_DRY_RUN" = true ]; then args+=(--dry-run); fi
+                    python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" reserve "${args[@]}"
+
+              - ${{ if parameters.dryRun }}:
+                  - bash: echo "##vso[task.logissue type=warning]dryRun: alle Prüfungen bestanden, nichts geändert."
+                    displayName: Nur geprüft (dryRun)
+
+              - ${{ if not(parameters.dryRun) }}:
+                  - bash: |
+                      set -euo pipefail
+                      python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" share \
+                        --project-id "$SEED_PROJECT_ID" \
+                        --connection "$SEED_SERVICE_CONNECTION" --connection "$SEED_GITHUB_CONNECTION"
+                    displayName: Service Connections ins Zielprojekt teilen
+                    env:
+                      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                      SEED_PROJECT_ID: $(seedProjectId)
+                      SEED_SERVICE_CONNECTION: ${{ parameters.serviceConnection }}
+                      SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
+
+              # mode new: seed-template ins vorhandene Repo, dann Terraform wie bei pat
+              - ${{ if and(eq(parameters.mode, 'new'), not(parameters.dryRun)) }}:
+                  - bash: |
+                      set -euo pipefail
+                      cd "$(Pipeline.Workspace)/target"
+                      if git log --format=%s origin/main | grep -q '^seed-scaffold: seed-template'; then
+                        echo "seed-template ist schon eingeführt."
+                        exit 0
+                      fi
+                      git config user.name "Sentinel Seed Scaffold"
+                      git config user.email "seed-scaffold@users.noreply.dev.azure.com"
+                      git checkout -q -B main origin/main
+                      git fetch -q --no-tags "$SEED_TEMPLATE_URL" main
+                      # Unabhängige Historien; bei Dateien wie README.md gewinnt seed-template.
+                      git merge -q --allow-unrelated-histories -X theirs --no-edit \
+                        -m "seed-scaffold: seed-template eingeführt" FETCH_HEAD
+                      git push -q origin HEAD:refs/heads/main
+                      echo "seed-template eingeführt: $(git rev-parse --short HEAD)"
+                    displayName: seed-template ins Repo
+                    env:
+                      SEED_TEMPLATE_URL: ${{ parameters.templateUrl }}
+                  - template: steps/terraform-install.yml
+                    parameters:
+                      version: ${{ parameters.terraformVersion }}
+                  - template: steps/scaffold-config.yml
+                    parameters:
+                      # Name aus der API (check), nicht die Eingabe: Makros landen als Text im Skript.
+                      adoProject: $(seedProjectName)
+                      createRepository: false
+                      repository: ${{ parameters.repository }}
+                      authorizeServiceConnections: true
+                      name: ${{ parameters.name }}
+                      sso: ${{ parameters.sso }}
+                      mcp: ${{ parameters.mcp }}
+                      storage: ${{ parameters.storage }}
+                      frontend: ${{ parameters.frontend }}
+                      environments: ${{ parameters.environments }}
+                      approvers: ${{ parameters.approvers }}
+                      approverGroups: ${{ parameters.approverGroups }}
+                      requesterCanApprove: ${{ parameters.requesterCanApprove }}
+                      minReviewers: ${{ parameters.minReviewers }}
+                      appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
+                      serviceConnection: ${{ parameters.serviceConnection }}
+                      githubConnection: ${{ parameters.githubConnection }}
+                      terraformState: ${{ parameters.terraformState }}
+                      pipelinesVersion: ${{ parameters.pipelinesVersion }}
+                      projectPool: ${{ parameters.projectPool }}
+                      terraformModuleVersion: ${{ parameters.terraformModuleVersion }}
+                  - template: steps/terraform.yml
+                    parameters:
+                      name: scaffold
+                      displayName: terraform apply
+                      serviceConnection: ${{ coalesce(parameters.stateServiceConnection, parameters.serviceConnection) }}
+                      workingDirectory: $(Agent.TempDirectory)/scaffold
+                      terraformState: ${{ parameters.terraformState }}
+                      stateKey: scaffold/$(seedProjectId)/${{ parameters.name }}.tfstate
+                      env:
+                        SEED_AZDO_TOKEN: $(System.AccessToken)
+                      script: |
+                        export AZDO_ORG_SERVICE_URL="$(System.CollectionUri)"
+                        export AZDO_PERSONAL_ACCESS_TOKEN="$SEED_AZDO_TOKEN"
+                        terraform apply -auto-approve
+                        echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
+                        echo "Repo: $(terraform output -raw repository_web_url)"
+                  - ${{ if parameters.startFirstRun }}:
+                      - bash: |
+                          set -euo pipefail
+                          python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" run \
+                            --project-id "$SEED_PROJECT_ID" --pipeline-id "$SEED_PIPELINE_ID"
+                          echo "##vso[task.logissue type=warning]Der erste Lauf wartet auf die Freigabe der Infrastruktur."
+                        displayName: Ersten Lauf starten
+                        env:
+                          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                          SEED_PROJECT_ID: $(seedProjectId)
+                          SEED_PIPELINE_ID: $(pipelineId)
+
+              # migrate und enableBranchPolicy: wie onboarding/Initialize-SeedProject.ps1
+              - ${{ if ne(parameters.mode, 'new') }}:
+                  - pwsh: |
+                      $arguments = @{
+                          AzureDevOpsOrganization = $env:SYSTEM_COLLECTIONURI.TrimEnd('/')
+                          AzureDevOpsProject      = $env:SEED_PROJECT_ID
+                          Repository              = $env:SEED_REPOSITORY
+                          SeedProjectName         = $env:SEED_NAME
+                          DefaultBranch           = $env:SEED_DEFAULT_BRANCH
+                          Environments            = [string[]] @($env:SEED_ENVIRONMENTS | ConvertFrom-Json)
+                          Approvers               = [string[]] @($env:SEED_APPROVERS | ConvertFrom-Json)
+                          ApproverGroups          = [string[]] @($env:SEED_APPROVER_GROUPS | ConvertFrom-Json)
+                          AppApprovalEnvironments = [string[]] @($env:SEED_APP_APPROVAL_ENVIRONMENTS | ConvertFrom-Json)
+                          ServiceConnectionName   = $env:SEED_SERVICE_CONNECTION
+                          GitHubConnectionName    = $env:SEED_GITHUB_CONNECTION
+                          MinReviewers            = [int] $env:SEED_MIN_REVIEWERS
+                          # Die Branch-Prüfung hängt zentral an der geteilten Service Connection.
+                          SkipBranchControl       = $true
+                      }
+                      if ($env:SEED_MODE -eq 'enableBranchPolicy') { $arguments.EnableBranchPolicy = $true }
+                      if ($env:SEED_REQUESTER_CAN_APPROVE -ne 'true') { $arguments.RequesterCannotApprove = $true }
+                      if ($env:SEED_DRY_RUN -eq 'true') { $arguments.DryRun = $true }
+                      & "$(Pipeline.Workspace)/seed/onboarding/Initialize-SeedProject.ps1" @arguments
+                    displayName: Projekt einrichten (${{ parameters.mode }})
+                    env:
+                      SEED_AZDO_TOKEN: $(System.AccessToken)
+                      SEED_PROJECT_ID: $(seedProjectId)
+                      SEED_DEFAULT_BRANCH: $(seedDefaultBranch)
+                      SEED_NAME: ${{ parameters.name }}
+                      SEED_MODE: ${{ parameters.mode }}
+                      SEED_REPOSITORY: ${{ parameters.repository }}
+                      SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+                      SEED_APPROVERS: ${{ convertToJson(parameters.approvers) }}
+                      SEED_APPROVER_GROUPS: ${{ convertToJson(parameters.approverGroups) }}
+                      SEED_APP_APPROVAL_ENVIRONMENTS: ${{ convertToJson(parameters.appApprovalEnvironments) }}
+                      SEED_SERVICE_CONNECTION: ${{ parameters.serviceConnection }}
+                      SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
+                      SEED_MIN_REVIEWERS: ${{ parameters.minReviewers }}
+                      SEED_REQUESTER_CAN_APPROVE: ${{ lower(parameters.requesterCanApprove) }}
+                      SEED_DRY_RUN: ${{ lower(parameters.dryRun) }}
