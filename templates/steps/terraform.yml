@@ -33,7 +33,14 @@ steps:
     displayName: ${{ parameters.displayName }}
     ${{ if ne(parameters.name, '') }}:
       name: ${{ parameters.name }}
-    env: ${{ parameters.env }}
+    # Backend-Werte über die Umgebung statt als Text im Skript: Der State-Key kann aus einem
+    # Laufzeit-Parameter stammen (seed-scaffold), und die Shell darf ihn nicht auswerten.
+    env:
+      SEED_TF_STATE_RESOURCE_GROUP: ${{ parameters.terraformState.resourceGroup }}
+      SEED_TF_STATE_STORAGE_ACCOUNT: ${{ parameters.terraformState.storageAccount }}
+      SEED_TF_STATE_CONTAINER: ${{ parameters.terraformState.container }}
+      SEED_TF_STATE_KEY: ${{ parameters.stateKey }}
+      ${{ insert }}: ${{ parameters.env }}
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
@@ -51,10 +58,10 @@ steps:
         export TF_INPUT=false
 
         terraform init \
-          -backend-config="resource_group_name=${{ parameters.terraformState.resourceGroup }}" \
-          -backend-config="storage_account_name=${{ parameters.terraformState.storageAccount }}" \
-          -backend-config="container_name=${{ parameters.terraformState.container }}" \
-          -backend-config="key=${{ parameters.stateKey }}" \
+          -backend-config="resource_group_name=$SEED_TF_STATE_RESOURCE_GROUP" \
+          -backend-config="storage_account_name=$SEED_TF_STATE_STORAGE_ACCOUNT" \
+          -backend-config="container_name=$SEED_TF_STATE_CONTAINER" \
+          -backend-config="key=$SEED_TF_STATE_KEY" \
           -backend-config="use_azuread_auth=true"
 
         ${{ parameters.script }}
