@@ -193,7 +193,8 @@ if ($group) {
     Write-Host '4. Environments'
     Set-Role 'Rolle Creator' 'distributedtask.globalenvironmentreferencerole' $project.id $groupIdentity.id 'Creator'
     Write-Host '5. Service Connections'
-    Set-Role 'Rolle Creator' 'distributedtask.serviceendpointrole' $project.id $groupIdentity.id 'Creator'
+    # Die Rolle Creator gibt es nur im Bereich des Projekts, nicht bei einzelnen Service Connections.
+    Set-Role 'Rolle Creator' 'distributedtask.project.serviceendpointrole' $project.id $groupIdentity.id 'Creator'
     if ($AgentPool) {
         Write-Host "7. Agent-Queue $AgentPool"
         $queue = (Invoke-AzDevOps get "$Org/$($project.id)/_apis/distributedtask/queues?queueNames=$([uri]::EscapeDataString($AgentPool))&api-version=7.1" $null).value |
