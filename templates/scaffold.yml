@@ -309,7 +309,8 @@ stages:
                     python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" reserve "${args[@]}"
 
               - ${{ if parameters.dryRun }}:
-                  - bash: echo "##vso[task.logissue type=warning]dryRun: alle Prüfungen bestanden, nichts geändert."
+                  - bash: |
+                      echo "##vso[task.logissue type=warning]dryRun: alle Prüfungen bestanden, nichts geändert."
                     displayName: Nur geprüft (dryRun)
 
               - ${{ if not(parameters.dryRun) }}:
