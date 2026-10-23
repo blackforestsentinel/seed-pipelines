@@ -105,7 +105,7 @@ param(
     [string] $Repository = 'seed-tenant',
     [string] $PipelineName = 'seed-intune',
     [string] $DefaultBranch = 'main',
-    [string] $SeedPipelinesVersion = 'v0.13.0',
+    [string] $SeedPipelinesVersion = 'v0.14.0',
     [string[]] $AllowedBranches = @(),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
     [ValidateRange(1, 10)] [int] $MinimumReviewers = 1,

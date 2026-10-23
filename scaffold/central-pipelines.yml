@@ -1,0 +1,103 @@
+# Sentinel Seed: zentrales Scaffold. Legt Seed-Projekte in anderen Azure-DevOps-Projekten an
+# und richtet vorhandene Repos ein, ohne Admin-Rechte der startenden Person.
+# Angelegt vom Tenant-Onboarding (onboarding/Initialize-SeedTenant.ps1 -CentralScaffold).
+#
+# Vorher im Zielprojekt, einmal: Ein Projektadmin schaltet das zentrale Scaffold frei
+# (onboarding/Grant-SeedScaffoldAccess.ps1). Bei new legt die Person das Repo selbst an
+# (Repos, New repository, mit README) und gibt seinen Namen an.
+trigger: none
+pr: none
+
+parameters:
+  - name: adoProject
+    displayName: Zielprojekt (Azure-DevOps-Projekt)
+    type: string
+  - name: repository
+    displayName: Repo im Zielprojekt (bei new vorher anlegen, mit README)
+    type: string
+  - name: mode
+    displayName: "new: neues Projekt, migrate: vorhandenes Repo einrichten, enableBranchPolicy: nach dem Umschalten"
+    type: string
+    default: new
+    values: [new, migrate, enableBranchPolicy]
+  - name: name
+    displayName: Projektname (3-20 Zeichen, a-z, 0-9, Bindestrich)
+    type: string
+  - name: sso
+    displayName: Login mit Entra ID (sso)
+    type: boolean
+    default: false
+  - name: mcp
+    displayName: MCP-Server für KI-Werkzeuge (mcp, setzt sso voraus)
+    type: boolean
+    default: false
+  - name: storage
+    displayName: Storage Account mit Tabellen und Queues (storage)
+    type: boolean
+    default: false
+  - name: frontend
+    displayName: Mit Frontend (Static Web App); aus = nur API
+    type: boolean
+    default: true
+  - name: environments
+    displayName: Umgebungen in Deploy-Reihenfolge
+    type: object
+    default: [dev]
+  - name: approvers
+    displayName: Weitere Freigabe für Infrastruktur-Änderungen (E-Mail-Adressen)
+    type: object
+    default: []
+  - name: appApprovalEnvironments
+    displayName: Umgebungen, in denen auch der App-Deploy eine Freigabe braucht
+    type: object
+    default: []
+  - name: startFirstRun
+    displayName: Ersten Lauf der neuen Pipeline starten
+    type: boolean
+    default: true
+  - name: dryRun
+    displayName: Nur prüfen, nichts ändern
+    type: boolean
+    default: false
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/tags/__SEED_PIPELINES_VERSION__
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/scaffold.yml@seed
+  parameters:
+    azureDevOpsAuth: jobToken
+    adoProject: ${{ parameters.adoProject }}
+    repository: ${{ parameters.repository }}
+    mode: ${{ parameters.mode }}
+    name: ${{ parameters.name }}
+    sso: ${{ parameters.sso }}
+    mcp: ${{ parameters.mcp }}
+    storage: ${{ parameters.storage }}
+    frontend: ${{ parameters.frontend }}
+    environments: ${{ parameters.environments }}
+    approvers: ${{ parameters.approvers }}
+    appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
+    startFirstRun: ${{ parameters.startFirstRun }}
+    dryRun: ${{ parameters.dryRun }}
+    # Fest, nicht beim Start änderbar:
+    allowedProjects: '__ALLOWED_PROJECTS__'
+    memberGroup: '__MEMBER_GROUP__'
+    approverGroups: __APPROVER_GROUPS__
+    requesterCanApprove: __REQUESTER_CAN_APPROVE__
+    minReviewers: __MIN_REVIEWERS__
+    pipelinesVersion: __SEED_PIPELINES_VERSION__
+    serviceConnection: __SERVICE_CONNECTION__
+    githubConnection: __GITHUB_CONNECTION__
+    stateServiceConnection: __SCAFFOLD_CONNECTION__
+    terraformState:
+      resourceGroup: __STATE_RESOURCE_GROUP__
+      storageAccount: __STATE_STORAGE_ACCOUNT__
+      container: __STATE_CONTAINER__
+    pool: '__POOL__'
+    projectPool: '__PROJECT_POOL__'
