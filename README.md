@@ -34,6 +34,7 @@ extends:
     confirmDataDeletion: ${{ parameters.confirmDataDeletion }}
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
+    # pool: Default                               # eigener Agent-Pool, siehe Eigene Agents
     # frontend: false                             # Projekt ohne Frontend (nur API)
     # extension:                                  # Browser-Erweiterung als zweiter Client, siehe unten
     #   path: extension
@@ -278,6 +279,16 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 - Rollen der Service-Connection-Identität: `Contributor` und `Role Based Access Control Administrator` auf der Subscription, `Storage Blob Data Contributor` auf dem State-Storage.
 - Je Umgebung zwei Environments, für die Pipeline berechtigt: `<project>-<env>` mit Freigabe als Check (Infrastruktur) und `<project>-<env>-app` für den App-Deploy, dort optional eine Freigabe, etwa in Produktion. Azure DevOps legt sie nicht selbst an.
 
+### Eigene Agents
+
+Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
+
+- **Was die Agents brauchen:** Linux (x64) mit bash, curl, unzip, tar, git, python3 und der Azure CLI; für `extension.signing` zusätzlich openssl.
+- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents.
+- **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
+- **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
+- **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).
+
 ### Projektstruktur, die das Template erwartet
 
 `project.yaml`, `api/Api.slnx`, `api/Api/Api.csproj`, `frontend/` mit `npm test` und `npm run build` nach `dist/` (nur mit Frontend), `infra/` mit den Outputs `resource_group_name`, `function_app_name`, `function_app_url`, `static_web_app_name`, `static_web_app_url` (ohne Frontend leere Strings) und optional `frontend_config` (Objekt, wird zu `config.json`). Pfade sind per Parameter änderbar.
@@ -327,6 +338,8 @@ Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed
 Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1 -EnableBranchPolicy`. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` mit `-EnableBranchPolicy` bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
 `-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)); der PAT entfällt dann.
+
+`-Pool <Name>` lässt `seed-scaffold` auf eigenen Agents laufen (siehe [Eigene Agents](#eigene-agents)); ohne den Parameter nutzt es Microsoft-gehostete Agents.
 
 Danach einmalig einen PAT anlegen und als geheime Variable `SeedScaffoldPat` an der Pipeline `seed-scaffold` hinterlegen. Scopes: Code (Read, write & manage), Build (Read & execute), Environment (Read & manage), Graph (Read), Project and Team (Read), Pipeline Resources (Use and manage). Das Job-Token der Pipeline reicht nicht, solange „Protect access to repositories in YAML pipelines“ an ist; dann darf es keine Repos anlegen. Die Person, deren PAT es ist, braucht außerdem „Edit policies“ an den Repos des Projekts (Branch-Policy der PR-Validierung).
 

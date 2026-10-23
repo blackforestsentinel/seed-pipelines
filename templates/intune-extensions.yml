@@ -68,9 +68,16 @@ parameters:
     type: boolean
     default: false
 
+  # Microsoft-gehosteter Agent; gilt nur, solange pool leer ist.
   - name: vmImage
     type: string
     default: ubuntu-24.04
+
+  # Eigener Agent-Pool statt Microsoft-gehosteter Agents, z. B. Default. Linux-Agents mit bash,
+  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents).
+  - name: pool
+    type: string
+    default: ''
 
 stages:
   - stage: plan
@@ -79,7 +86,10 @@ stages:
       - job: plan
         displayName: Registerdatei und Plan
         pool:
-          vmImage: ${{ parameters.vmImage }}
+          ${{ if eq(parameters.pool, '') }}:
+            vmImage: ${{ parameters.vmImage }}
+          ${{ else }}:
+            name: ${{ parameters.pool }}
         steps:
           - checkout: self
             path: tenant
@@ -126,7 +136,10 @@ stages:
           - deployment: apply
             displayName: Richtlinie anwenden
             pool:
-              vmImage: ${{ parameters.vmImage }}
+              ${{ if eq(parameters.pool, '') }}:
+                vmImage: ${{ parameters.vmImage }}
+              ${{ else }}:
+                name: ${{ parameters.pool }}
             # Freigaben hängen als Check an diesem Environment.
             environment: ${{ parameters.environment }}
             variables:
