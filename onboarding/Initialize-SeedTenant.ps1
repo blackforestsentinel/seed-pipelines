@@ -633,6 +633,12 @@ try {
                     Get-Endpoint $ScaffoldConnectionName
                 }
             }
+            if (-not $scaffoldIdentity) {
+                foreach ($title in @('Rollen auf State-Container und Subscription', "Service Connection $ScaffoldConnectionName", 'Federated Credential')) {
+                    Write-Host "  [fehlt] $title (nach der Managed Identity)" -ForegroundColor Yellow
+                    $missing.Add($title)
+                }
+            }
             if ($scaffoldEndpoint -and $scaffoldIdentity) {
                 $issuer = $scaffoldEndpoint.authorization.parameters.workloadIdentityFederationIssuer
                 $subject = $scaffoldEndpoint.authorization.parameters.workloadIdentityFederationSubject
