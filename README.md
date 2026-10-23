@@ -541,7 +541,7 @@ Beispiel: Ein Projekt verteilt seine Erweiterung bisher mit einer eigenen Pipeli
 1. Onboarding mit `-AdoptPolicies 'Kundenportal: Edge-Erweiterung'` (landet in `adoptPolicies`).
 2. Im Projekt den bisherigen Intune-Schritt entfernen oder dessen Pipeline anhalten, **bevor** `seed-intune` zum ersten Mal anwendet. Sonst findet er seine Richtlinie nach der Umbenennung nicht mehr, legt sie neu an, und beide stehen im Konflikt.
 3. Pull Request in `seed-tenant` mit dem Eintrag des Projekts (`id` und `updateUrl` wie bisher). Nach dem Merge zeigt der Plan „übernehmen und umbenennen“, mit derselben Liste ohne Entfernungen.
-4. Nach dem Apply der Identität `kundenportal-rollout` das Recht `DeviceManagementConfiguration.ReadWrite.All` entziehen; das Onboarding nennt alle weiteren Identitäten mit diesem Recht.
+4. Nach dem Apply der bisherigen Identität das Recht `DeviceManagementConfiguration.ReadWrite.All` entziehen; das Onboarding nennt alle weiteren Identitäten mit diesem Recht.
 
 ### Rechte und Schutz
 
