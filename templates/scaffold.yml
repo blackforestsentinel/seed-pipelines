@@ -61,10 +61,11 @@ parameters:
   - name: requesterCanApprove
     type: boolean
     default: true
-  # Pflicht-Reviewer für Pull Requests auf main, ohne die eigene Stimme; 0: keine.
+  # Pflicht-Reviewer für Pull Requests auf main, ohne die eigene Stimme; 0: keine. Standard 1,
+  # weil die Stage Plan des neuen Projekts die Service Connection vor jeder Freigabe nutzt.
   - name: minReviewers
     type: number
-    default: 0
+    default: 1
   # Umgebungen, in denen auch der App-Deploy eine Freigabe braucht.
   - name: appApprovalEnvironments
     type: object

@@ -24,6 +24,10 @@
          Seed-Projekte legt die Person das Repo selbst an; das Scaffold darf es nicht.
       7. Mit -AgentPool: die Gruppe wird Administrator der Agent-Queue, damit das Scaffold neue
          Pipelines für einen eigenen Pool berechtigen kann
+      8. Tags im Projekt nur für Administratoren: Deny "Create tag" für Contributors, Build
+         Administrators und die Build-Service-Identitäten (nicht mit -AllowTagCreation). Die
+         Branch-Prüfung der geteilten Service Connection lässt refs/tags/v* für jedes Repo des Laufs
+         durch; ein Tag v… im Repo eines Seed-Projekts bekäme sonst die Deployment-Identität.
 
     Repos legt die Identität nicht an, und sie sieht nur die Repos, die ein Lauf des Scaffolds
     auscheckt ("Protect access to repositories in YAML pipelines"). Weitere Rechte, etwa
@@ -36,6 +40,11 @@
 
 .PARAMETER CentralProject
     Name des Azure-DevOps-Projekts mit dem zentralen Scaffold.
+
+.PARAMETER AllowTagCreation
+    Tags im Projekt nicht auf Administratoren beschränken (Schritt 8 entfällt, mit Warnung), etwa
+    weil andere Repos dort Tags brauchen. Dann sollte ein Admin "Create tag" in jedem Repo eines
+    Seed-Projekts selbst verbieten.
 
 .PARAMETER Check
     Nur prüfen und anzeigen, was fehlt. Ändert nichts.
@@ -52,6 +61,7 @@ param(
     [string] $GroupName = 'Sentinel Seed Scaffold',
     [switch] $AllowContributorsToCreateRepositories,
     [string] $AgentPool = '',
+    [switch] $AllowTagCreation,
     [switch] $Check
 )
 
@@ -147,6 +157,23 @@ function Set-Allow([string] $Title, [string] $Namespace, [string] $SecurityToken
     } | Out-Null
 }
 
+# Verbietet die Rechte $Bits für die Identität auf $SecurityToken; vorhandene Einträge bleiben.
+function Set-Deny([string] $Title, [string] $Namespace, [string] $SecurityToken, [object] $Identity, [int] $Bits) {
+    Invoke-Step $Title {
+        $acl = (Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$Namespace`?token=$([uri]::EscapeDataString($SecurityToken))&descriptors=$([uri]::EscapeDataString($Identity.descriptor))&api-version=7.1" $null).value
+        $deny = 0
+        foreach ($entry in $acl) { foreach ($ace in $entry.acesDictionary.PSObject.Properties.Value) { $deny = $deny -bor $ace.deny } }
+        ($deny -band $Bits) -eq $Bits
+    } {
+        Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$Namespace`?api-version=7.1" @{
+            token                = $SecurityToken
+            merge                = $true
+            accessControlEntries = @(@{ descriptor = $Identity.descriptor; allow = 0; deny = $Bits })
+        } | Out-Null
+        $true
+    } | Out-Null
+}
+
 function Set-Role([string] $Title, [string] $Scope, [string] $Resource, [string] $IdentityId, [string] $Role) {
     $url = "$Org/_apis/securityroles/scopes/$Scope/roleassignments/resources/$Resource`?api-version=7.1-preview.1"
     Invoke-Step $Title {
@@ -224,6 +251,26 @@ if ($AllowContributorsToCreateRepositories) {
         Where-Object principalName -eq "[$($project.name)]\Contributors" | Select-Object -First 1
     Set-Allow 'Create repository für Contributors' $GitNamespace "repoV2/$($project.id)" (Get-Identity $contributors.descriptor) `
         (Get-ActionBits $GitNamespace @('CreateRepository'))
+}
+
+# --- 8. Tags nur für Administratoren ---------------------------------------------------------
+# Auch die Job-Tokens der Pipelines im Projekt (Build-Service-Identitäten) könnten Tags anlegen.
+Write-Host '8. Tags im Projekt nur für Administratoren'
+if ($AllowTagCreation) {
+    Write-Host "  [warn]  -AllowTagCreation: In $($project.name) darf ein Admin dann Create tag je Seed-Repo verbieten." -ForegroundColor Yellow
+} else {
+    $projectGroups = (az devops security group list --org $Org --project $project.id -o json | ConvertFrom-Json).graphGroups
+    $tagBits = Get-ActionBits $GitNamespace @('CreateTag')
+    foreach ($name in @('Contributors', 'Build Administrators')) {
+        $projectGroup = $projectGroups | Where-Object principalName -eq "[$($project.name)]\$name" | Select-Object -First 1
+        if (-not $projectGroup) { throw "Gruppe [$($project.name)]\$name nicht gefunden." }
+        Set-Deny "Create tag verboten für $name" $GitNamespace "repoV2/$($project.id)" (Get-Identity $projectGroup.descriptor) $tagBits
+    }
+    foreach ($name in @("$($project.name) Build Service ($orgName)", "Project Collection Build Service ($orgName)")) {
+        $service = Find-BuildIdentity $name
+        if (-not $service) { throw "$name nicht gefunden." }
+        Set-Deny "Create tag verboten für $name" $GitNamespace "repoV2/$($project.id)" (Get-Identity $service.descriptor) $tagBits
+    }
 }
 
 Write-Host ''

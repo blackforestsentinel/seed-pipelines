@@ -19,6 +19,12 @@
       5. Nur mit -EnableBranchPolicy: Branch-Prüfung an der Azure-Service-Connection, nur Läufe
          von -AllowedBranches (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs
          (Standard refs/tags/v*) bekommen die Deployment-Identität
+      6. Tags im Repo nur für Administratoren: Deny "Create tag" für Contributors, Build
+         Administrators und die Build-Service-Identitäten, weil die Branch-Prüfung refs/tags/v*
+         auch für das Projekt-Repo durchlässt (nicht mit -SkipBranchControl oder -AllowTagCreation)
+
+    Mit -Pool prüft das Skript außerdem die Agent-Queue und warnt, wenn sie ohne Freigabe oder
+    Branch-Prüfung ist, allen Pipelines offensteht oder der Pool in jedes neue Projekt kommt.
 
     Einstellungen wie in ado-project: Freigabe durch eine der genannten Personen, auch durch
     die, die den Lauf gestartet hat, 30 Tage Zeit; Policy blockierend, Ergebnis 12 Stunden
@@ -60,7 +66,10 @@
 
 .PARAMETER Pool
     Eigener Agent-Pool, den azure-pipelines.yml des Projekts nennt (pool). Die Pipeline wird für
-    dessen Queue berechtigt; sonst fragt der erste Lauf danach ("Permit").
+    dessen Queue berechtigt; sonst fragt der erste Lauf danach ("Permit"). Ein eigener Agent
+    läuft dauerhaft, und was ein Lauf dort hinterlässt, trifft spätere Läufe; das Skript warnt
+    deshalb, wenn die Queue ohne Freigabe oder Branch-Prüfung ist, allen Pipelines offensteht
+    oder der Pool automatisch in jedes neue Projekt kommt (README, Eigene Agents).
 
 .PARAMETER EnableBranchPolicy
     Branch-Policy für die PR-Validierung setzen. Erst nach dem Umschalten: Die Policy ist
@@ -70,7 +79,8 @@
 
 .PARAMETER MinReviewers
     Nur mit -EnableBranchPolicy: Pull Requests brauchen so viele Zustimmungen anderer Personen,
-    die eigene Stimme zählt nicht. 0 (Standard): keine Pflicht.
+    die eigene Stimme zählt nicht. Standard 1, weil die Stage Plan die Service Connection vor
+    jeder Freigabe nutzt; 0: keine Pflicht.
 
 .PARAMETER SkipBranchControl
     Branch-Prüfung an der Service Connection nicht anfassen, etwa weil sie zentral an einer
@@ -86,8 +96,12 @@
     Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
     Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
     Projekte über einen Tag einbinden. Ein Tag v… im Projekt-Repo und ein Lauf darauf kämen
-    deshalb ebenfalls durch: Im Projekt-Repo sollten nur Administratoren Tags anlegen dürfen
-    (README, Branch-Prüfung).
+    deshalb ebenfalls durch: Im Projekt-Repo dürfen deshalb nur Administratoren Tags anlegen
+    (Schritt 6, README, Branch-Prüfung).
+
+.PARAMETER AllowTagCreation
+    Tags im Repo nicht auf Administratoren beschränken (Schritt 6 entfällt, mit Warnung). Dann
+    kann jede Person mit Schreibrecht über einen Tag v… die Deployment-Identität bekommen.
 
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Ändert nichts.
@@ -115,10 +129,11 @@ param(
     [string] $DefaultBranch = 'main',
     [string] $Pool = '',
     [switch] $EnableBranchPolicy,
-    [ValidateRange(0, 10)] [int] $MinReviewers = 0,
+    [ValidateRange(0, 10)] [int] $MinReviewers = 1,
     [switch] $SkipBranchControl,
     [string[]] $AllowedBranches = @(),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [switch] $AllowTagCreation,
     [switch] $DryRun
 )
 
@@ -159,6 +174,8 @@ $ApprovalCheckType = '8c6f20a7-a545-4486-9777-f762fafe0d4d'
 $BuildPolicyType = '0609b952-1397-4640-95ec-e00a01b2c241'
 $BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
 $BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
+$GitNamespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'
+$CreateTagBit = 32   # Recht "Create tag" (CreateTag) im Namespace Git Repositories
 $BranchRef = "refs/heads/$DefaultBranch"
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-project-$(Get-Random)")
@@ -233,6 +250,50 @@ function Find-OrganizationGroup([string] $Name) {
 # Für Prüfungen: Fehler (etwa 404 für eine fehlende Ressource) bedeuten "nicht vorhanden".
 function Get-OrNull([scriptblock] $Command) {
     try { & $Command } catch { $null }
+}
+
+# Wer im Projekt-Repo Tags anlegen könnte, ohne Administrator zu sein: Contributors, Build
+# Administrators und die Job-Tokens der Pipelines (Build-Service-Identitäten des Projekts und der
+# Organisation). Liefert Name und Identitäts-Deskriptor für Zugriffslisten.
+function Get-TagCreators {
+    $scope = (Invoke-AzDevOps get "$Vssps/_apis/graph/descriptors/$($project.id)?api-version=7.1-preview.1").value
+    $groupNames = @("[$($project.name)]\Contributors", "[$($project.name)]\Build Administrators")
+    $subjects = @((Invoke-AzDevOps get "$Vssps/_apis/graph/groups?scopeDescriptor=$scope&api-version=7.1-preview.1").value |
+            Where-Object principalName -in $groupNames | ForEach-Object { [pscustomobject] @{ Name = $_.principalName; Descriptor = $_.descriptor } })
+    $serviceNames = @("$($project.name) Build Service ($orgName)", "Project Collection Build Service ($orgName)")
+    $continuation = $null
+    do {
+        $url = "$Vssps/_apis/graph/users?subjectTypes=svc&api-version=7.1-preview.1"
+        if ($continuation) { $url += "&continuationToken=$([uri]::EscapeDataString($continuation))" }
+        $response = Invoke-RestMethod -Uri $url -Headers (Get-AuthHeader) -ResponseHeadersVariable headers
+        $subjects += @($response.value | Where-Object displayName -in $serviceNames |
+                ForEach-Object { [pscustomobject] @{ Name = $_.displayName; Descriptor = $_.descriptor } })
+        $continuation = if ($headers['x-ms-continuationtoken']) { @($headers['x-ms-continuationtoken'])[0] }
+    } while ($continuation)
+
+    foreach ($name in @($groupNames + $serviceNames)) {
+        $subject = $subjects | Where-Object Name -eq $name | Select-Object -First 1
+        if (-not $subject) { throw "Tags: $name nicht gefunden." }
+        $id = (Invoke-AzDevOps get "$Vssps/_apis/graph/storagekeys/$($subject.Descriptor)?api-version=7.1-preview.1").value
+        [pscustomobject] @{ Name = $name; Descriptor = (Invoke-AzDevOps get "$Identities`?identityIds=$id&api-version=7.1").value[0].descriptor }
+    }
+}
+
+# Verbietet "Create tag" auf $SecurityToken (Repo oder ganzes Projekt); vorhandene Einträge bleiben.
+function Set-TagDeny([string] $SecurityToken, [object[]] $Creators) {
+    foreach ($creator in $Creators) {
+        Invoke-Step "Create tag verboten für $($creator.Name)" {
+            (Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$GitNamespace`?token=$([uri]::EscapeDataString($SecurityToken))&descriptors=$([uri]::EscapeDataString($creator.Descriptor))&api-version=7.1").value |
+                ForEach-Object { $_.acesDictionary.PSObject.Properties.Value } | Where-Object { $_.deny -band $CreateTagBit }
+        } {
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$GitNamespace`?api-version=7.1" @{
+                token                = $SecurityToken
+                merge                = $true
+                accessControlEntries = @(@{ descriptor = $creator.Descriptor; allow = 0; deny = $CreateTagBit })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
 }
 
 # Wie die Vorbedingung in ado-project: PR-Läufe ohne Deploy kennt web-app.yml erst ab
@@ -410,6 +471,28 @@ try {
         } | Out-Null
     }
 
+    # Ein eigener Agent läuft dauerhaft; was ein Lauf dort hinterlässt, trifft spätere Läufe, auch
+    # die mit der Service Connection. Nur Warnungen: Checks an der Queue gelten für alle Pipelines
+    # des Projekts, das entscheidet ein Admin (README, Eigene Agents).
+    if ($Pool -and $poolQueue) {
+        $queueChecks = @((Invoke-AzDevOps get "$api/pipelines/checks/configurations?resourceType=queue&resourceId=$($poolQueue.id)&`$expand=settings&api-version=7.1-preview.1").value)
+        $warnings = @(
+            if (-not ($queueChecks | Where-Object { $_.type.id -eq $ApprovalCheckType })) {
+                "Agent-Queue $Pool hat keine Freigabe: Jeder Lauf erreicht den Agent ohne Rückfrage."
+            }
+            if (-not ($queueChecks | Where-Object { $_.type.id -eq $BranchControlCheckType -and $_.settings.definitionRef.id -eq $BranchControlDefinition })) {
+                "Agent-Queue $Pool hat keine Branch-Prüfung: Auch Läufe von Feature-Branches erreichen den Agent."
+            }
+            if ((Invoke-AzDevOps get "$api/pipelines/pipelinePermissions/queue/$($poolQueue.id)?api-version=7.1-preview.1").allPipelines.authorized) {
+                "Agent-Queue $Pool steht allen Pipelines des Projekts offen, auch neu angelegten."
+            }
+            if ((Invoke-AzDevOps get "$Org/_apis/distributedtask/pools/$($poolQueue.pool.id)?api-version=7.1").autoProvision) {
+                "Pool $Pool kommt automatisch in jedes neue Projekt der Organisation, dort ohne diese Checks."
+            }
+        )
+        foreach ($warning in $warnings) { Write-Host "  [warn]  $warning" -ForegroundColor Yellow }
+    }
+
     # --- 4. Branch-Policy -------------------------------------------------------------------
     # Pull Requests brauchen einen erfolgreichen PR-Lauf der Pipeline. Als Pflicht-Policy sperrt
     # sie direkte Pushes; deshalb erst nach dem Umschalten und nur mit -EnableBranchPolicy.
@@ -520,6 +603,19 @@ try {
                 Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
             } | Out-Null
         }
+    }
+
+    # --- 6. Tags ----------------------------------------------------------------------------
+    # Die Branch-Prüfung erlaubt refs/tags/v* für jedes Repo des Laufs, weil Projekte
+    # seed-pipelines über einen Tag einbinden. Ein Tag v… im Projekt-Repo, von einer Person oder
+    # per Job-Token einer Pipeline angelegt, bekäme sonst die Deployment-Identität, ohne Review.
+    Write-Host '6. Tags im Repo nur für Administratoren'
+    if ($SkipBranchControl) {
+        Write-Host '          entfällt (-SkipBranchControl): zentral sperrt Grant-SeedScaffoldAccess.ps1 Tags im ganzen Projekt.'
+    } elseif ($AllowTagCreation) {
+        Write-Host "  [warn]  -AllowTagCreation: Wer in $($repo.name) Tags anlegen darf, bekommt über einen Tag v… die Deployment-Identität." -ForegroundColor Yellow
+    } else {
+        Set-TagDeny "repoV2/$($project.id)/$($repo.id)" @(Get-TagCreators)
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------

@@ -18,7 +18,9 @@
          Storage Blob Data Contributor nur auf dem Container
       5. Azure DevOps: Service Connection per Workload Identity Federation, mit Branch-Prüfung:
          nur Läufe von -AllowedBranches (Standard main) bekommen die Identität (nicht mit
-         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy)
+         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy); dazu
+         Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
+         Administrators und die Build-Service-Identitäten), außer mit -AllowTagCreation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
          (entfällt mit -SkipScaffold). Mit -CentralScaffold als zentrales Scaffold für andere
@@ -70,8 +72,13 @@
     Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
     Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
     Projekte über einen Tag einbinden. Ein Tag v… in einem Projekt-Repo und ein Lauf darauf kämen
-    deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts sollten nur Administratoren
-    Tags anlegen dürfen (README, Branch-Prüfung).
+    deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts dürfen deshalb nur
+    Administratoren Tags anlegen (Schritt 5, README, Branch-Prüfung).
+
+.PARAMETER AllowTagCreation
+    Tags im Azure-DevOps-Projekt nicht auf Administratoren beschränken, etwa weil andere Repos dort
+    Tags brauchen. Dann sperrt Initialize-SeedProject.ps1 Tags nur im Repo des Seed-Projekts; ohne
+    das kann jede Person mit Schreibrecht über einen Tag v… die Deployment-Identität bekommen.
 
 .PARAMETER Pool
     Agent-Pool für seed-scaffold, etwa Default für eigene Agents; leer: Microsoft-gehostete
@@ -131,6 +138,7 @@ param(
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [switch] $AllowTagCreation,
     [string] $Pool = '',
     [switch] $SkipScaffold,
     [switch] $CentralScaffold,
@@ -292,6 +300,50 @@ function Set-BranchControl([object] $Endpoint, [string] $ProjectId) {
     Invoke-Step $title { $existing } {
         Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
     } | Out-Null
+}
+
+# Tags nur für Administratoren: Die Branch-Prüfung lässt refs/tags/v* für jedes Repo des Laufs
+# durch. Wer sonst Tags anlegen könnte: Contributors, Build Administrators und die Job-Tokens der
+# Pipelines (Build-Service-Identitäten des Projekts und der Organisation).
+$GitNamespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'
+$CreateTagBit = 32   # Recht "Create tag" (CreateTag) im Namespace Git Repositories
+
+function Get-TagCreators([object] $Project) {
+    $vssps = "https://vssps.dev.azure.com/$($Org.Split('/')[-1])"
+    $orgName = $Org.Split('/')[-1]
+    $scope = (Invoke-AzDevOps get "$vssps/_apis/graph/descriptors/$($Project.id)?api-version=7.1-preview.1" $null).value
+    $groups = (Invoke-AzDevOps get "$vssps/_apis/graph/groups?scopeDescriptor=$scope&api-version=7.1-preview.1" $null).value
+    $subjects = @(
+        foreach ($name in @("[$($Project.name)]\Contributors", "[$($Project.name)]\Build Administrators")) {
+            $group = $groups | Where-Object principalName -eq $name | Select-Object -First 1
+            if (-not $group) { throw "Tags: Gruppe $name nicht gefunden." }
+            [pscustomobject] @{ Name = $name; Id = (Invoke-AzDevOps get "$vssps/_apis/graph/storagekeys/$($group.descriptor)?api-version=7.1-preview.1" $null).value }
+        }
+        foreach ($name in @("$($Project.name) Build Service ($orgName)", "Project Collection Build Service ($orgName)")) {
+            $identity = Find-BuildIdentity $name
+            if (-not $identity) { throw "Tags: $name nicht gefunden." }
+            [pscustomobject] @{ Name = $name; Id = $identity.Id }
+        })
+    foreach ($subject in $subjects) {
+        [pscustomobject] @{ Name = $subject.Name; Descriptor = (Invoke-AzDevOps get "$vssps/_apis/identities?identityIds=$($subject.Id)&api-version=7.1" $null).value[0].descriptor }
+    }
+}
+
+# Verbietet "Create tag" auf $SecurityToken (Repo oder ganzes Projekt); vorhandene Einträge bleiben.
+function Set-TagDeny([string] $SecurityToken, [object[]] $Creators) {
+    foreach ($creator in $Creators) {
+        Invoke-Step "Create tag verboten für $($creator.Name)" {
+            (Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$GitNamespace`?token=$([uri]::EscapeDataString($SecurityToken))&descriptors=$([uri]::EscapeDataString($creator.Descriptor))&api-version=7.1" $null).value |
+                ForEach-Object { $_.acesDictionary.PSObject.Properties.Value } | Where-Object { $_.deny -band $CreateTagBit }
+        } {
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$GitNamespace`?api-version=7.1" @{
+                token                = $SecurityToken
+                merge                = $true
+                accessControlEntries = @(@{ descriptor = $creator.Descriptor; allow = 0; deny = $CreateTagBit })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
 }
 
 function Invoke-Arm([string] $Method, [string] $Url, [string] $BodyFile) {
@@ -563,6 +615,14 @@ try {
     } else {
         Write-Host "  [fehlt] Branch-Prüfung an $ServiceConnectionName" -ForegroundColor Yellow
         $missing.Add("Branch-Prüfung an $ServiceConnectionName")
+    }
+    # Gilt für alle Repos des Projekts, auch für Projekte, die seed-scaffold später anlegt.
+    if ($SkipScaffold) {
+        Write-Host '          Tags sperrt Initialize-SeedProject.ps1 im Repo des Projekts.'
+    } elseif ($AllowTagCreation) {
+        Write-Host "  [warn]  -AllowTagCreation: Wer in $($project.name) Tags anlegen darf, bekommt über einen Tag v… die Deployment-Identität." -ForegroundColor Yellow
+    } else {
+        Set-TagDeny "repoV2/$($project.id)" @(Get-TagCreators $project)
     }
 
     # --- 6. GitHub-Service-Connection ------------------------------------------------------

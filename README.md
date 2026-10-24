@@ -288,6 +288,10 @@ Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsof
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
 - **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).
+- **Abschottung:** Ein eigener Agent läuft dauerhaft und für jede Pipeline, die seine Queue nutzen darf. Was ein Lauf dort hinterlässt (Dateien im Profil, Werkzeuge im Tool-Verzeichnis), trifft spätere Läufe, auch die mit der Service Connection. Deshalb:
+  - ein eigener Pool statt `Default`, ohne „Auto-provision this agent pool in all projects“, nur in den Projekten, die ihn brauchen; `Default` kommt in jedes neue Projekt;
+  - die Queue nur für einzelne Pipelines freigeben und an ihr unter „Approvals and checks“ eine Branch-Prüfung (nur `main`) oder eine Freigabe setzen; `Initialize-SeedProject.ps1 -Pool` warnt, wenn das fehlt;
+  - der Agent-Benutzer ohne Administratorrechte und ohne Zugriff auf andere Konten oder Anmeldedaten der Maschine, etwa auf einer eigenen VM oder in einer eigenen WSL-Distribution mit `[interop] enabled=false` und `[automount] enabled=false` in `/etc/wsl.conf`, sonst erreicht jeder Lauf das Windows-Profil und startet Windows-Programme.
 
 ### Projektstruktur, die das Template erwartet
 
@@ -333,7 +337,7 @@ cd seed-pipelines
 
 **Branch-Prüfung:** An der Azure-Service-Connection hängt der Check „Branch control“: Nur Läufe von `-AllowedBranches` (Standard `main`, Muster wie `release/*` erlaubt) bekommen die Deployment-Identität, PR-Läufe und Feature-Branches nicht. Freigaben allein reichen dafür nicht, denn sie hängen an den Environments: Eine geänderte Pipeline-Datei auf einem Feature-Branch, die die Service Connection direkt nutzt, käme ohne die Prüfung an der Freigabe vorbei und hätte die Rechte der Identität auf der ganzen Subscription. Ein erneuter Lauf mit anderen Branches aktualisiert die Prüfung.
 
-Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed-pipelines`, das Projekte über einen Tag einbinden. Deshalb erlaubt sie zusätzlich `-TemplateRefs` (Standard `refs/tags/v*`); ohne sie scheitert jeder Lauf auf `main`. Die Kehrseite: Ein Tag `v…` im Projekt-Repo und ein Lauf darauf kämen ebenfalls durch. In den Projekt-Repos sollten deshalb nur Administratoren Tags anlegen dürfen: unter Project Settings → Repositories → Security „Create tag“ auf Deny für Contributors, Build Administrators, `<Projekt> Build Service` und `Project Collection Build Service`. Seed-Pipelines legen selbst keine Tags an. Wer Seed-Änderungen in einem Testprojekt vor dem Release prüft, nimmt die Branches von seed-pipelines in `-TemplateRefs` auf, etwa `refs/heads/feat/*`.
+Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed-pipelines`, das Projekte über einen Tag einbinden. Deshalb erlaubt sie zusätzlich `-TemplateRefs` (Standard `refs/tags/v*`); ohne sie scheitert jeder Lauf auf `main`. Die Kehrseite: Ein Tag `v…` im Projekt-Repo und ein Lauf darauf kämen ebenfalls durch, ohne Review und ohne Freigabe. Deshalb dürfen dort nur Administratoren Tags anlegen: Das Onboarding setzt „Create tag“ auf Deny für Contributors, Build Administrators, `<Projekt> Build Service` und `Project Collection Build Service`, also auch für die Job-Tokens der Pipelines. `Initialize-SeedTenant.ps1` tut das für das ganze Azure-DevOps-Projekt (nicht mit `-SkipScaffold`), `Initialize-SeedProject.ps1` für das Repo des Projekts, `Grant-SeedScaffoldAccess.ps1` für ein Zielprojekt des zentralen Scaffolds. Brauchen andere Repos im selben Projekt Tags, lässt `-AllowTagCreation` das projektweite Verbot weg; das Skript warnt dann. Ein Deny gilt auch für Administratoren, die zugleich Contributors sind; Seed-Pipelines legen selbst keine Tags an. Wer Seed-Änderungen in einem Testprojekt vor dem Release prüft, nimmt die Branches von seed-pipelines in `-TemplateRefs` auf, etwa `refs/heads/feat/*`.
 
 Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1 -EnableBranchPolicy`. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` mit `-EnableBranchPolicy` bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
@@ -432,7 +436,9 @@ Ein Projekt mit eigenem Repo und eigenen Pipelines zieht ohne neues Repo auf See
 - Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`
 - die Pipeline-Definition für die YAML-Datei (Default `azure-pipelines.yml`), ohne sie zu starten
 - die Berechtigungen der Pipeline für die Environments, die Azure- und die GitHub-Service-Connection; das „Permit“ beim ersten Lauf entfällt
-- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch)
+- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung, einen Pflicht-Reviewer (`-MinReviewers`, Standard 1, die eigene Stimme zählt nicht) und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch)
+- Tags im Repo nur für Administratoren (siehe [Branch-Prüfung](#tenant-onboarding)); `-AllowTagCreation` lässt das mit Warnung weg
+- mit `-Pool` Warnungen, wenn die Agent-Queue ohne Freigabe oder Branch-Prüfung ist, allen Pipelines offensteht oder der Pool in jedes neue Projekt kommt (siehe [Eigene Agents](#eigene-agents))
 
 Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das Onboarding prüft es jeden Schritt zuerst, und `-DryRun` zeigt nur an, was fehlt. Die Reihenfolge:
 
