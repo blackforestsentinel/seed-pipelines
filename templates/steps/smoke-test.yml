@@ -35,6 +35,9 @@ steps:
 
   - bash: |
       set -euo pipefail
+      # Antworten der API nur bereinigt ins Log: Der Agent führt ##vso[...] in jeder Zeile aus, auch
+      # mitten im Text, und ein Zeilenumbruch in der Antwort begänne eine neue Zeile.
+      clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
       api="$(tf_function_app_url)"
       expected="$(Build.BuildNumber)"
       # Health-Endpunkt mit Build-Nummer: Erst wenn die API die Nummer dieses Laufs meldet, läuft
@@ -51,10 +54,11 @@ steps:
         sleep 10
       done
       if [ "${version%%+*}" != "$expected" ]; then
-        echo "##vso[task.logissue type=error]Die API meldet Version '${version:-keine}' statt $expected. Letzte Antwort: ${body:-keine}"
+        echo "##vso[task.logissue type=error]Die API meldet Version '$(clean "${version:-keine}")' statt $expected. Letzte Antwort: $(clean "${body:-keine}")"
         exit 1
       fi
-      echo "$body"
+      clean "$body"
+      echo
 
       if [ "${{ lower(parameters.frontend) }}" = true ]; then
         # CORS-Preflight wie aus dem Browser: Der Ursprung des Frontends ist erlaubt, ein fremder nicht.
@@ -70,12 +74,12 @@ steps:
         frontend="$(tf_static_web_app_url)"
         allowed="$(allowed_origin "$frontend")"
         if [ "$allowed" != "$frontend" ]; then
-          echo "##vso[task.logissue type=error]CORS: Die API erlaubt '${allowed:-keinen Ursprung}' statt $frontend."
+          echo "##vso[task.logissue type=error]CORS: Die API erlaubt '$(clean "${allowed:-keinen Ursprung}")' statt $frontend."
           exit 1
         fi
         foreign="$(allowed_origin https://example.org)"
         if [ -n "$foreign" ]; then
-          echo "##vso[task.logissue type=error]CORS: Die API erlaubt auch fremde Ursprünge ($foreign)."
+          echo "##vso[task.logissue type=error]CORS: Die API erlaubt auch fremde Ursprünge ($(clean "$foreign"))."
           exit 1
         fi
         echo "CORS: $frontend erlaubt, fremde Ursprünge nicht."
@@ -87,11 +91,13 @@ steps:
   - ${{ if parameters.smokeTest.protectedPath }}:
       - bash: |
           set -euo pipefail
+          # Den Pfad gibt das Projekt vor: nur bereinigt ins Log (Logging-Befehle, siehe Smoke-Test API).
+          clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
           url="$(tf_function_app_url)/${PROTECTED_PATH#/}"
           status="$(curl --silent --output /dev/null --max-time 10 --write-out '%{http_code}' "$url" || true)"
-          echo "$url ohne Token: $status"
+          echo "$(clean "$url") ohne Token: $status"
           if [ "$status" != 401 ]; then
-            echo "##vso[task.logissue type=error]$url antwortet ohne Token mit $status statt 401. Ist UseSeedAuth() in Program.cs aktiv?"
+            echo "##vso[task.logissue type=error]$(clean "$url") antwortet ohne Token mit $status statt 401. Ist UseSeedAuth() in Program.cs aktiv?"
             exit 1
           fi
         displayName: Smoke-Test Token-Pflicht
@@ -102,6 +108,8 @@ steps:
   - ${{ if parameters.frontend }}:
       - bash: |
           set -euo pipefail
+          # Header der Antwort nur bereinigt ins Log (Logging-Befehle, siehe Smoke-Test API).
+          clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
           url="$(tf_static_web_app_url)"
           echo "Frontend: $url"
           curl --fail --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors \
@@ -114,7 +122,8 @@ steps:
           for attempt in 1 2 3 4 5 6; do
             csp="$(curl --fail --silent --show-error -D - -o /dev/null "$url/" | tr -d '\r' | grep -i '^content-security-policy:' || true)"
             if [ -n "$csp" ] && ! grep -q '__API_ORIGIN__' <<< "$csp"; then
-              echo "$csp"
+              clean "$csp"
+              echo
               exit 0
             fi
             sleep 10
@@ -122,7 +131,7 @@ steps:
           if [ -z "$csp" ]; then
             echo "##vso[task.logissue type=error]Das Frontend liefert keinen Content-Security-Policy-Header. globalHeaders in frontend/public/staticwebapp.config.json aus seed-template übernehmen."
           else
-            echo "##vso[task.logissue type=error]Die Content-Security-Policy enthält noch den Platzhalter __API_ORIGIN__: $csp"
+            echo "##vso[task.logissue type=error]Die Content-Security-Policy enthält noch den Platzhalter __API_ORIGIN__: $(clean "$csp")"
           fi
           exit 1
         displayName: Smoke-Test Frontend

@@ -12,7 +12,11 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      # Actions per Commit-SHA statt Tag, den ein Angreifer verschieben könnte; Dependabot hebt sie
+      # an (.github/dependabot.yml). Das Token bleibt nicht im Checkout liegen.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Python 3.12 und openssl aus dem Image, wie auf den Agents der Pipelines; alle Tests unter
       # scripts/ (extension, intune), nur Standardbibliothek
       - name: Tests der Skripte

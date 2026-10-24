@@ -72,8 +72,9 @@ steps:
       store = environment in [name.strip() for name in store_environments.split(",")]
       signed = sign == "true"
 
+      # Meldungen enthalten Werte aus dem Manifest: ohne Steuerzeichen und ##vso[ (Logging-Befehle).
       def fail(message):
-          print("##vso[task.logissue type=error]" + message)
+          print("##vso[task.logissue type=error]" + re.sub(r"[\x00-\x1f\x7f]", " ", message).replace("##vso[", "##vso_["))
           sys.exit(1)
 
       copy = os.path.join(work_dir, package)

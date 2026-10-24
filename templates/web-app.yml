@@ -183,9 +183,12 @@ stages:
 
           - bash: |
               set -euo pipefail
+              # Text aus dem Repo nur bereinigt ins Log: Der Agent führt ##vso[...] in jeder Zeile aus,
+              # und ein Zeilenumbruch im Wert begänne eine neue.
+              clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
               actual="$(grep -E '^project:' project.yaml | awk '{print $2}' | tr -d "\"'")"
               if [ "$actual" != "${{ parameters.project }}" ]; then
-                echo "##vso[task.logissue type=error]project.yaml nennt '$actual', die Pipeline '${{ parameters.project }}'."
+                echo "##vso[task.logissue type=error]project.yaml nennt '$(clean "$actual")', die Pipeline '${{ parameters.project }}'."
                 exit 1
               fi
               # hosting.staticWebApp: none gehört zu frontend: false und umgekehrt.
@@ -202,10 +205,16 @@ stages:
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
+          # Mit .terraform.lock.hcl wie im Plan (steps/terraform.yml) nur, was die Datei festhält; eine
+          # veraltete Datei fällt so schon im PR-Lauf auf.
           - bash: |
               set -euo pipefail
               terraform fmt -check -recursive
-              terraform init -backend=false -input=false
+              lockfile=""
+              if [ -f .terraform.lock.hcl ]; then
+                lockfile="-lockfile=readonly"
+              fi
+              terraform init -backend=false -input=false $lockfile
               terraform validate
             displayName: terraform fmt und validate
             workingDirectory: ${{ parameters.infraPath }}
@@ -318,8 +327,11 @@ stages:
                   python3 -c '
                   import json, os, re, sys
                   path = sys.argv[1]
+                  # Werte aus dem Manifest ohne Steuerzeichen und ##vso[ ins Log (Logging-Befehle).
+                  def clean(text):
+                      return re.sub(r"[\x00-\x1f\x7f]", " ", text).replace("##vso[", "##vso_[")
                   def fail(message):
-                      print("##vso[task.logissue type=error]" + message)
+                      print("##vso[task.logissue type=error]" + clean(message))
                       sys.exit(1)
                   try:
                       manifest = json.load(open(path, encoding="utf-8"))
@@ -334,7 +346,7 @@ stages:
                   if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9][0-9]{0,4})(\.(0|[1-9][0-9]{0,4})){0,3}", version) or max(map(int, version.split("."))) > 65535:
                       fail(f"{path}: version ist „{version}“, erwartet bis zu vier Zahlen von 0 bis 65535 ohne führende Nullen, z. B. 1.2.0.")
                   name = manifest.get("name")
-                  print(f"{path}: {name} {version}, Manifest V3")
+                  print(clean(f"{path}: {name} {version}, Manifest V3"))
 
                   # extension.signing (nur dann gesetzt): Fehler hier statt erst im Deploy der Umgebung.
                   # Keine einfachen Anführungszeichen im Python: Es steht in einem davon in bash.
@@ -648,6 +660,8 @@ stages:
                             scriptLocation: inlineScript
                             inlineScript: |
                               set -euo pipefail
+                              # Kudu-Antworten nur bereinigt ins Log, wie im Build (Logging-Befehle).
+                              clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
                               rg="$(tf_resource_group_name)"
                               app="$(tf_function_app_name)"
                               scm="$(az rest --method get \
@@ -661,15 +675,20 @@ stages:
                                 -H @<(printf 'Authorization: Bearer %s\n' "$token") -H 'Content-Type: application/zip' \
                                 --data-binary @"$(Pipeline.Workspace)/api/api.zip" \
                                 "https://$scm/api/publish?RemoteBuild=false&Deployer=seed-pipelines")"; then
-                                id="$(tr -d '"' <<< "$response")"
+                                # Nur die Kennung des Deployments, ohne Anführungszeichen und alles andere
+                                id="$(tr -cd 'A-Za-z0-9-' <<< "$response")"
                                 id="${id:-latest}"
                                 echo "Function-Deploy $id gestartet."
                               else
-                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $response"
+                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $(clean "$response")"
                               fi
                               echo "##vso[task.setvariable variable=kudu_deployment]$id"
 
                               if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                                # Deployment-Token bei jedem Deploy neu: azurerm_static_web_app liest ihn mit in
+                                # den Terraform-State und in jeden Plan. Nach dem Zurücksetzen gelten diese
+                                # Kopien nicht mehr; der neue Token steht nur in der geheimen Variable.
+                                az staticwebapp secrets reset-api-key --name "$(tf_static_web_app_name)" --resource-group "$rg" -o none
                                 token="$(az staticwebapp secrets list --name "$(tf_static_web_app_name)" --resource-group "$rg" --query properties.apiKey -o tsv)"
                                 echo "##vso[task.setvariable variable=swa_token;issecret=true]$token"
                                 # Eigene Domains, die Azure noch nicht validiert hat: nötige DNS-Einträge als
@@ -702,15 +721,17 @@ stages:
                         - bash: |
                             set -euo pipefail
                             auth() { printf 'Authorization: Bearer %s\n' "$KUDU_TOKEN"; }
+                            # Kudu-Antworten nur bereinigt ins Log, wie im Build (Logging-Befehle).
+                            clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
                             publish() {
                               local response
                               if response="$(curl --silent --show-error --fail-with-body -X POST -H @<(auth) \
                                 -H 'Content-Type: application/zip' --data-binary @"$(Pipeline.Workspace)/api/api.zip" \
                                 "https://$(kudu_host)/api/publish?RemoteBuild=false&Deployer=seed-pipelines")"; then
-                                response="$(tr -d '"' <<< "$response")"
+                                response="$(tr -cd 'A-Za-z0-9-' <<< "$response")"
                                 echo "${response:-latest}"
                               else
-                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $response" >&2
+                                echo "##vso[task.logissue type=warning]Function-Deploy nicht gestartet: $(clean "$response")" >&2
                                 echo none
                               fi
                             }
@@ -730,7 +751,7 @@ stages:
                                     echo "Function-Deploy $id erfolgreich (Versuch $attempt, $SECONDS s)."
                                     exit 0 ;;
                                   3|5|6|-1)
-                                    echo "##vso[task.logissue type=warning]Function-Deploy $id, Versuch $attempt: Status $code ($text)."
+                                    echo "##vso[task.logissue type=warning]Function-Deploy $id, Versuch $attempt: Status $code ($(clean "$text"))."
                                     break ;;
                                 esac
                                 sleep 3

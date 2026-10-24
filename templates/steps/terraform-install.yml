@@ -1,19 +1,49 @@
-# Installiert eine feste Terraform-Version auf Linux-Agents.
+# Installiert eine feste Terraform-Version auf Linux-Agents (x64), wie gitleaks in secret-scan.yml
+# per SHA-256 geprüft: die Standardversion gegen die Prüfsumme hier, jede andere Version gegen
+# terraform_<version>_SHA256SUMS von releases.hashicorp.com.
+#
+# Ein terraform, das schon im PATH oder im Tool-Verzeichnis liegt, zählt nicht: Auf eigenen Agents
+# bleibt beides zwischen den Läufen liegen, und ein früherer Lauf (etwa ein PR-Lauf mit eigenen
+# Schritten) könnte dort ein anderes Programm abgelegt haben. Der Schritt lädt und prüft deshalb
+# jedes Mal und legt das Verzeichnis, das er in den PATH stellt, neu an, nur mit terraform darin.
 parameters:
   - name: version
     type: string
+  # Standardversion von web-app.yml und scaffold.yml (terraformVersion) und die SHA-256 von
+  # terraform_<version>_linux_amd64.zip laut terraform_<version>_SHA256SUMS. Beim Anheben der
+  # Standardversion beide ändern.
+  - name: pinnedVersion
+    type: string
+    default: '1.15.3'
+  - name: pinnedSha256
+    type: string
+    default: c3d4b579064745a5f7e918125db23b12ba52a8a7287adb9f32c49d637e02e3bf
 
 steps:
   - bash: |
       set -euo pipefail
-      if command -v terraform >/dev/null && terraform version -json | grep -q '"terraform_version": *"${{ parameters.version }}"'; then
-        echo "Terraform ${{ parameters.version }} ist bereits installiert."
-        exit 0
+      version="${{ parameters.version }}"
+      zip="terraform_${version}_linux_amd64.zip"
+      base="https://releases.hashicorp.com/terraform/$version"
+      download="$(Agent.TempDirectory)/terraform-download"
+      rm -rf "$download"
+      mkdir -p "$download"
+      curl -fsSL -o "$download/$zip" "$base/$zip"
+      if [ "$version" = "${{ parameters.pinnedVersion }}" ]; then
+        expected="${{ parameters.pinnedSha256 }}"
+      else
+        curl -fsSL -o "$download/SHA256SUMS" "$base/terraform_${version}_SHA256SUMS"
+        expected="$(awk -v file="$zip" '$2 == file { print $1 }' "$download/SHA256SUMS")"
       fi
-      dir="$(Agent.ToolsDirectory)/terraform/${{ parameters.version }}"
+      if [ -z "$expected" ] || ! echo "$expected  $download/$zip" | sha256sum --check --quiet; then
+        echo "##vso[task.logissue type=error]Prüfsumme von $zip stimmt nicht oder fehlt; Terraform wird nicht installiert."
+        exit 1
+      fi
+      dir="$(Agent.ToolsDirectory)/terraform/$version"
+      rm -rf "$dir"
       mkdir -p "$dir"
-      curl -fsSL -o /tmp/terraform.zip \
-        "https://releases.hashicorp.com/terraform/${{ parameters.version }}/terraform_${{ parameters.version }}_linux_amd64.zip"
-      unzip -o -q /tmp/terraform.zip -d "$dir"
+      unzip -q "$download/$zip" terraform -d "$dir"
+      rm -rf "$download"
       echo "##vso[task.prependpath]$dir"
+      echo "Terraform $version geprüft (SHA-256 $expected) und installiert."
     displayName: Terraform ${{ parameters.version }} installieren

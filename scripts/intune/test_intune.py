@@ -624,5 +624,27 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(options.adopt, ["A", "B"])
 
 
+class LogTests(unittest.TestCase):
+    def test_messages_cannot_issue_logging_commands(self):
+        # updates.xml eines Projekts landet in Meldungen; der Agent erkennt ##vso[ in jeder Zeile.
+        evil = "app/@appid: x\n##vso[task.setvariable variable=x]1\r###vso[task.prependpath]/tmp"
+        out = io.StringIO()
+        os.environ["TF_BUILD"] = "True"
+        try:
+            with contextlib.redirect_stdout(out):
+                intune.warn(evil)
+                with self.assertRaises(intune.IntuneError) as error:
+                    intune.fail(evil, "zweite Meldung")
+        finally:
+            os.environ.pop("TF_BUILD", None)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        for line in lines:
+            self.assertTrue(line.startswith("##vso[task.logissue type="))
+            self.assertEqual(line.count("##vso["), 1)
+        self.assertEqual(len(str(error.exception).splitlines()), 2)
+        self.assertNotIn("##vso[", str(error.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

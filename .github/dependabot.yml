@@ -1,0 +1,7 @@
+# Hebt die per Commit-SHA gepinnten Actions in .github/workflows an, einmal pro Woche als Pull Request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

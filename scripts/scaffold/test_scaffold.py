@@ -312,6 +312,12 @@ class CleanTest(unittest.TestCase):
     def test_keine_zeilenumbrueche_in_meldungen(self):
         self.assertNotIn("\n", scaffold.clean("a\n##vso[task.setvariable variable=x]1"))
 
+    def test_keine_logging_befehle_in_meldungen(self):
+        # Der Agent erkennt ##vso[ auch mitten in einer Zeile, etwa in "Fehler: …" auf stderr.
+        for value in ("a ##vso[task.setvariable variable=x]1", "###vso[task.prependpath]/tmp", "a\r##vso[x]"):
+            with self.subTest(value=value):
+                self.assertNotIn("##vso[", scaffold.clean(value))
+
 
 if __name__ == "__main__":
     unittest.main()

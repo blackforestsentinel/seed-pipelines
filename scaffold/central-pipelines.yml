@@ -89,7 +89,8 @@ extends:
     allowedProjects: '__ALLOWED_PROJECTS__'
     memberGroup: '__MEMBER_GROUP__'
     approverGroups: __APPROVER_GROUPS__
-    requesterCanApprove: __REQUESTER_CAN_APPROVE__
+    # Niemand gibt die Infrastruktur seines eigenen Laufs frei, auch ohne approverGroups.
+    requesterCanApprove: false
     minReviewers: __MIN_REVIEWERS__
     pipelinesVersion: __SEED_PIPELINES_VERSION__
     serviceConnection: __SERVICE_CONNECTION__

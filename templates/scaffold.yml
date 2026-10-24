@@ -257,13 +257,6 @@ stages:
                   SEED_REPOSITORY: ${{ parameters.repository }}
               - checkout: seed
                 path: seed
-              # Erst diese Referenz gibt dem Job-Token Zugriff auf das Repo im Zielprojekt
-              # (Protect access to repositories). Inline, weil resources.repositories keine
-              # Template-Ausdrücke erlaubt; das Repo braucht mindestens einen Commit.
-              - checkout: git://${{ coalesce(parameters.adoProject, variables['System.TeamProject']) }}/${{ parameters.repository }}
-                path: target
-                fetchDepth: 0
-                persistCredentials: true
 
               - bash: |
                   set -euo pipefail
@@ -283,6 +276,17 @@ stages:
                   SEED_MEMBER_GROUP: ${{ parameters.memberGroup }}
                   SEED_SERVICE_CONNECTION: ${{ parameters.serviceConnection }}
                   SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
+
+              # Diese Referenz gibt dem Job-Token Zugriff auf das Repo im Zielprojekt (Protect access to
+              # repositories); das gilt für den ganzen Job ab dessen Start, die Prüfung davor liest das
+              # Repo also schon über die API. Ausgecheckt wird erst nach der Prüfung, damit Inhalt und
+              # Token (persistCredentials) nur für ein geprüftes Zielprojekt und Repo auf dem Agent
+              # liegen. Inline, weil resources.repositories keine Template-Ausdrücke erlaubt; das Repo
+              # braucht mindestens einen Commit.
+              - checkout: git://${{ coalesce(parameters.adoProject, variables['System.TeamProject']) }}/${{ parameters.repository }}
+                path: target
+                fetchDepth: 0
+                persistCredentials: true
 
               - task: AzureCLI@2
                 displayName: Namen prüfen und eintragen

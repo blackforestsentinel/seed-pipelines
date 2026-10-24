@@ -31,8 +31,10 @@ steps:
       inlineScript: |
         $ErrorActionPreference = 'Stop'
         $PSNativeCommandUseErrorActionPreference = $true
+        # Meldungen enthalten Antworten der Power Platform: ohne Steuerzeichen und ##vso[, sonst könnten
+        # sie Logging-Befehle ausgeben.
         function Fail([string] $message) {
-          Write-Host "##vso[task.logissue type=error]$message"
+          Write-Host "##vso[task.logissue type=error]$($message -replace '[\x00-\x1f\x7f]', ' ' -replace '##vso\[', '##vso_[')"
           exit 1
         }
 

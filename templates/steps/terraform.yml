@@ -57,7 +57,13 @@ steps:
         export TF_IN_AUTOMATION=true
         export TF_INPUT=false
 
-        terraform init \
+        # Mit .terraform.lock.hcl (seed-template) nur die Provider-Versionen und Prüfsummen daraus:
+        # init bricht ab, statt die Datei still zu ergänzen, etwa um einen neuen Provider.
+        lockfile=""
+        if [ -f .terraform.lock.hcl ]; then
+          lockfile="-lockfile=readonly"
+        fi
+        terraform init $lockfile \
           -backend-config="resource_group_name=$SEED_TF_STATE_RESOURCE_GROUP" \
           -backend-config="storage_account_name=$SEED_TF_STATE_STORAGE_ACCOUNT" \
           -backend-config="container_name=$SEED_TF_STATE_CONTAINER" \

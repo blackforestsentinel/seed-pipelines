@@ -84,13 +84,20 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def clean(message: str) -> str:
+    """Ohne Steuerzeichen und ##vso[: Meldungen enthalten Antworten fremder APIs (updates.xml der
+    Projekte), und der Agent führt Logging-Befehle in jeder Zeile aus, auch mitten im Text."""
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(message)).replace("##vso[", "##vso_[")
+
+
 def warn(message: str) -> None:
     prefix = "##vso[task.logissue type=warning]" if os.environ.get("TF_BUILD") else "Warnung: "
-    print(prefix + message, flush=True)
+    print(prefix + clean(message), flush=True)
 
 
 def fail(*messages: str) -> None:
     """Meldet jeden Fehler einzeln (in Azure Pipelines als Annotation) und bricht ab."""
+    messages = tuple(clean(message) for message in messages)
     if os.environ.get("TF_BUILD"):
         for message in messages:
             print(f"##vso[task.logissue type=error]{message}", flush=True)

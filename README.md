@@ -63,7 +63,9 @@ Umgebungen laufen in der Reihenfolge der Liste nacheinander.
 
 Eine Plan-Datei enthält den State samt aller sensiblen Werte im Klartext, etwa den Deployment-Token der Static Web App. Als Artefakt am Lauf könnte sie jeder laden, der die Pipeline lesen darf, und mit dem Token eigene Inhalte auf die Web-App deployen. Der Plan liegt deshalb im Container des Terraform-States unter `plans/<project>/<env>/<Build.BuildId>.tfplan`; dort kommt nur hin, wer auch den State lesen darf. `apply_<env>` lädt ihn von dort und löscht ihn nach dem Apply. Pläne, die nie angewendet werden (Freigabe abgelehnt oder abgelaufen), löscht der nächste Plan derselben Umgebung nach 31 Tagen. Die Deployment-Identität braucht dafür keine weiteren Rechte: `Storage Blob Data Contributor` auf dem Container hat sie aus dem Onboarding.
 
-Bis v0.10.0 lag der Plan als Artefakt `tfplan_<env>` am Lauf. Wer von dort umsteigt, setzt nach dem ersten Lauf mit der neuen Version die Deployment-Tokens der Static Web Apps zurück (`az staticwebapp secrets reset-api-key --name <swa> --resource-group <rg>`); der Deploy liest den Token jedes Mal neu. Die alten Artefakte enthalten dann nur noch ungültige Tokens. Die übrigen Schlüssel im State (Storage, Application Insights) sind ohne Wirkung, weil die Seed-Module Shared Key und lokale Anmeldung abschalten.
+Den Deployment-Token selbst setzt `deploy_<env>` bei jedem Deploy zurück (`az staticwebapp secrets reset-api-key`), unmittelbar bevor er ihn für den Deploy der Static Web App liest. `azurerm_static_web_app` liest den Token beim Plan mit; seine Kopien im State und in Plan-Dateien gelten deshalb nach dem nächsten Deploy der Umgebung nicht mehr. Der neue Token steht nur in einer geheimen Variable des Jobs. Ein anderer Weg, der mit dem Token deployt (etwa eine zweite Pipeline), funktioniert damit nicht mehr.
+
+Bis v0.10.0 lag der Plan als Artefakt `tfplan_<env>` am Lauf. Die Tokens in diesen alten Artefakten werden mit dem ersten Deploy ab v0.15.0 ungültig; wer eine ältere Version nutzt, setzt sie nach dem Umstieg von Hand zurück (`az staticwebapp secrets reset-api-key --name <swa> --resource-group <rg>`). Die übrigen Schlüssel im State (Storage, Application Insights) sind ohne Wirkung, weil die Seed-Module Shared Key und lokale Anmeldung abschalten.
 
 ### Laufzeit
 
@@ -71,7 +73,13 @@ Ein Lauf ohne Infrastruktur-Änderung dauert rund 4 Minuten (vorher 7). Die Orga
 
 Die Function geht über Kudu (`/api/publish`) mit einem Entra-Token der Service Connection raus, nicht über `az functionapp deployment source config-zip`: Das wartet nach dem Deploy fest 60 Sekunden und prüft dann den Host. Kudu verarbeitet das Paket rund eine Minute lang; währenddessen läuft der Deploy der Static Web App, danach wartet die Pipeline auf den Status des Deployments. Ob die neue Fassung läuft, prüft der Smoke-Test über die Build-Nummer. Eine frisch angelegte Function antwortet einige Minuten mit 503, bis die Storage-Rollen ihrer Identität wirken; der Deploy versucht es dann bis zu 10 Minuten lang erneut. Scheitert der Function-Deploy endgültig, ist die Static Web App schon neu; ein erneuter Lauf von `deploy_<env>` gleicht das aus.
 
-Caching (NuGet, npm, Terraform-Provider) fehlt bewusst: Auf den gehosteten Agents ist der NuGet-Cache rund 1 GB groß und der Provider-Cache 670 MB, beides wiederherzustellen dauert länger als `dotnet restore` (7 bis 15 s) und `terraform init` (7 s) ohne Cache. `npm ci` war auch mit Cache-Treffer nicht schneller, und jeder neue Cache-Schlüssel kostet beim Sichern rund eine Minute. Projekte brauchen deshalb auch keine NuGet-Lockfiles.
+Caching (NuGet, npm, Terraform-Provider) fehlt bewusst: Auf den gehosteten Agents ist der NuGet-Cache rund 1 GB groß und der Provider-Cache 670 MB, beides wiederherzustellen dauert länger als `dotnet restore` (7 bis 15 s) und `terraform init` (7 s) ohne Cache. `npm ci` war auch mit Cache-Treffer nicht schneller, und jeder neue Cache-Schlüssel kostet beim Sichern rund eine Minute. Für den Cache brauchen Projekte deshalb keine NuGet-Lockfiles; mit privatem Feed empfehlen sie sich trotzdem (siehe Privater Paket-Feed).
+
+### Terraform und Provider
+
+`templates/steps/terraform-install.yml` lädt Terraform in der Version `terraformVersion` in jedem Job von releases.hashicorp.com und prüft das Zip per SHA-256, wie gitleaks im Secret-Scan: die Standardversion gegen die Prüfsumme im Template (`pinnedVersion`, `pinnedSha256`), jede andere Version gegen `terraform_<version>_SHA256SUMS` von derselben Seite. Ein `terraform`, das schon im `PATH` oder im Tool-Verzeichnis liegt, nutzt die Pipeline nicht, und das Verzeichnis, das sie in den `PATH` stellt, legt sie jedes Mal neu an: Auf eigenen Agents könnte ein früherer Lauf dort ein anderes Programm abgelegt haben. Wer die Standardversion in `web-app.yml` und `scaffold.yml` anhebt, ändert `pinnedVersion` und `pinnedSha256` mit (Prüfsumme für `linux_amd64` aus `SHA256SUMS`, dessen Signatur HashiCorp mit `SHA256SUMS.sig` veröffentlicht).
+
+Liegt `.terraform.lock.hcl` im Ordner `infra` (seed-template legt sie an), läuft `terraform init` mit `-lockfile=readonly`, im Build wie in Plan und Apply. Provider kommen dann nur in den Versionen und mit den Prüfsummen aus der Datei; fehlt ein Provider darin oder passt die Version nicht mehr zu den Anforderungen, bricht init ab, schon im PR-Lauf, statt die Datei still zu ergänzen. Die Datei ändert das Projekt per Pull Request, etwa nach einem Update von seed-terraform mit `terraform init -upgrade` und `terraform providers lock -platform=linux_amd64 -platform=windows_amd64` (Prüfsummen für die Agents und für Windows-Rechner im Team). Ohne die Datei läuft init wie bisher.
 
 ### PR-Validierung
 
@@ -109,6 +117,31 @@ extends:
 - **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`, denn ohne Restore gibt es keinen Build.
 - **Rechte:** `NuGetAuthenticate@1` und `npmAuthenticate@0` melden sich ohne Secret mit dem Job-Token an, also als `<Projekt> Build Service (<org>)` oder, wenn das Projekt den Job-Scope nicht auf sich beschränkt, als `Project Collection Build Service (<org>)`. Diese Identität braucht am Feed mindestens die Rolle Feed Reader (Feed settings, Permissions). Liegt der Feed in einem anderen Projekt, braucht sie zusätzlich Lesezugriff auf dieses Projekt (Gruppe Readers). Für Feeds einer anderen Organisation oder außerhalb von Azure DevOps nennt der Schritt eine NuGet-Service-Connection des Projekts (`nuGetServiceConnections`). Eine Azure-Service-Connection bekommen die Schritte nicht.
 - Für die Anmeldung taugt `extraBuildSteps` nicht: Diese Schritte laufen erst nach Build und Tests.
+
+**Dependency Confusion:** Kennt der Restore neben dem privaten Feed auch nuget.org oder npmjs.com, kann ein öffentliches Paket mit dem Namen eines internen (und höherer Version) das interne ersetzen; sein Code liefe dann im Build und in der App. Deshalb legt jedes Paket fest, woher es kommt:
+
+- **NuGet, eine Quelle:** In `nuget.config` mit `<clear />` nur den privaten Feed nennen und dort nuget.org als Upstream-Quelle eintragen (Azure Artifacts, Feed settings, Upstream sources). Der Feed löst dann jeden Namen selbst auf, und ein intern veröffentlichtes Paket verdeckt ein öffentliches gleichen Namens.
+
+  ```xml
+  <configuration>
+    <packageSources>
+      <clear />
+      <add key="intern" value="https://pkgs.dev.azure.com/<org>/_packaging/<feed>/nuget/v3/index.json" />
+    </packageSources>
+  </configuration>
+  ```
+
+- **NuGet, mehrere Quellen:** `packageSourceMapping` ordnet Namensmuster genau einer Quelle zu; das spezifischere Muster gewinnt, interne Präfixe kommen also nie von nuget.org.
+
+  ```xml
+  <packageSourceMapping>
+    <packageSource key="nuget.org"><package pattern="*" /></packageSource>
+    <packageSource key="intern"><package pattern="Example.*" /></packageSource>
+  </packageSourceMapping>
+  ```
+
+- **npm:** Interne Pakete haben einen eigenen Scope, und `.npmrc` leitet nur diesen Scope an den privaten Feed (`@example:registry=https://pkgs.dev.azure.com/<org>/_packaging/<feed>/npm/registry/`), alles andere an `registry=https://registry.npmjs.org/`. Pakete ohne Scope gehören nicht in den privaten Feed. `package-lock.json` mit `integrity` hat jedes Projekt ohnehin (`npm ci`).
+- **Lockfiles für NuGet:** Projekte mit privatem Feed setzen `RestorePackagesWithLockFile` (etwa in `Directory.Build.props`) und checken `packages.lock.json` ein; mit `<RestoreLockedMode Condition="'$(TF_BUILD)' == 'true'">true</RestoreLockedMode>` restauriert die Pipeline nur, was darin steht (wie `dotnet restore --locked-mode`), samt Prüfsummen, und bricht bei Abweichungen ab.
 
 ### Eigene Schritte im Build
 
@@ -268,6 +301,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 ```
 
 - **Ausgabe:** die Werte für `extension.signing` und für `project.yaml` je signierter Umgebung, `auth.extraRedirectUris` (`https://<id>.chromiumapp.org/`) und `hosting.corsAllowedOrigins` (`chrome-extension://<id>`).
+- **Die Datei** darf vom Anlegen an nur der eigene Benutzer lesen: unter Windows mit eigener Zugriffsliste ohne geerbte Einträge, sonst mit Modus 600.
 - **Den Schlüssel sicher offline ablegen** (Passwortmanager, Tresor) und die Datei danach löschen. Azure DevOps gibt Secure Files nicht wieder heraus, und ein neuer Schlüssel ergibt eine neue ID: Browser sehen eine neue Erweiterung, Redirect-URI, CORS und die Intune-Richtlinie brauchen die neue ID.
 - **Wiederholen:** Gibt es die Secure File schon, entsteht kein neuer Schlüssel. Mit `-ExistingKey -KeyFile <pem>` lädt das Skript einen vorhandenen Schlüssel hoch, falls die Secure File fehlt, und prüft ihn sonst gegen die ID, die es beim Hochladen an der Secure File vermerkt hat (Eigenschaft `extensionId`).
 - Der private Schlüssel erscheint in keiner Ausgabe. Im Deploy liegt er nur für die Dauer des Jobs auf dem Agent (`DownloadSecureFile@1`).
@@ -284,7 +318,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
 - **Was die Agents brauchen:** Linux (x64) mit bash, curl, unzip, tar, git, python3 und der Azure CLI. Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl.
-- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents.
+- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents. Terraform und gitleaks prüft sie per SHA-256; Terraform lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider).
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
 - **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).
@@ -345,7 +379,7 @@ Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umsc
 
 `-CentralScaffold` richtet `seed-scaffold` als zentrales Scaffold für andere Azure-DevOps-Projekte ein, ohne PAT (siehe [Zentrales Scaffold](#zentrales-scaffold-selbstbedienung-über-projektgrenzen)).
 
-`-Pool <Name>` lässt `seed-scaffold` auf eigenen Agents laufen (siehe [Eigene Agents](#eigene-agents)); ohne den Parameter nutzt es Microsoft-gehostete Agents.
+`-Pool <Name>` lässt `seed-scaffold` auf eigenen Agents laufen (siehe [Eigene Agents](#eigene-agents)); ohne den Parameter nutzt es Microsoft-gehostete Agents. Mit `-CentralScaffold` warnt das Skript dabei.
 
 Danach einmalig einen PAT anlegen und als geheime Variable `SeedScaffoldPat` an der Pipeline `seed-scaffold` hinterlegen. Scopes: Code (Read, write & manage), Build (Read & execute), Environment (Read & manage), Graph (Read), Project and Team (Read), Pipeline Resources (Use and manage). Das Job-Token der Pipeline reicht nicht, solange „Protect access to repositories in YAML pipelines“ an ist; dann darf es keine Repos anlegen. Die Person, deren PAT es ist, braucht außerdem „Edit policies“ an den Repos des Projekts (Branch-Policy der PR-Validierung).
 
@@ -375,7 +409,7 @@ Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `te
 - **Anmeldung:** mit dem Job-Token. Dahinter steht die Build-Service-Identität des zentralen Projekts, „<Projekt> Build Service (<Organisation>)“. Sie entsteht mit dem Projekt und zählt nicht als Benutzer mit Zugriffsstufe. Ein eigener Service Principal bräuchte für Repos die Zugriffsstufe Basic, die je Organisation kostet.
 - **Freischalten:** Ein Projektadmin schaltet jedes Zielprojekt einmal frei (`onboarding/Grant-SeedScaffoldAccess.ps1`). Ein nicht freigeschaltetes Projekt sieht das Scaffold gar nicht.
 - **Repos:** Die Identität legt keine Repos an. Unter „Protect access to repositories in YAML pipelines“ sieht ihr Token nur Repos, die der Lauf auscheckt. Bei `new` legt die Person das Repo vorher an, mit README.
-  - Das Scaffold referenziert es per Inline-Checkout (`git://<projekt>/<repo>`); in `resources.repositories` sind Template-Ausdrücke nicht erlaubt.
+  - Das Scaffold referenziert es per Inline-Checkout (`git://<projekt>/<repo>`); in `resources.repositories` sind Template-Ausdrücke nicht erlaubt. Die Referenz gibt dem Token schon ab Start des Jobs Zugriff; ausgecheckt wird das Repo (mit `persistCredentials`) aber erst nach den Prüfungen unten.
   - seed-template führt es per Merge unabhängiger Historien ein; bei gleichen Dateien wie `README.md` gewinnt seed-template.
 - **Service Connections:**
   - Das Scaffold teilt die Azure- und die GitHub-Service-Connection des zentralen Projekts ins Zielprojekt, unter demselben Namen.
@@ -392,9 +426,12 @@ Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `te
 - **Eingaben in Skripten:** Eingaben der startenden Person erreichen Skripte nur über die Umgebung.
 - **Freigabe und Review:**
   - `approverGroups`: eine feste Gruppe der Organisation als Freigebende;
-  - `requesterCanApprove: false`: Niemand gibt seine eigene Infrastruktur allein frei;
+  - `requesterCanApprove: false`, fest in der Vorlage: Niemand gibt seine eigene Infrastruktur allein frei. Ohne `approverGroups` bestimmt die startende Person die Freigebenden selbst (`approvers`), und ohne Eintrag hat das neue Projekt keine Freigabe; das Onboarding warnt dann. In bestehenden `seed-scaffold`-Repos den Wert in `azure-pipelines.yml` per Hand setzen; das Onboarding legt die Datei nur einmal an;
   - `minReviewers` (Standard 1 im Onboarding): Pull Requests auf `main` brauchen eine Zustimmung, die eigene zählt nicht. Die Stage Plan nutzt die Service Connection schon vor jeder Freigabe; ohne Review könnte eine Person ihre eigene Pipeline-Änderung mergen.
 - **State:** unter `scaffold/<projekt-id>/<name>.tfstate`. Eigene Azure-Identität des Scaffolds: Managed Identity mit Storage Blob Data Contributor auf dem State-Container und Reader auf der Subscription. Die Deployment-Identität teilt das Scaffold nur weiter, es nutzt sie nicht selbst.
+  - Im selben Container liegen State und Pläne aller Projekte, mit sensiblen Werten wie den Deployment-Tokens der Static Web Apps. Eine Bedingung an der Rolle (ABAC, `blobs:path StringStartsWith 'scaffold/'`) lässt die Identität deshalb nur Blobs unter `scaffold/` lesen, schreiben und löschen: die Registry und ihren eigenen State.
+  - Auflisten darf sie den ganzen Container: Die Namensprüfung sucht State unter `<name>/`, und eine Liste nennt nur Namen.
+  - Bestehende Installationen: `Initialize-SeedTenant.ps1 -CentralScaffold` erneut ausführen; es ergänzt die Bedingung an der vorhandenen Zuweisung (im DryRun `[alt]`).
 
 ### Einrichten
 
@@ -404,18 +441,19 @@ Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `te
        -AzureDevOpsProject Sentinel-Seed -CentralScaffold -AllowedProjects '^Apps-.+$' `
        -ApproverGroups 'Seed Infrastruktur-Freigabe' -DryRun
    ```
-   `-Pool` und `-ProjectPool` für eigene Agents.
+   `-Pool` und `-ProjectPool` für eigene Agents. Das Skript warnt, ohne etwas zu ändern, bei Einstellungen aus Punkt 2, die das Job-Token über das Scaffold hinaus öffnen, ohne `-ApproverGroups` und mit `-Pool`; nach Punkt 2 zeigt ein erneuter Lauf mit `-DryRun`, ob noch etwas offen ist.
 2. **Im zentralen Projekt per UI:**
    - Entwicklerinnen und Entwickler als Readers aufnehmen;
    - unter Pipelines, `seed-scaffold`, Manage security den Readers „Queue builds“ geben;
-   - das Repo `seed-scaffold` und Pipelines ändern nur Admins, denn jede Pipeline des Projekts bekäme dasselbe Token.
+   - das Repo `seed-scaffold` und Pipelines ändern nur Admins, denn jede Pipeline des Projekts bekäme dasselbe Token. Deshalb keine weiteren Pipelines im Projekt und am Repo `seed-scaffold` eine Branch-Policy mit Pflicht-Reviewer;
+   - unter Project settings, Pipelines, Settings: „Limit job authorization scope to current project for non-release pipelines“, „Protect access to repositories in YAML pipelines“, „Limit variables that can be set at queue time“ und „Disable creation of classic build pipelines“ bzw. „… classic release pipelines“ an. Sonst liefe das Token als Project Collection Build Service, sähe alle Repos der Zielprojekte, oder wer startet, setzte beliebige Umgebungsvariablen.
 3. **Je Zielprojekt einmal, durch einen Projektadmin:**
    ```powershell
    ./onboarding/Grant-SeedScaffoldAccess.ps1 -AzureDevOpsOrganization https://dev.azure.com/<org> `
        -AzureDevOpsProject <ziel> -CentralProject Sentinel-Seed -AllowContributorsToCreateRepositories -Check
    ```
    Ohne `-Check` vergibt das Skript die Rechte (Skript-Hilfe). Mit `-AgentPool` gilt das auch für einen eigenen Pool der neuen Projekte.
-4. **Agents:** `migrate` und `enableBranchPolicy` rufen `Initialize-SeedProject.ps1` auf und brauchen PowerShell 7; Microsoft-gehostete Agents haben es.
+4. **Agents:** `migrate` und `enableBranchPolicy` rufen `Initialize-SeedProject.ps1` auf und brauchen PowerShell 7; Microsoft-gehostete Agents haben es. Für das zentrale Scaffold sind sie auch sonst die bessere Wahl: Sein Job-Token erreicht alle freigeschalteten Projekte, und auf einem eigenen Agent träfe, was ein Lauf hinterlässt, die folgenden.
 
 ### Ein Projekt anlegen oder einrichten
 
@@ -599,6 +637,10 @@ Neue Projekte bekommen die Versionen, die hier als Standard stehen. Vor jedem Ta
 - die Beispiele in dieser README.
 
 Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`. Für `seed-tenant` erst `Initialize-SeedIntune.ps1` mit dem neuen Tag ausführen, dann `ref` per Pull Request anheben (siehe Intune).
+
+## Sicherheit
+
+Schwachstellen bitte vertraulich melden, nicht als Issue: siehe [SECURITY.md](SECURITY.md).
 
 ## Lizenz
 
