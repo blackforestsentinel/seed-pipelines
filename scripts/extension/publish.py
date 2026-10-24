@@ -86,7 +86,14 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def clean(message: str) -> str:
+    """Ohne Steuerzeichen und ##vso[: Meldungen enthalten Antworten der API (updates.xml) und von az,
+    und der Agent führt Logging-Befehle in jeder Zeile aus, auch mitten im Text."""
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(message)).replace("##vso[", "##vso_[")
+
+
 def warn(message: str) -> None:
+    message = clean(message)
     if os.environ.get("TF_BUILD"):
         print(f"##vso[task.logissue type=warning]{message}", flush=True)
     else:
@@ -94,6 +101,7 @@ def warn(message: str) -> None:
 
 
 def fail(message: str) -> None:
+    message = clean(message)
     if os.environ.get("TF_BUILD"):
         print(f"##vso[task.logissue type=error]{message}", flush=True)
     raise PublishError(message)

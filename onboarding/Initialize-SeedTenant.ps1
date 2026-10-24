@@ -18,14 +18,20 @@
          Storage Blob Data Contributor nur auf dem Container
       5. Azure DevOps: Service Connection per Workload Identity Federation, mit Branch-Prüfung:
          nur Läufe von -AllowedBranches (Standard main) bekommen die Identität (nicht mit
-         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy)
+         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy); dazu
+         Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
+         Administrators und die Build-Service-Identitäten), außer mit -AllowTagCreation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
          (entfällt mit -SkipScaffold). Mit -CentralScaffold als zentrales Scaffold für andere
          Azure-DevOps-Projekte, ohne PAT: eigene Managed Identity nur für den State (Storage Blob
-         Data Contributor auf dem Container, Reader auf der Subscription) mit Service Connection,
-         dazu für die Build-Service-Identität dieses Projekts die Rolle Administrator auf
-         Organisationsebene an den Service Connections aus 5 und 6, damit sie sie teilen kann
+         Data Contributor auf dem Container, per Bedingung nur für Blobs unter scaffold/; Reader
+         auf der Subscription) mit Service Connection, dazu für die Build-Service-Identität dieses
+         Projekts die Rolle Administrator auf Organisationsebene an den Service Connections aus 5
+         und 6, damit sie sie teilen kann. Danach Warnungen, ohne etwas zu ändern: ohne
+         -ApproverGroups, mit -Pool, Job-Scope nicht auf das Projekt beschränkt, Repos nicht
+         geschützt, Variablen beim Start frei setzbar, klassische Pipelines erlaubt, weitere
+         Pipelines im Projekt, kein Pflicht-Reviewer im Repo seed-scaffold
       8. Azure DevOps: GitHub-Service-Connection für alle Pipelines
       9. Power Platform (nur mit -PowerPlatformEnvironmentUrl): die Deployment-Identität als
          Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Umgebung, damit
@@ -70,12 +76,18 @@
     Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
     Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
     Projekte über einen Tag einbinden. Ein Tag v… in einem Projekt-Repo und ein Lauf darauf kämen
-    deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts sollten nur Administratoren
-    Tags anlegen dürfen (README, Branch-Prüfung).
+    deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts dürfen deshalb nur
+    Administratoren Tags anlegen (Schritt 5, README, Branch-Prüfung).
+
+.PARAMETER AllowTagCreation
+    Tags im Azure-DevOps-Projekt nicht auf Administratoren beschränken, etwa weil andere Repos dort
+    Tags brauchen. Dann sperrt Initialize-SeedProject.ps1 Tags nur im Repo des Seed-Projekts; ohne
+    das kann jede Person mit Schreibrecht über einen Tag v… die Deployment-Identität bekommen.
 
 .PARAMETER Pool
     Agent-Pool für seed-scaffold, etwa Default für eigene Agents; leer: Microsoft-gehostete
-    Agents. Landet in azure-pipelines.yml im Repo seed-scaffold (README, Eigene Agents).
+    Agents. Landet in azure-pipelines.yml im Repo seed-scaffold (README, Eigene Agents). Mit
+    -CentralScaffold warnt das Skript: Dessen Job-Token erreicht alle freigeschalteten Projekte.
 
 .PARAMETER CentralScaffold
     seed-scaffold als zentrales Scaffold (README, Zentrales Scaffold): Es legt Seed-Projekte auch
@@ -93,7 +105,9 @@
 
 .PARAMETER ApproverGroups
     Nur mit -CentralScaffold: Gruppen der Organisation, deren Mitglieder Infrastruktur-Änderungen
-    jedes Projekts freigeben. Mit Gruppe darf die auslösende Person nicht selbst freigeben.
+    jedes Projekts freigeben. Die auslösende Person gibt nie selbst frei (requesterCanApprove:
+    false). Ohne Gruppe geben nur die Personen frei, die sie beim Start einträgt; trägt sie
+    niemanden ein, hat das neue Projekt keine Freigabe. Das Skript warnt deshalb.
 
 .PARAMETER MinReviewers
     Nur mit -CentralScaffold: Pflicht-Reviewer für Pull Requests auf main, Standard 1.
@@ -131,6 +145,7 @@ param(
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [switch] $AllowTagCreation,
     [string] $Pool = '',
     [switch] $SkipScaffold,
     [switch] $CentralScaffold,
@@ -178,6 +193,17 @@ $AssignableRoles = @(
 # Eigene Rolle für Löschsperren: Contributor darf keine Sperren setzen, Owner oder User Access
 # Administrator wären viel zu weit. Diese Rolle darf nur Sperren lesen, setzen und entfernen.
 $LockRoleName = 'Sentinel Seed Lock Contributor'
+
+# Die Identität des zentralen Scaffolds liest, schreibt und löscht im State-Container nur Blobs unter
+# scaffold/ (Registry und eigener State, scaffold/<projekt-id>/<name>.tfstate). Im selben Container
+# liegen State und Pläne aller Projekte mit sensiblen Werten wie den Deployment-Tokens der Static
+# Web Apps. Auflisten (Blob.List) bleibt erlaubt: Die Namensprüfung sucht State unter <name>/, und
+# eine Liste nennt nur Namen. Eine vorhandene Zuweisung ohne diese Bedingung wird aktualisiert.
+$blobActions = 'Microsoft.Storage/storageAccounts/blobServices/containers/blobs'
+$ScaffoldBlobCondition = "(((!(ActionMatches{'$blobActions/read'} AND NOT SubOperationMatches{'Blob.List'})) AND " +
+    "(!(ActionMatches{'$blobActions/write'})) AND (!(ActionMatches{'$blobActions/add/action'})) AND " +
+    "(!(ActionMatches{'$blobActions/delete'}))) OR " +
+    "(@Resource[$($blobActions):path] StringStartsWith 'scaffold/'))"
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-onboarding-$(Get-Random)")
 $missing = [Collections.Generic.List[string]]::new()
@@ -294,6 +320,50 @@ function Set-BranchControl([object] $Endpoint, [string] $ProjectId) {
     } | Out-Null
 }
 
+# Tags nur für Administratoren: Die Branch-Prüfung lässt refs/tags/v* für jedes Repo des Laufs
+# durch. Wer sonst Tags anlegen könnte: Contributors, Build Administrators und die Job-Tokens der
+# Pipelines (Build-Service-Identitäten des Projekts und der Organisation).
+$GitNamespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'
+$CreateTagBit = 32   # Recht "Create tag" (CreateTag) im Namespace Git Repositories
+
+function Get-TagCreators([object] $Project) {
+    $vssps = "https://vssps.dev.azure.com/$($Org.Split('/')[-1])"
+    $orgName = $Org.Split('/')[-1]
+    $scope = (Invoke-AzDevOps get "$vssps/_apis/graph/descriptors/$($Project.id)?api-version=7.1-preview.1" $null).value
+    $groups = (Invoke-AzDevOps get "$vssps/_apis/graph/groups?scopeDescriptor=$scope&api-version=7.1-preview.1" $null).value
+    $subjects = @(
+        foreach ($name in @("[$($Project.name)]\Contributors", "[$($Project.name)]\Build Administrators")) {
+            $group = $groups | Where-Object principalName -eq $name | Select-Object -First 1
+            if (-not $group) { throw "Tags: Gruppe $name nicht gefunden." }
+            [pscustomobject] @{ Name = $name; Id = (Invoke-AzDevOps get "$vssps/_apis/graph/storagekeys/$($group.descriptor)?api-version=7.1-preview.1" $null).value }
+        }
+        foreach ($name in @("$($Project.name) Build Service ($orgName)", "Project Collection Build Service ($orgName)")) {
+            $identity = Find-BuildIdentity $name
+            if (-not $identity) { throw "Tags: $name nicht gefunden." }
+            [pscustomobject] @{ Name = $name; Id = $identity.Id }
+        })
+    foreach ($subject in $subjects) {
+        [pscustomobject] @{ Name = $subject.Name; Descriptor = (Invoke-AzDevOps get "$vssps/_apis/identities?identityIds=$($subject.Id)&api-version=7.1" $null).value[0].descriptor }
+    }
+}
+
+# Verbietet "Create tag" auf $SecurityToken (Repo oder ganzes Projekt); vorhandene Einträge bleiben.
+function Set-TagDeny([string] $SecurityToken, [object[]] $Creators) {
+    foreach ($creator in $Creators) {
+        Invoke-Step "Create tag verboten für $($creator.Name)" {
+            (Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$GitNamespace`?token=$([uri]::EscapeDataString($SecurityToken))&descriptors=$([uri]::EscapeDataString($creator.Descriptor))&api-version=7.1" $null).value |
+                ForEach-Object { $_.acesDictionary.PSObject.Properties.Value } | Where-Object { $_.deny -band $CreateTagBit }
+        } {
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$GitNamespace`?api-version=7.1" @{
+                token                = $SecurityToken
+                merge                = $true
+                accessControlEntries = @(@{ descriptor = $creator.Descriptor; allow = 0; deny = $CreateTagBit })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
+}
+
 function Invoke-Arm([string] $Method, [string] $Url, [string] $BodyFile) {
     # Direkt per HTTP wie bei Azure DevOps: Filter-URLs mit & überstehen az.cmd nicht, und az gibt
     # Umlaute unter Windows als Ersatzzeichen aus. Gelesene Texte gehen hier zurück an Azure,
@@ -383,8 +453,12 @@ try {
     )
     $existingAssignments = if ($sp) { az role assignment list --assignee $sp.id --all -o json | ConvertFrom-Json } else { @() }
 
+    # Für die Deployment-Identität; mit PrincipalId und Existing (ihre vorhandenen Zuweisungen) auch
+    # für eine andere Identität, etwa die des zentralen Scaffolds.
     function Set-RoleAssignment([hashtable] $Assignment) {
-        $existing = $existingAssignments | Where-Object { $_.scope -eq $Assignment.Scope -and $_.roleDefinitionId -like "*/$($Assignment.RoleId)" } |
+        $principalId = if ($Assignment.PrincipalId) { $Assignment.PrincipalId } else { $sp.id }
+        $candidates = if ($Assignment.ContainsKey('Existing')) { $Assignment.Existing } else { $existingAssignments }
+        $existing = $candidates | Where-Object { $_.scope -eq $Assignment.Scope -and $_.roleDefinitionId -like "*/$($Assignment.RoleId)" } |
             Select-Object -First 1
         # Neue Seed-Versionen erlauben weitere Rollen: eine ältere Bedingung wird ersetzt, nicht ergänzt.
         if ($existing -and $Assignment.Condition -and $existing.condition -ne $Assignment.Condition) {
@@ -408,7 +482,7 @@ try {
         Invoke-Step $Assignment.Name { $existing } {
             $properties = @{
                 roleDefinitionId = "$Subscription/providers/Microsoft.Authorization/roleDefinitions/$($Assignment.RoleId)"
-                principalId      = $sp.id
+                principalId      = $principalId
                 principalType    = 'ServicePrincipal'
                 description      = "Sentinel Seed: $($Assignment.Name)"
             }
@@ -564,6 +638,14 @@ try {
         Write-Host "  [fehlt] Branch-Prüfung an $ServiceConnectionName" -ForegroundColor Yellow
         $missing.Add("Branch-Prüfung an $ServiceConnectionName")
     }
+    # Gilt für alle Repos des Projekts, auch für Projekte, die seed-scaffold später anlegt.
+    if ($SkipScaffold) {
+        Write-Host '          Tags sperrt Initialize-SeedProject.ps1 im Repo des Projekts.'
+    } elseif ($AllowTagCreation) {
+        Write-Host "  [warn]  -AllowTagCreation: Wer in $($project.name) Tags anlegen darf, bekommt über einen Tag v… die Deployment-Identität." -ForegroundColor Yellow
+    } else {
+        Set-TagDeny "repoV2/$($project.id)" @(Get-TagCreators $project)
+    }
 
     # --- 6. GitHub-Service-Connection ------------------------------------------------------
     Write-Host '6. Azure DevOps: GitHub-Service-Connection'
@@ -601,19 +683,16 @@ try {
             }
             if ($scaffoldIdentity) {
                 foreach ($role in @(
-                        @{ Scope = $StateContainerScope; Role = 'Storage Blob Data Contributor'; Title = "Storage Blob Data Contributor auf Container $StateContainer" }
-                        @{ Scope = $Subscription; Role = 'Reader'; Title = 'Reader auf der Subscription (Namensprüfung)' })) {
+                        @{ Scope = $StateContainerScope; RoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'; Condition = $ScaffoldBlobCondition
+                            Name = "Storage Blob Data Contributor auf Container $StateContainer (nur scaffold/) für $ScaffoldIdentityName" }
+                        @{ Scope = $Subscription; RoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+                            Name = "Reader auf der Subscription (Namensprüfung) für $ScaffoldIdentityName" })) {
                     # Nach Principal-ID filtern statt --assignee: Das sucht im Verzeichnis, und eine
                     # frisch angelegte Managed Identity ist dort oft noch nicht angekommen.
-                    Invoke-Step "$($role.Title) für $ScaffoldIdentityName" {
-                        az role assignment list --scope $role.Scope -o json | ConvertFrom-Json | Where-Object {
-                            $_.principalId -eq $scaffoldIdentity.principalId -and $_.roleDefinitionName -eq $role.Role -and $_.scope -eq $role.Scope
-                        }
-                    } {
-                        az role assignment create --assignee-object-id $scaffoldIdentity.principalId --assignee-principal-type ServicePrincipal `
-                            --role $role.Role --scope $role.Scope -o none
-                        $true
-                    } | Out-Null
+                    $role.PrincipalId = $scaffoldIdentity.principalId
+                    $role.Existing = @(az role assignment list --scope $role.Scope -o json | ConvertFrom-Json |
+                            Where-Object principalId -eq $scaffoldIdentity.principalId)
+                    Set-RoleAssignment $role
                 }
                 $scaffoldEndpoint = Invoke-Step "Service Connection $ScaffoldConnectionName (Workload Identity Federation)" {
                     Get-Endpoint $ScaffoldConnectionName
@@ -681,14 +760,13 @@ try {
             Invoke-Step 'azure-pipelines.yml in seed-scaffold' {
                 (Invoke-AzDevOps get "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/refs?filter=heads/main&api-version=7.1" $null).count -gt 0
             } {
-                # Mit Freigabe-Gruppe darf die auslösende Person nicht selbst freigeben; ohne Gruppe
-                # bliebe sonst oft niemand, der freigeben darf.
+                # Zentral steht requesterCanApprove fest auf false (central-pipelines.yml), auch ohne
+                # Freigabe-Gruppe; ohne sie warnt das Skript unten.
                 $content = if ($CentralScaffold) {
                     (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'central-pipelines.yml')).
                         Replace('__ALLOWED_PROJECTS__', $AllowedProjects.Replace("'", "''")).
                         Replace('__MEMBER_GROUP__', $MemberGroup.Replace("'", "''")).
                         Replace('__APPROVER_GROUPS__', (ConvertTo-YamlList $ApproverGroups)).
-                        Replace('__REQUESTER_CAN_APPROVE__', $(if ($ApproverGroups) { 'false' } else { 'true' })).
                         Replace('__MIN_REVIEWERS__', "$MinReviewers").
                         Replace('__SCAFFOLD_CONNECTION__', $ScaffoldConnectionName).
                         Replace('__PROJECT_POOL__', $ProjectPool.Replace("'", "''"))
@@ -736,6 +814,60 @@ try {
                 } | Out-Null
             }
             Write-Host "  [ok]    seed-scaffold berechtigt für $($azureForScaffold.name), $($github.name)$(if ($Pool) { " und den Pool $Pool" })"
+        }
+
+        # Zentrales Scaffold: Das Job-Token jeder Pipeline dieses Projekts ist dieselbe
+        # Build-Service-Identität mit Rechten in allen freigeschalteten Projekten. Einstellungen, die
+        # das öffnen, meldet das Skript nur (kein Schritt, zählt nicht als fehlend); ändern sie
+        # Projektadmins (README, Zentrales Scaffold).
+        if ($CentralScaffold) {
+            $MinReviewersPolicyType = 'fa4e907d-c16b-4a4c-9dfa-4906e5d171dd'
+            $settings = Get-OrNull { Invoke-AzDevOps get "$Org/$($project.id)/_apis/build/generalsettings?api-version=7.1-preview.1" $null }
+            $otherPipelines = @((Invoke-AzDevOps get "$Org/$($project.id)/_apis/build/definitions?api-version=7.1" $null).value |
+                    Where-Object { if ($pipeline) { $_.id -ne $pipeline.id } else { $_.name -ne 'seed-scaffold' } } | ForEach-Object name)
+            $warnings = @(
+                if (-not $ApproverGroups) {
+                    'Ohne -ApproverGroups bestimmt die startende Person selbst, wer Infrastruktur-Änderungen ihres neuen Projekts freigibt (approvers); trägt sie niemanden ein, gibt es keine Freigabe. Sie selbst darf nicht freigeben (requesterCanApprove: false).'
+                }
+                if ($Pool) {
+                    "-Pool $Pool für das zentrale Scaffold: Sein Job-Token erreicht alle freigeschalteten Projekte, und was ein Lauf auf einem eigenen Agent hinterlässt, trifft die folgenden. Empfohlen sind Microsoft-gehostete Agents."
+                }
+                if (-not $settings) {
+                    "Pipeline-Einstellungen von $($project.name) nicht lesbar; Job-Scope, Repo-Schutz, Variablen beim Start und klassische Pipelines ungeprüft."
+                } else {
+                    if (-not $settings.enforceJobAuthScope) {
+                        'Job-Scope nicht auf das Projekt beschränkt („Limit job authorization scope to current project for non-release pipelines“ aus): Pipelines laufen dann als Project Collection Build Service, mit dessen Rechten in allen Projekten der Organisation.'
+                    }
+                    if (-not $settings.enforceReferencedRepoScopedToken) {
+                        '„Protect access to repositories in YAML pipelines“ aus: Das Job-Token sieht dann alle Repos der freigeschalteten Projekte, nicht nur das ausgecheckte.'
+                    }
+                    if (-not $settings.enforceSettableVar) {
+                        'Beim Start sind beliebige Variablen setzbar („Limit variables that can be set at queue time“ aus): Wer seed-scaffold starten darf, setzt damit Umgebungsvariablen in jedem Schritt.'
+                    }
+                    if (-not ($settings.disableClassicPipelineCreation -or
+                            ($settings.disableClassicBuildPipelineCreation -and $settings.disableClassicReleasePipelineCreation))) {
+                        'Klassische Pipelines dürfen angelegt werden („Disable creation of classic build/release pipelines“ aus): Für sie gilt „Protect access to repositories“ nicht, ihr Job-Token sieht alle Repos der freigeschalteten Projekte.'
+                    }
+                }
+                if ($otherPipelines) {
+                    "Weitere Pipelines in $($project.name) ($($otherPipelines -join ', ')): Jede bekommt dasselbe Job-Token wie seed-scaffold. Das zentrale Projekt nur für seed-scaffold nutzen."
+                }
+                if ($repo) {
+                    $branchRef = if ($repo.defaultBranch) { $repo.defaultBranch } else { 'refs/heads/main' }
+                    $review = (Invoke-AzDevOps get "$Org/$($project.id)/_apis/policy/configurations?policyType=$MinReviewersPolicyType&api-version=7.1" $null).value |
+                        Where-Object {
+                            $_.type.id -eq $MinReviewersPolicyType -and $_.isEnabled -and $_.isBlocking -and $_.settings.minimumApproverCount -ge 1 -and
+                            ($_.settings.scope | Where-Object {
+                                (-not $_.repositoryId -or $_.repositoryId -eq $repo.id) -and
+                                ($_.matchKind -eq 'DefaultBranch' -or $_.refName -eq $branchRef -or ($_.matchKind -eq 'Prefix' -and $branchRef.StartsWith("$($_.refName)")))
+                            })
+                        }
+                    if (-not $review) {
+                        "Repo seed-scaffold ohne Pflicht-Reviewer auf $($branchRef -replace '^refs/heads/'): Eine Änderung an azure-pipelines.yml (Zielprojekte, Freigaben, Pool, Version) gilt ohne zweite Person für alle Zielprojekte."
+                    }
+                }
+            )
+            foreach ($warning in $warnings) { Write-Host "  [warn]  $warning" -ForegroundColor Yellow }
         }
     }
 

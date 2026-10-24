@@ -57,8 +57,9 @@ class ScaffoldError(Exception):
 
 
 def clean(value: object) -> str:
-    """Für Meldungen: ohne Zeilenumbrüche und Steuerzeichen, damit keine Logging-Befehle entstehen."""
-    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value))[:200]
+    """Für Meldungen: ohne Zeilenumbrüche, Steuerzeichen und ##vso[, damit keine Logging-Befehle
+    entstehen. Der Agent erkennt sie in jeder Zeile, auch mitten im Text, etwa in "Fehler: …"."""
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value))[:200].replace("##vso[", "##vso_[")
 
 
 def log(message: str) -> None:

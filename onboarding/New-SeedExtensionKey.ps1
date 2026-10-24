@@ -158,12 +158,24 @@ function Read-PrivateKey([string] $Path) {
 }
 
 # Neuer Schlüssel in eine neue Datei. CreateNew bricht ab, statt eine vorhandene Datei zu
-# überschreiben; außerhalb von Windows darf nur der eigene Benutzer sie lesen.
+# überschreiben. Lesen darf sie nur der eigene Benutzer, und zwar ab dem Anlegen, also bevor der
+# Schlüssel darin steht: außerhalb von Windows per Dateimodus 600, unter Windows mit einer eigenen
+# Zugriffsliste ohne geerbte Einträge (nur der eigene Benutzer, Vollzugriff). Sonst erbte die Datei
+# die Rechte des Ordners, in dem etwa Administratoren oder andere Benutzer lesen dürfen.
 function New-PrivateKey([string] $Path) {
-    $options = [IO.FileStreamOptions] @{ Mode = 'CreateNew'; Access = 'Write'; Share = 'None' }
-    if (-not $IsWindows) { $options.UnixCreateMode = [IO.UnixFileMode] 'UserRead, UserWrite' }
     $rsa = [Security.Cryptography.RSA]::Create(2048)
-    $writer = [IO.StreamWriter]::new($Path, [Text.UTF8Encoding]::new($false), $options)
+    if ($IsWindows) {
+        $security = [Security.AccessControl.FileSecurity]::new()
+        $security.SetAccessRuleProtection($true, $false)
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+        $stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path), [IO.FileMode]::CreateNew,
+            [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security)
+    } else {
+        $stream = [IO.FileStream]::new($Path, [IO.FileStreamOptions] @{
+                Mode = 'CreateNew'; Access = 'Write'; Share = 'None'; UnixCreateMode = [IO.UnixFileMode] 'UserRead, UserWrite' })
+    }
+    $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
     try {
         $writer.Write($rsa.ExportPkcs8PrivateKeyPem())
     } finally {

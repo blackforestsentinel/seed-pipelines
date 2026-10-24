@@ -426,5 +426,22 @@ class PublishTests(KeyTestCase):
         self.assertEqual(self.azure.commands, [])
 
 
+class LogTests(unittest.TestCase):
+    def test_messages_cannot_issue_logging_commands(self):
+        # Meldungen enthalten Antworten von updates.xml; der Agent erkennt ##vso[ in jeder Zeile.
+        evil = "1.0\n##vso[task.uploadfile]/tmp/key.pem\r###vso[task.setvariable variable=x]1"
+        with mock.patch.dict(os.environ, {"TF_BUILD": "True"}), quiet() as out:
+            publish.warn(evil)
+            with self.assertRaises(publish.PublishError) as error:
+                publish.fail(evil)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertTrue(line.startswith("##vso[task.logissue type="))
+            self.assertEqual(line.count("##vso["), 1)
+        self.assertNotIn("\n", str(error.exception))
+        self.assertNotIn("##vso[", str(error.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
