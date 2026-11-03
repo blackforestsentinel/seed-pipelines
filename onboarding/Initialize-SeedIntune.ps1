@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Legt an, was die Pipeline seed-intune (templates/intune-extensions.yml) braucht. Sie besitzt
-    die eine Intune-Richtlinie mit ExtensionInstallForcelist für alle Seed-Erweiterungen; die
+    die eine Intune-Richtlinie mit ExtensionSettings für alle Seed-Erweiterungen; die
     Liste steht in der Registerdatei extensions.yaml im Repo seed-tenant. Jeder Schritt prüft
     zuerst und legt nur an, was fehlt; das Skript lässt sich also gefahrlos wiederholen.
 
@@ -55,8 +55,9 @@
     Pflicht: Ohne Freigabe würde jeder Merge Intune sofort ändern.
 
 .PARAMETER AdoptPolicies
-    Namen alter Intune-Richtlinien mit ExtensionInstallForcelist, die die Pipeline beim ersten
-    Lauf übernimmt (umbenennt) statt eine neue anzulegen, etwa 'Kundenportal: Edge-Erweiterung'.
+    Namen alter Intune-Richtlinien mit ExtensionInstallForcelist oder ExtensionSettings, die die
+    Pipeline beim ersten Lauf übernimmt (umbenennt) statt eine neue anzulegen, etwa
+    'Kundenportal: Edge-Erweiterung'.
     Landen nur im Startinhalt von azure-pipelines.yml; danach dort pflegen.
 
 .PARAMETER SeedPipelinesVersion

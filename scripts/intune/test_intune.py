@@ -35,9 +35,10 @@ OTHER_ID = "abcdefghijklmnopabcdefghijklmnop"
 OTHER_URL = "https://func-demo-prod.azurewebsites.net/api/extension/updates.xml"
 PORTAL = f"{PORTAL_ID};{PORTAL_URL}"
 OTHER = f"{OTHER_ID};{OTHER_URL}"
-IDS = ("device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist",
-       "device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist_1",
-       "device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist_extensioninstallforcelistdesc")
+IDS = ("device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensionsettings",
+       "device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensionsettings_1",
+       "device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensionsettings_extensionsettings")
+FORCELIST = "device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist"
 DEFINITION = {
     "id": IDS[0],
     "options": [
@@ -78,6 +79,25 @@ def quiet():
 def settings_for(entries, enabled=True):
     ids = IDS if enabled else (IDS[0], IDS[0] + "_0", IDS[2])
     return intune.desired_policy(ids, entries)["settings"]
+
+
+def settings_with(value):
+    """ExtensionSettings mit einem beliebigen Wert, als JSON oder als Text."""
+    settings = settings_for([])
+    text = settings[0]["settingInstance"]["choiceSettingValue"]["children"][0]["simpleSettingValue"]
+    text["value"] = value if isinstance(value, str) else json.dumps(value)
+    return settings
+
+
+def forcelist_settings(entries, setting_id=FORCELIST):
+    """ExtensionInstallForcelist, wie sie die Richtlinie bis v0.15.0 setzte."""
+    return [{"settingInstance": {
+        "settingDefinitionId": setting_id,
+        "choiceSettingValue": {"value": setting_id + "_1", "children": [{
+            "settingDefinitionId": setting_id + "_extensioninstallforcelistdesc",
+            "simpleSettingCollectionValue": [{"value": entry} for entry in entries],
+        }]},
+    }}]
 
 
 class FakeGraph:
@@ -358,11 +378,44 @@ class PlanTests(unittest.TestCase):
         self.assertEqual((plan.added, plan.removed), ([OTHER], [PORTAL]))
         self.assertIn(f"- {PORTAL} (Edge deinstalliert sie)", plan.steps[0])
 
-    def test_order_and_duplicates_count_as_change(self):
-        plan = intune.make_plan(self.state([OTHER, PORTAL, PORTAL]), IDS, sorted([PORTAL, OTHER]))
+    def test_json_formatting_does_not_count(self):
+        value = intune.desired_value(sorted([PORTAL, OTHER]))
+        settings = settings_with(json.dumps(dict(reversed(list(value.items()))), indent=2))
 
-        self.assertIn("Reihenfolge", plan.steps[0])
-        self.assertEqual(plan.removed, [])
+        self.assertEqual(intune.make_plan(self.state(settings=settings), IDS, sorted([PORTAL, OTHER])).steps, [])
+
+    def test_aligns_kept_extensions_and_drops_other_keys(self):
+        value = intune.desired_value(sorted([PORTAL, OTHER]))
+        value[PORTAL_ID] = {"installation_mode": "force_installed", "update_url": PORTAL_URL}
+        value["*"] = {"installation_mode": "blocked"}
+
+        plan = intune.make_plan(self.state(settings=settings_with(value)), IDS, sorted([PORTAL, OTHER]))
+
+        self.assertEqual((plan.added, plan.removed), ([], []))
+        self.assertIn(f"~ {PORTAL_ID}: bisher", plan.steps[0])
+        self.assertIn("force_installed", plan.steps[0])
+        self.assertIn("- * (blocked) entfernen", plan.steps[0])
+        self.assertNotIn(OTHER_ID, plan.steps[0])
+
+    def test_switches_forcelist_without_uninstalling(self):
+        plan = intune.make_plan(self.state(settings=forcelist_settings([OTHER, PORTAL])), IDS, sorted([PORTAL, OTHER]))
+
+        self.assertTrue(plan.replace_settings)
+        self.assertEqual((plan.added, plan.removed), ([], []))
+        self.assertIn("ExtensionInstallForcelist durch ExtensionSettings ersetzen", plan.steps[0])
+        self.assertNotIn("weitere Einstellungen", plan.steps[0])
+
+    def test_switch_removes_forcelist_entries_missing_in_registry(self):
+        plan = intune.make_plan(self.state(settings=forcelist_settings([PORTAL, OTHER])), IDS, [PORTAL])
+
+        self.assertEqual(plan.removed, [OTHER])
+        self.assertIn(f"- {OTHER} (Edge deinstalliert sie)", plan.steps[0])
+
+    def test_invalid_json_installs_nothing(self):
+        plan = intune.make_plan(self.state(settings=settings_with("{kaputt")), IDS, [PORTAL])
+
+        self.assertEqual((plan.added, plan.removed), ([PORTAL], []))
+        self.assertIn("kein gültiges JSON-Objekt", plan.steps[0])
 
     def test_disabled_setting_and_other_settings(self):
         settings = settings_for([PORTAL], enabled=False) + [{"settingInstance": {"settingDefinitionId": "anderes"}}]
@@ -397,7 +450,7 @@ class PlanTests(unittest.TestCase):
         plan = intune.make_plan(self.state([PORTAL, OTHER]), IDS, [], allow_empty=True)
 
         self.assertTrue(plan.delete)
-        self.assertEqual(plan.removed, [PORTAL, OTHER])
+        self.assertEqual(plan.removed, sorted([PORTAL, OTHER]))
         self.assertEqual(intune.make_plan(self.state(policy=False), IDS, [], allow_empty=True).steps, [])
 
     def test_plan_id_follows_steps(self):
@@ -418,7 +471,10 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(instance["choiceSettingValue"]["value"], IDS[1])
         child = instance["choiceSettingValue"]["children"][0]
         self.assertEqual(child["settingDefinitionId"], IDS[2])
-        self.assertEqual([v["value"] for v in child["simpleSettingCollectionValue"]], [PORTAL, OTHER])
+        self.assertEqual(json.loads(child["simpleSettingValue"]["value"]), {
+            PORTAL_ID: {"installation_mode": "normal_installed", "update_url": PORTAL_URL},
+            OTHER_ID: {"installation_mode": "normal_installed", "update_url": OTHER_URL},
+        })
         json.dumps(body)
 
 
@@ -441,7 +497,7 @@ class StateTests(unittest.TestCase):
         state = intune.read_state(graph, NAME, [OLD, "Gibt es nicht"])
 
         self.assertEqual((state.policy["id"], state.adopted_from), (old, OLD))
-        self.assertEqual(intune.entries_in(state.settings, IDS), ([PORTAL], 0))
+        self.assertEqual(intune.read_settings(state.settings, IDS).entries, [PORTAL])
 
     def test_refuses_several_candidates(self):
         graph = FakeGraph()
@@ -472,9 +528,9 @@ class StateTests(unittest.TestCase):
         graph.add("Nur Ausschluss", [OTHER], assignments=[{"target": {"@odata.type": intune.EXCLUSION, "groupId": "g"}}])
         graph.add("Andere Einstellung", settings=[{"settingInstance": {"settingDefinitionId": "x"}}])
         graph.add("Mac", [OTHER], platforms="macOS")
-        # Chrome hat eine eigene Forcelist und stört Edge nicht.
+        # Chrome hat eigene Richtlinien und stört Edge nicht.
         graph.add("Chrome", settings=[{"settingInstance": {"settingDefinitionId":
-                  "device_vendor_msft_policy_config_chromeintunev1~policy~googlechrome~extensions_extensioninstallforcelist"}}])
+                  "device_vendor_msft_policy_config_chromeintunev1~policy~googlechrome~extensions_extensionsettings"}}])
         others = intune.read_state(graph, NAME, []).others
 
         errors, warnings = intune.find_conflicts(graph, others, IDS[0], [])
@@ -482,6 +538,20 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("„Zugewiesen“", errors[0])
         self.assertEqual(len(warnings), 2)
+
+    def test_forcelist_elsewhere_warns_only_for_own_extensions(self):
+        graph = FakeGraph()
+        user_forcelist = FORCELIST.replace("device_vendor", "user_vendor")
+        graph.add("Erzwingt Demo", settings=forcelist_settings([OTHER], user_forcelist))
+        graph.add("Erzwingt Demo, nicht zugewiesen", settings=forcelist_settings([OTHER]), assignments=[])
+        graph.add("Store-Erweiterungen", settings=forcelist_settings(["fremdefremdefremdefremdefremdefr"]))
+        others = intune.read_state(graph, NAME, []).others
+
+        errors, warnings = intune.find_conflicts(graph, others, IDS[0], [], frozenset([PORTAL_ID, OTHER_ID]))
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(f"„Erzwingt Demo“ (p1) erzwingt per ExtensionInstallForcelist {OTHER_ID}", warnings[0])
 
     def test_conflict_names_adopt_hint(self):
         graph = FakeGraph()
@@ -543,8 +613,23 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         (policy,) = self.graph.policies.values()
         self.assertEqual(policy["name"], NAME)
-        self.assertEqual(intune.entries_in(policy["settings"], IDS), (sorted([PORTAL, OTHER]), 0))
+        current = intune.read_settings(policy["settings"], IDS)
+        self.assertEqual((current.value, current.forcelist, current.others),
+                         (intune.desired_value(sorted([PORTAL, OTHER])), None, 0))
         self.assertEqual(policy["assignments"], [{"target": {"@odata.type": intune.ALL_USERS}}])
+        self.assertIn("Richtlinie entspricht dem Soll", out)
+
+    def test_apply_switches_forcelist_in_place(self):
+        policy_id = self.graph.add(NAME, settings=forcelist_settings(sorted([PORTAL, OTHER])))
+
+        code, out = self.apply()
+
+        self.assertEqual(code, 0)
+        self.assertEqual([m for m, _ in self.graph.writes()], ["PUT"])
+        current = intune.read_settings(self.graph.policies[policy_id]["settings"], IDS)
+        self.assertEqual((current.entries, current.forcelist, current.others), (sorted([PORTAL, OTHER]), None, 0))
+        self.assertIn("ExtensionInstallForcelist durch ExtensionSettings ersetzen", out)
+        self.assertNotIn("deinstalliert", out)
         self.assertIn("Richtlinie entspricht dem Soll", out)
 
     def test_apply_adopts_without_delete(self):
@@ -554,7 +639,7 @@ class CommandTests(unittest.TestCase):
 
         self.assertEqual(list(self.graph.policies), [old])
         self.assertEqual(self.graph.policies[old]["name"], NAME)
-        self.assertEqual(intune.entries_in(self.graph.policies[old]["settings"], IDS), (sorted([PORTAL, OTHER]), 0))
+        self.assertEqual(intune.read_settings(self.graph.policies[old]["settings"], IDS).entries, sorted([PORTAL, OTHER]))
         self.assertNotIn("DELETE", [m for m, _ in self.graph.writes()])
         self.assertEqual([m for m, _ in self.graph.writes()], ["PUT", "POST"])
 

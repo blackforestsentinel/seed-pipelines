@@ -8,12 +8,17 @@
   apply  gleicht die Richtlinie an, liest sie danach erneut und prüft, dass nichts mehr fehlt.
          Mit --expect-plan nur, wenn der Plan noch derselbe ist wie bei der Freigabe.
 
-Die Richtlinie (Einstellungskatalog, Windows, MDM) setzt nur die Edge-Richtlinie „Control which
-extensions are installed silently“ (ExtensionInstallForcelist) auf „<id>;<updateUrl>“ je Eintrag
-der Registerdatei, sortiert, und gilt für alle Benutzer. Intune erlaubt die Einstellung nur in einer
-Richtlinie: Setzt eine zweite sie ebenfalls, meldet Intune einen Konflikt, und keine wirkt. Die
-Pipeline besitzt deshalb die ganze Richtlinie; Einträge, die nicht in der Registerdatei stehen,
-entfernt sie.
+Die Richtlinie (Einstellungskatalog, Windows, MDM) setzt nur die Edge-Richtlinie „Configure
+extension management settings“ (ExtensionSettings), je Eintrag der Registerdatei
+{"<id>": {"installation_mode": "normal_installed", "update_url": "<updateUrl>"}}, und gilt für alle
+Benutzer. Edge installiert die Erweiterungen von selbst; die Benutzer können sie ausschalten, aber
+nicht entfernen. Intune erlaubt die Einstellung nur in einer Richtlinie: Setzt eine zweite sie
+ebenfalls, meldet Intune einen Konflikt, und keine wirkt. Die Pipeline besitzt deshalb die ganze
+Richtlinie; Einträge, die nicht in der Registerdatei stehen, entfernt sie.
+
+Bis v0.15.0 setzte die Richtlinie ExtensionInstallForcelist (erzwungen, nicht ausschaltbar). Eine
+solche Richtlinie stellt apply in einem Schritt auf ExtensionSettings um, in derselben Richtlinie,
+damit Edge keinen Stand ohne die Erweiterungen sieht.
 
 Übernahme: Fehlt die Richtlinie --policy-name, gibt es aber genau eine aus --adopt (etwa die alte
 „Kundenportal: Edge-Erweiterung“), wird diese umbenannt und angeglichen, nie gelöscht und neu
@@ -49,14 +54,19 @@ GRAPH = "https://graph.microsoft.com/beta"
 POLICY_NAME = "Sentinel Seed: Edge-Erweiterungen"
 MANAGED_BY = "der Seed-Pipeline aus templates/intune-extensions.yml (seed-pipelines)"
 # Edge-Richtlinien im Einstellungskatalog; die ID hängt an der ADMX-Version, in der die
-# Richtlinie dazukam. Die abhängige Liste liest das Skript aus der Definition selbst.
+# Richtlinie dazukam (ExtensionSettings: ohne Versionszusatz, nachgesehen 2026-11). Das abhängige
+# Textfeld liest das Skript aus der Definition selbst.
 SETTING_CANDIDATES = (
-    "device_vendor_msft_policy_config_microsoft_edgev77.3~policy~microsoft_edge~extensions_extensioninstallforcelist",
-    "device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensioninstallforcelist",
+    "device_vendor_msft_policy_config_microsoft_edge~policy~microsoft_edge~extensions_extensionsettings",
 )
+SETTINGS_SUFFIX = "extensions_extensionsettings"
+# Die Einstellung bis v0.15.0; make_plan stellt sie um, find_conflicts sucht sie in anderen Richtlinien.
 FORCELIST_SUFFIX = "extensions_extensioninstallforcelist"
-# Nur Edge zählt als Konflikt; Chrome (…~policy~googlechrome~…) hat eine eigene Forcelist.
+# Nur Edge zählt; Chrome (…~policy~googlechrome~…) hat eigene Richtlinien.
 EDGE_POLICY_MARKER = "~policy~microsoft_edge~"
+# Von selbst installiert, die Benutzer können die Erweiterung ausschalten (anders als force_installed).
+INSTALLATION_MODE = "normal_installed"
+INSTALLED_MODES = ("normal_installed", "force_installed")
 ALL_USERS = "#microsoft.graph.allLicensedUsersAssignmentTarget"
 EXCLUSION = "#microsoft.graph.exclusionGroupAssignmentTarget"
 
@@ -139,7 +149,7 @@ class Extension:
 
     @property
     def entry(self) -> str:
-        """Eintrag in ExtensionInstallForcelist."""
+        """Kurzform <id>;<updateUrl> für Plan und Log, wie früher in ExtensionInstallForcelist."""
         return f"{self.id};{self.update_url}"
 
 
@@ -330,6 +340,12 @@ def desired_entries(extensions: list[Extension]) -> list[str]:
     return sorted({extension.entry for extension in extensions})
 
 
+def desired_value(entries: list[str]) -> dict:
+    """Soll-Wert von ExtensionSettings: je Erweiterung von selbst installiert, ausschaltbar."""
+    return {extension_id: {"installation_mode": INSTALLATION_MODE, "update_url": url}
+            for extension_id, url in (entry.split(";", 1) for entry in entries)}
+
+
 # --- Veröffentlicht? ---------------------------------------------------------------------------
 
 
@@ -457,29 +473,29 @@ def find_definition(graph: Graph) -> dict:
         definition = graph.request("GET", f"/deviceManagement/configurationSettings('{urllib.parse.quote(candidate, safe='')}')", missing_ok=True)
         if definition:
             return definition
-    fail("Die Einstellung ExtensionInstallForcelist (Microsoft Edge > Extensions > Control which extensions are "
-         "installed silently) fehlt im Einstellungskatalog unter den bekannten IDs. Die ID in Intune nachsehen "
+    fail("Die Einstellung ExtensionSettings (Microsoft Edge > Extensions > Configure extension management "
+         "settings) fehlt im Einstellungskatalog unter den bekannten IDs. Die ID in Intune nachsehen "
          f"und in SETTING_CANDIDATES ({Path(__file__).name}) eintragen.")
 
 
 def setting_ids(definition: dict) -> tuple[str, str, str]:
-    """Einstellung, ihr Wert „Aktiviert“ und die abhängige Liste der Erweiterungen."""
+    """Einstellung, ihr Wert „Aktiviert“ und das abhängige Textfeld mit dem JSON."""
     enabled = next((o for o in definition.get("options", []) if str(o.get("itemId", "")).endswith("_1")), None)
     children = [d.get("dependedOnBy") for d in (enabled or {}).get("dependedOnBy", []) if d.get("dependedOnBy")]
     if not enabled or not children:
-        fail(f"Unerwarteter Aufbau der Einstellung {definition.get('id')}: kein Wert „Aktiviert“ mit Liste.")
-    child = next((c for c in children if c.endswith("desc")), children[0])
+        fail(f"Unerwarteter Aufbau der Einstellung {definition.get('id')}: kein Wert „Aktiviert“ mit Textfeld.")
+    child = next((c for c in children if c.endswith(f"_{SETTINGS_SUFFIX}")), children[0])
     return definition["id"], enabled["itemId"], child
 
 
 def description(managed_by: str) -> str:
-    return (f"Installiert die Edge-Erweiterungen der Seed-Projekte. Gepflegt von {managed_by}; "
-            "Änderungen hier überschreibt der nächste Lauf.")
+    return (f"Installiert die Edge-Erweiterungen der Seed-Projekte; die Benutzer können sie ausschalten. "
+            f"Gepflegt von {managed_by}; Änderungen hier überschreibt der nächste Lauf.")
 
 
 def desired_policy(ids: tuple[str, str, str], entries: list[str], name: str = POLICY_NAME,
                    managed_by: str = MANAGED_BY) -> dict:
-    setting_id, enabled_id, list_id = ids
+    setting_id, enabled_id, text_id = ids
     return {
         "name": name,
         "description": description(managed_by),
@@ -495,12 +511,12 @@ def desired_policy(ids: tuple[str, str, str], entries: list[str], name: str = PO
                     "@odata.type": "#microsoft.graph.deviceManagementConfigurationChoiceSettingValue",
                     "value": enabled_id,
                     "children": [{
-                        "@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingCollectionInstance",
-                        "settingDefinitionId": list_id,
-                        "simpleSettingCollectionValue": [
-                            {"@odata.type": "#microsoft.graph.deviceManagementConfigurationStringSettingValue", "value": entry}
-                            for entry in entries
-                        ],
+                        "@odata.type": "#microsoft.graph.deviceManagementConfigurationSimpleSettingInstance",
+                        "settingDefinitionId": text_id,
+                        "simpleSettingValue": {
+                            "@odata.type": "#microsoft.graph.deviceManagementConfigurationStringSettingValue",
+                            "value": json.dumps(desired_value(entries), sort_keys=True),
+                        },
                     }],
                 },
             },
@@ -508,26 +524,75 @@ def desired_policy(ids: tuple[str, str, str], entries: list[str], name: str = PO
     }
 
 
-def entries_in(settings: list[dict], ids: tuple[str, str, str]) -> tuple[list[str] | None, int]:
-    """Liste der Erweiterungen, wenn die Einstellung aktiviert ist, und die Zahl anderer Einstellungen."""
-    setting_id, enabled_id, list_id = ids
-    entries, others = None, 0
+def is_edge(setting_id: str, suffix: str) -> bool:
+    return setting_id.endswith(suffix) and EDGE_POLICY_MARKER in setting_id
+
+
+def forcelist_entries(instance: dict) -> list[str] | None:
+    """Einträge einer ExtensionInstallForcelist, wenn sie aktiviert ist."""
+    choice = instance.get("choiceSettingValue", {})
+    if not str(choice.get("value", "")).endswith("_1"):
+        return None
+    return [value.get("value") for child in choice.get("children", [])
+            for value in child.get("simpleSettingCollectionValue", [])]
+
+
+@dataclass
+class Current:
+    """Was die Richtlinie heute setzt."""
+    value: object = None  # JSON aus ExtensionSettings; Text, wenn es keins ist; None, wenn nicht aktiviert
+    forcelist: list[str] | None = None  # alte ExtensionInstallForcelist derselben Richtlinie, wenn aktiviert
+    others: int = 0  # weitere Einstellungen
+
+    @property
+    def entries(self) -> list[str] | None:
+        """Was Edge über die Richtlinie installiert, als <id>;<update_url>; None, wenn nichts aktiviert ist."""
+        if self.value is None and self.forcelist is None:
+            return None
+        entries = set(self.forcelist or [])
+        if isinstance(self.value, dict):
+            entries |= {f"{key};{item.get('update_url', '')}" for key, item in self.value.items()
+                        if isinstance(item, dict) and item.get("installation_mode") in INSTALLED_MODES}
+        return sorted(entries)
+
+
+def read_settings(settings: list[dict], ids: tuple[str, str, str]) -> Current:
+    setting_id, enabled_id, text_id = ids
+    current = Current()
     for setting in settings:
         instance = setting.get("settingInstance", {})
-        if instance.get("settingDefinitionId") != setting_id:
-            others += 1
+        definition_id = str(instance.get("settingDefinitionId", ""))
+        if definition_id == setting_id:
+            choice = instance.get("choiceSettingValue", {})
+            if choice.get("value") != enabled_id:
+                continue
+            for child in choice.get("children", []):
+                if child.get("settingDefinitionId") == text_id:
+                    text = child.get("simpleSettingValue", {}).get("value")
+                    try:
+                        current.value = json.loads(text)
+                    except (TypeError, ValueError):
+                        current.value = text
             continue
-        choice = instance.get("choiceSettingValue", {})
-        if choice.get("value") != enabled_id:
-            continue
-        entries = [value.get("value") for child in choice.get("children", []) if child.get("settingDefinitionId") == list_id
-                   for value in child.get("simpleSettingCollectionValue", [])]
-    return entries, others
+        entries = forcelist_entries(instance) if is_edge(definition_id, FORCELIST_SUFFIX) else None
+        if entries is None:
+            current.others += 1
+        else:
+            current.forcelist = entries
+    return current
 
 
-def sets_forcelist(settings: list[dict], setting_id: str) -> bool:
+def sets_extension_settings(settings: list[dict], setting_id: str) -> bool:
     ids = {s.get("settingInstance", {}).get("settingDefinitionId", "") for s in settings}
-    return setting_id in ids or any(i.endswith(FORCELIST_SUFFIX) and EDGE_POLICY_MARKER in i for i in ids)
+    return setting_id in ids or any(is_edge(i, SETTINGS_SUFFIX) for i in ids)
+
+
+def forced_ids(settings: list[dict]) -> set[str]:
+    """IDs, die eine ExtensionInstallForcelist für Edge erzwingt."""
+    instances = [s.get("settingInstance", {}) for s in settings]
+    return {str(entry).split(";", 1)[0] for instance in instances
+            if is_edge(str(instance.get("settingDefinitionId", "")), FORCELIST_SUFFIX)
+            for entry in forcelist_entries(instance) or []}
 
 
 def active_targets(assignments: list[dict]) -> list[dict]:
@@ -597,13 +662,14 @@ def make_plan(state: State, ids: tuple[str, str, str], entries: list[str], name:
               allow_empty: bool = False) -> Plan:
     """Was zu tun ist, als lesbare Schritte; ohne Schritte stimmt alles."""
     plan = Plan()
-    current, other_settings = entries_in(state.settings, ids)
+    current = read_settings(state.settings, ids)
+    installed = current.entries
     if not entries:
         if not allow_empty:
             fail(EMPTY_REGISTRY)
         if state.policy is not None and state.adopted_from is None:
             plan.delete = True
-            plan.removed = list(current or [])
+            plan.removed = list(installed or [])
             plan.steps.append(f"Richtlinie „{name}“ löschen: Edge deinstalliert "
                               f"{extensions_count(len(plan.removed))} daraus")
         return plan
@@ -617,19 +683,34 @@ def make_plan(state: State, ids: tuple[str, str, str], entries: list[str], name:
     if state.adopted_from:
         plan.rename = True
         plan.steps.append(f"Richtlinie „{state.adopted_from}“ übernehmen und in „{name}“ umbenennen")
-    if current != entries or other_settings:
+    if current.value != desired_value(entries) or current.forcelist is not None or current.others:
         plan.replace_settings = True
-        plan.added = [entry for entry in entries if entry not in (current or [])]
-        plan.removed = [entry for entry in (current or []) if entry not in entries]
-        lines = [f"Einstellung ersetzen, danach {extensions_count(len(entries))}"]
-        if current is None:
+        plan.added = [entry for entry in entries if entry not in (installed or [])]
+        plan.removed = [entry for entry in (installed or []) if entry not in entries]
+        lines = [f"Einstellung ersetzen, danach {extensions_count(len(entries))}, ausschaltbar"]
+        if installed is None:
             lines.append("bisher nicht aktiviert")
+        elif current.value is not None and not isinstance(current.value, dict):
+            lines.append("ExtensionSettings enthält bisher kein gültiges JSON-Objekt")
+        if current.forcelist is not None:
+            lines.append("ExtensionInstallForcelist durch ExtensionSettings ersetzen: installierte Erweiterungen "
+                         "bleiben, die Benutzer können sie danach ausschalten")
         lines += [f"+ {entry}" for entry in plan.added]
         lines += [f"- {entry} (Edge deinstalliert sie)" for entry in plan.removed]
-        if current is not None and not plan.added and not plan.removed and current != entries:
-            lines.append("Reihenfolge und doppelte Einträge angleichen")
-        if other_settings:
-            lines.append(f"{other_settings} weitere Einstellungen entfernen")
+        if isinstance(current.value, dict):
+            # Was die Zeilen + und - nicht zeigen: andere Einträge (etwa "*" oder gesperrte IDs) und
+            # Erweiterungen, die bleiben, aber anders eingestellt sind (etwa force_installed).
+            wanted = desired_value(entries)
+            removed_ids = {entry.split(";", 1)[0] for entry in plan.removed}
+            for key, item in sorted(current.value.items()):
+                if key not in wanted and key not in removed_ids:
+                    mode = item.get("installation_mode") if isinstance(item, dict) else item
+                    lines.append(f"- {key} ({mode}) entfernen")
+                elif key in wanted and item != wanted[key] and f"{key};{wanted[key]['update_url']}" in installed:
+                    lines.append(f"~ {key}: bisher {json.dumps(item, sort_keys=True)}, danach "
+                                 f"{json.dumps(wanted[key], sort_keys=True)}")
+        if current.others:
+            lines.append(f"{current.others} weitere Einstellungen entfernen")
         plan.steps.append("\n".join(lines))
     targets = sorted(a.get("target", {}).get("@odata.type", "") for a in state.assignments)
     if targets != [ALL_USERS]:
@@ -638,29 +719,44 @@ def make_plan(state: State, ids: tuple[str, str, str], entries: list[str], name:
     return plan
 
 
-def find_conflicts(graph: Graph, others: list[dict], setting_id: str, adopt: list[str]) -> tuple[list[str], list[str]]:
-    """Andere Richtlinien mit ExtensionInstallForcelist: zugewiesene als Fehler, übrige als Warnung.
+def find_conflicts(graph: Graph, others: list[dict], setting_id: str, adopt: list[str],
+                   extension_ids: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
+    """Andere Richtlinien mit ExtensionSettings: zugewiesene als Fehler, übrige als Warnung.
 
     Zugewiesen heißt: Intune meldet auf den Geräten beider Richtlinien einen Konflikt, und keine
     wirkt; Anwenden hilft dann nicht, die Pipeline hält deshalb an. Ob sich die Zuweisungen
     tatsächlich überschneiden, prüft sie nicht (Gruppen); im Zweifel lieber anhalten. Eine Richtlinie
     ohne Zuweisung wirkt nirgends und ist nur ein Hinweis.
+
+    ExtensionInstallForcelist in anderen Richtlinien ist eine eigene Einstellung und kein Konflikt.
+    Erzwingt eine zugewiesene davon aber eine Erweiterung aus extension_ids, warnt der Plan: Dann
+    lässt sie sich womöglich nicht ausschalten.
     """
     errors, warnings = [], []
     for policy in others:
         if "windows" not in str(policy.get("platforms", "")).lower():
             continue
-        if not sets_forcelist(graph.pages(f"{policy_path(policy)}/settings"), setting_id):
+        settings = graph.pages(f"{policy_path(policy)}/settings")
+        forced = sorted(forced_ids(settings) & extension_ids)
+        conflict = sets_extension_settings(settings, setting_id)
+        if not forced and not conflict:
             continue
         label = f"„{policy.get('name')}“ ({policy['id']})"
+        assigned = bool(active_targets(graph.pages(f"{policy_path(policy)}/assignments")))
+        if forced and assigned:
+            warnings.append(f"Die Intune-Richtlinie {label} erzwingt per ExtensionInstallForcelist {', '.join(forced)}. "
+                            "Dort lassen sich die Erweiterungen womöglich nicht ausschalten; die Einträge aus der "
+                            "Richtlinie entfernen.")
+        if not conflict:
+            continue
         hint = (" Sie steht in adoptPolicies, übernommen wird aber nur, solange es die Richtlinie der Pipeline "
                 "noch nicht gibt." if policy.get("name") in adopt else "")
-        if active_targets(graph.pages(f"{policy_path(policy)}/assignments")):
-            errors.append(f"Die Intune-Richtlinie {label} setzt ebenfalls ExtensionInstallForcelist und ist zugewiesen. "
+        if assigned:
+            errors.append(f"Die Intune-Richtlinie {label} setzt ebenfalls ExtensionSettings und ist zugewiesen. "
                           "Intune meldet dann einen Konflikt, und auf den betroffenen Geräten wirkt keine der beiden. "
                           "Ihre Einträge in die Registerdatei übernehmen und die Richtlinie in Intune löschen." + hint)
         else:
-            warnings.append(f"Die Intune-Richtlinie {label} setzt ebenfalls ExtensionInstallForcelist, ist aber "
+            warnings.append(f"Die Intune-Richtlinie {label} setzt ebenfalls ExtensionSettings, ist aber "
                             "nicht zugewiesen und wirkt deshalb nicht. Am besten in Intune löschen." + hint)
     return errors, warnings
 
@@ -716,7 +812,8 @@ def run_plan(options: Options, graph: Graph) -> int:
     state = read_state(graph, options.name, options.adopt if entries else [])
     plan = make_plan(state, ids, entries, options.name, options.allow_empty)
     print_plan(plan, extensions, options.name)
-    errors, warnings = find_conflicts(graph, state.others, ids[0], options.adopt) if entries else ([], [])
+    extension_ids = frozenset(extension.id for extension in extensions)
+    errors, warnings = find_conflicts(graph, state.others, ids[0], options.adopt, extension_ids) if entries else ([], [])
     for message in warnings:
         warn(message)
     if errors:

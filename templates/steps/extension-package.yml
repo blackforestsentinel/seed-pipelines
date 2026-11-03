@@ -17,7 +17,7 @@
 # Mit sign (extension.signing in web-app.yml, nur in dessen Umgebungen) signiert der Deploy das
 # Paket danach als CRX3 und veröffentlicht es im Container extension des Daten-Storage;
 # Bfs.Seed.Extension liefert es unter /api/extension/updates.xml an verwaltete Geräte aus (Intune,
-# ExtensionInstallForcelist). Das übernimmt scripts/extension/publish.py aus diesem Repo (README,
+# ExtensionSettings). Das übernimmt scripts/extension/publish.py aus diesem Repo (README,
 # Browser-Erweiterung). CRX und release.json kommen als Artefakt extension_release_<env>.
 #
 # Die Artefakte entstehen erst am Ende: Pipeline-Artefakte lassen sich nicht überschreiben, auch

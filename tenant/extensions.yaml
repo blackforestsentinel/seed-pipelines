@@ -1,6 +1,7 @@
 # Edge-Erweiterungen, die Intune auf allen verwalteten Windows-Geräten installiert.
 # Die Pipeline __PIPELINE__ hält die Intune-Richtlinie „__POLICY_TEXT__“ gleich dieser Liste:
 # Ein neuer Eintrag installiert die Erweiterung, ein gelöschter deinstalliert sie überall.
+# Ausschalten können die Benutzer jede Erweiterung selbst, entfernen nicht.
 # Änderungen nur per Pull Request (README).
 #
 # Je Erweiterung ein Eintrag:
