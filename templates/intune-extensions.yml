@@ -1,8 +1,9 @@
 # Sentinel Seed: die eine Intune-Richtlinie für die Edge-Erweiterungen aller Seed-Projekte.
 #
 # Eine Pipeline je Tenant (Repo seed-tenant, Vorlage tenant/ in diesem Repo) bindet das Template
-# per extends ein. Intune erlaubt ExtensionInstallForcelist nur in einer Richtlinie; diese Pipeline
-# besitzt sie ganz und setzt sie auf die Einträge der Registerdatei, zugewiesen an alle Benutzer.
+# per extends ein. Intune erlaubt ExtensionSettings nur in einer Richtlinie; diese Pipeline
+# besitzt sie ganz und setzt sie auf die Einträge der Registerdatei (normal_installed: von den
+# Benutzern ausschaltbar), zugewiesen an alle Benutzer.
 #   plan   Registerdatei prüfen (Format, je Erweiterung updates.xml mit der richtigen ID), dann
 #          scripts/intune/intune.py plan gegen Intune; merkt sich, ob sich etwas ändert
 #   apply  nur bei Änderungen: Deployment-Job im Environment (dort hängt die Freigabe), wendet

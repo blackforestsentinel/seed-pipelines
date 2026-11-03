@@ -2,7 +2,9 @@
 
 Dieses Repo enthält die Registerdatei [`extensions.yaml`](extensions.yaml): alle Edge-Erweiterungen der Seed-Projekte, die Intune auf den verwalteten Windows-Geräten installiert. Die Pipeline `__PIPELINE__` (Template `templates/intune-extensions.yml` aus [seed-pipelines](https://github.com/blackforestsentinel/seed-pipelines), README-Abschnitt „Intune: Edge-Erweiterungen verteilen“) hält die Intune-Richtlinie „__POLICY_TEXT__“ gleich dieser Liste, zugewiesen an alle Benutzer.
 
-Intune erlaubt die Einstellung `ExtensionInstallForcelist` nur in **einer** Richtlinie. Andere Richtlinien mit derselben Einstellung führen zu einem Konflikt, und keine wirkt; der Plan bricht dann ab. Erweiterungen gehören deshalb hierher und nicht in eigene Richtlinien der Projekte.
+Edge installiert die Erweiterungen von selbst; die Benutzer können sie unter `edge://extensions` ausschalten, aber nicht entfernen (`ExtensionSettings` mit `normal_installed`).
+
+Intune erlaubt die Einstellung `ExtensionSettings` nur in **einer** Richtlinie. Andere Richtlinien mit derselben Einstellung führen zu einem Konflikt, und keine wirkt; der Plan bricht dann ab. Erweiterungen gehören deshalb hierher und nicht in eigene Richtlinien der Projekte.
 
 ## Erweiterung aufnehmen
 

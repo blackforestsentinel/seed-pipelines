@@ -1,7 +1,7 @@
 # Sentinel Seed: Edge-Erweiterungen auf die von Intune verwalteten Geräte.
 # Angelegt vom Onboarding (onboarding/Initialize-SeedIntune.ps1 in seed-pipelines). Die eigentliche
 # Pipeline liegt in github.com/blackforestsentinel/seed-pipelines (templates/intune-extensions.yml):
-# Sie hält die Intune-Richtlinie mit ExtensionInstallForcelist gleich der Registerdatei
+# Sie hält die Intune-Richtlinie mit ExtensionSettings gleich der Registerdatei
 # extensions.yaml. Ändert sich etwas, wartet der Lauf auf die Freigabe im Environment
 # __ENVIRONMENT__. Pull Requests prüfen nur die Registerdatei.
 name: intune-$(Date:yyyyMMdd)$(Rev:.r)
