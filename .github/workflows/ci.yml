@@ -26,6 +26,9 @@ jobs:
       - name: Tests der Connector-Prüfung
         shell: pwsh
         run: ./scripts/custom-connector/SeedConnectorCheck.Tests.ps1
+      # Python, das Schritte im Build-Job inline mitbringen (Heredoc im YAML, tests/steps/embedded.py)
+      - name: Tests der Pipeline-Schritte
+        run: python3 -m unittest discover -s tests/steps -p "test_*.py" -v
       # Nur Syntax: Die Skripte selbst brauchen Azure und Azure DevOps.
       - name: PowerShell-Syntax
         shell: pwsh

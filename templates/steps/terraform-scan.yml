@@ -1,0 +1,258 @@
+# Terraform-Sicherheitsscan mit Trivy (trivy config) im Build-Job, auch im PR-Lauf. Läuft nach
+# terraform init -backend=false: Trivy wertet die Module aus .terraform/modules mit aus, damit
+# Werte aus Modul-Outputs bekannt sind, meldet aber nur Befunde in Dateien des Projekts (Wurzel und
+# lokale Module). Heruntergeladene Module, auch die aus seed-terraform, prüft deren eigenes Repo;
+# ihre Befunde könnte ein Projekt weder beheben noch begründet ausnehmen.
+#
+# Trivy kommt wie gitleaks in secret-scan.yml in fester Version, der Download wird per SHA-256
+# geprüft. Die Prüfregeln stecken im Programm (--skip-check-update), ändern sich also nur mit der
+# Version. Einstellungen nur von hier: Projektdateien wie trivy.yaml und .trivyignore sowie
+# TRIVY_*-Variablen wirken nicht. Ausnahmen stehen inline im .tf, mit Begründung in derselben Zeile:
+#   # trivy:ignore:AZU-0011 Altes Lesegerät kann nur TLS 1.0, Ablösung bis Ende 2027
+#   # trivy:ignore:AZU-0011:exp:2027-12-31 dasselbe, ab dem Datum wieder ein Befund
+# Eine Ausnahme ohne Begründung (mindestens zehn Zeichen) oder mit * statt einer Regel ist ein Fehler.
+#
+# Schwere: CRITICAL und HIGH sowie die Regeln aus errorChecks sind Fehler, der Rest Warnungen. Die
+# Regeln aus skipChecks sind aus (Seed-Regelsatz, README: Terraform-Sicherheitsscan).
+parameters:
+  # Ordner mit den .tf-Dateien (infraPath), relativ zum Checkout, nach terraform init
+  - name: workingDirectory
+    type: string
+  - name: version
+    type: string
+    default: '0.76.1'
+  # SHA-256 von trivy_<version>_Linux-64bit.tar.gz laut trivy_<version>_checksums.txt
+  - name: sha256
+    type: string
+    default: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+  # Seed-Regelsatz, aus für alle Projekte: Prüfungen, die der Seed-Architektur widersprechen oder
+  # Kosten- bzw. Compliance-Entscheidungen sind statt Grundsicherung. Die Gründe stehen im Log.
+  - name: skipChecks
+    type: object
+    default:
+      # CRITICAL: Seed betreibt keine VNets. Die Function (Flex Consumption ohne VNet-Integration)
+      # erreicht Storage über den öffentlichen Endpunkt; Schutz über Entra ID ohne Shared Key.
+      # Mit default_action Deny wäre der Storage für die Function gesperrt.
+      - id: AZU-0012
+        reason: Seed betreibt keine VNets; Storage ist nur mit Entra ID erreichbar (ohne Shared Key), Deny sperrte die Function aus.
+      # CRITICAL: wie AZU-0012 für Key Vaults; Key-Vault-Referenzen der Function laufen über den
+      # öffentlichen Endpunkt, Zugriff per RBAC.
+      - id: AZU-0013
+        reason: Seed betreibt keine VNets; Key Vaults sind nur per RBAC erreichbar, network_acls sperrte die Function aus.
+      # MEDIUM: klassische Storage-Analytics-Protokolle (queue_properties.logging), ein veraltetes
+      # Verfahren; Protokolle gehören über Diagnoseeinstellungen nach Log Analytics.
+      - id: AZU-0009
+        reason: Klassische Storage-Analytics-Protokolle sind veraltet; Protokolle laufen über Diagnoseeinstellungen.
+      - id: AZU-0057
+        reason: Klassische Storage-Analytics-Protokolle sind veraltet; Protokolle laufen über Diagnoseeinstellungen.
+      # LOW: Georedundanz ist eine Kostenentscheidung je Projekt; Seed schützt Daten mit Soft
+      # Delete, Versionierung und Löschsperre.
+      - id: AZU-0058
+        reason: Georedundanz ist eine Kostenentscheidung; Seed schützt Daten mit Soft Delete, Versionierung und Löschsperre.
+      # MEDIUM: Azure verschlüsselt immer. Eigene Schlüssel brauchen Key Vault und Rotation und sind
+      # eine Compliance-Vorgabe einzelner Projekte.
+      - id: AZU-0060
+        reason: Azure verschlüsselt immer; kundenseitige Schlüssel sind eine Compliance-Vorgabe, keine Grundsicherung.
+      # MEDIUM: doppelte Verschlüsselung, nur beim Anlegen setzbar; Compliance-Option wie AZU-0060.
+      - id: AZU-0061
+        reason: Doppelte Verschlüsselung ist eine Compliance-Option, keine Grundsicherung.
+      # MEDIUM: App Service Authentication (Easy Auth). Seed prüft Tokens in der API (Bfs.Seed.Auth).
+      - id: AZU-0003
+        reason: Seed prüft Tokens in der API (Bfs.Seed.Auth), nicht per App Service Authentication.
+      # LOW: Client-Zertifikate (mTLS). Seed authentifiziert mit Entra-Tokens.
+      - id: AZU-0001
+        reason: Seed authentifiziert mit Entra-Tokens, nicht mit Client-Zertifikaten.
+      # LOW: content_type an Key-Vault-Secrets ist eine Beschreibung ohne Schutzwirkung.
+      - id: AZU-0015
+        reason: content_type an Secrets ist eine Beschreibung ohne Schutzwirkung.
+      # LOW: Seed erzwingt kein Ablaufdatum für Secrets; Werte setzt ein Mensch außerhalb von
+      # Terraform, ein Ablaufdatum gehört zum Wert.
+      - id: AZU-0017
+        reason: Seed erzwingt kein Ablaufdatum; Werte und Ablauf setzt ein Mensch außerhalb von Terraform.
+
+  # Fehler unabhängig von der Schwere, die Trivy nennt (dort MEDIUM): Klartext-Verbindungen und
+  # endgültiger Datenverlust, wie sie die Seed-Module ausschließen.
+  - name: errorChecks
+    type: object
+    default:
+      # Key Vault ohne Purge-Schutz: Ein gelöschter Vault ginge samt Secrets endgültig verloren.
+      - id: AZU-0016
+        reason: Ohne Purge-Schutz ginge ein gelöschter Key Vault samt Secrets endgültig verloren.
+      # Datenbank ohne erzwungenes TLS bzw. mit TLS unter 1.2
+      - id: AZU-0020
+        reason: Datenbankverbindungen ohne TLS laufen im Klartext.
+      - id: AZU-0026
+        reason: TLS unter 1.2 gilt als unsicher.
+      # App Service mit FTP bzw. HTTP: Code und Tokens im Klartext
+      - id: AZU-0071
+        reason: FTP überträgt Zugangsdaten und Code im Klartext.
+      - id: AZU-0072
+        reason: HTTP überträgt Tokens und Daten im Klartext.
+
+steps:
+  - bash: |
+      set -euo pipefail
+      # Jedes Mal laden und prüfen, ins Temp-Verzeichnis des Jobs, wie gitleaks in secret-scan.yml.
+      dir="$(Agent.TempDirectory)/trivy"
+      rm -rf "$dir"
+      mkdir -p "$dir"
+      archive="$dir/trivy.tar.gz"
+      curl -fsSL -o "$archive" \
+        "https://github.com/aquasecurity/trivy/releases/download/v${{ parameters.version }}/trivy_${{ parameters.version }}_Linux-64bit.tar.gz"
+      echo "${{ parameters.sha256 }}  $archive" | sha256sum --check --quiet
+      tar -xzf "$archive" -C "$dir" trivy
+      # TRIVY_* aus der Umgebung (etwa Pipeline-Variablen) könnten Regeln, Schwere oder Ordner ändern.
+      for name in $(compgen -e | grep '^TRIVY_' || true); do unset "$name"; done
+      # Nur Terraform; Module aus .terraform werden ausgewertet, ihre Befunde aber nicht gemeldet.
+      # Ohne Netz: eingebaute Regeln, keine Versionsabfrage, keine Telemetrie.
+      "$dir/trivy" config . --quiet --format json --output "$dir/report.json" \
+        --misconfig-scanners terraform --tf-exclude-downloaded-modules \
+        --skip-check-update --skip-version-check --disable-telemetry \
+        --config '' --ignorefile '' --cache-dir "$dir/cache"
+      # Auswertung: Ausnahmen im Code prüfen, Befunde nach Seed-Regelsatz und Schwere melden.
+      python3 - "$dir/report.json" . "${{ parameters.workingDirectory }}" <<'PY'
+      # seed-terraform-scan
+      import json, os, re, sys
+      from pathlib import Path
+
+      MIN_REASON = 10
+      ERROR_SEVERITIES = {"CRITICAL", "HIGH"}
+      # Kommentar mit Ausnahme: # trivy:ignore:<regel>[:exp:<datum>] <Begründung>; Trivy liest auch tfsec:ignore.
+      IGNORE = re.compile(r"(?:trivy|tfsec):ignore:(\S*)")
+      COMMENT = re.compile(r"(#|//|/\*)")
+
+      def clean(text):
+          # Text aus dem Repo und aus Trivy nur ohne Steuerzeichen und ##vso[ ins Log (Logging-Befehle).
+          return re.sub(r"[\x00-\x1f\x7f]", " ", str(text)).replace("##vso[", "##vso_[")
+
+      def issue(kind, message, path=None, line=None):
+          props = f"type={kind}"
+          if path:
+              props += f";sourcepath={clean(path).replace(';', ',').replace(']', ')')}"
+          if line:
+              props += f";linenumber={int(line)}"
+          print(f"##vso[task.logissue {props}]{clean(message)}")
+
+      def rule_id(value):
+          # AVD-AZU-0011 (ältere Trivy-Versionen) und AZU-0011 meinen dieselbe Regel.
+          value = str(value or "").strip()
+          return value[4:] if value.upper().startswith("AVD-") else value
+
+      def find_ignores(root):
+          """Ausnahmen in den .tf-Dateien des Projekts: (Datei, Zeile, Regeln, Begründung, Problem)."""
+          found = []
+          for path in sorted(root.rglob("*.tf")):
+              relative = path.relative_to(root)
+              if ".terraform" in relative.parts:
+                  continue
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for number, line in enumerate(text.splitlines(), 1):
+                  token = IGNORE.search(line)
+                  if not token:
+                      continue
+                  marker = None
+                  for candidate in COMMENT.finditer(line, 0, token.start()):
+                      marker = candidate
+                  if marker is None:
+                      continue
+                  comment = line[marker.end():]
+                  rules = [match.group(1).split(":")[0] for match in IGNORE.finditer(comment)]
+                  reason = IGNORE.sub(" ", comment).replace("*/", " ")
+                  reason = re.sub(r"\s+", " ", reason).strip(" -–—:;,.")
+                  problem = None
+                  if any(rule in ("", "*") for rule in rules):
+                      problem = "nennt keine einzelne Regel (* oder leer)"
+                  elif len(reason) < MIN_REASON:
+                      problem = "ohne Begründung"
+                  found.append((relative.as_posix(), number, rules, reason, problem))
+          return found
+
+      def evaluate(report, skip, raise_):
+          """Befunde aus dem Bericht: (schwere, regel, Datei, Zeile, Text) und Zahlen."""
+          findings, seen = [], set()
+          counts = {"passed": 0, "skipped": 0, "modules": 0}
+          for result in report.get("Results") or []:
+              target = str(result.get("Target") or "")
+              summary = result.get("MisconfSummary") or {}
+              counts["passed"] += int(summary.get("Successes") or 0)
+              # Heruntergeladene Module (git::…, Registry, .terraform/…); --tf-exclude-downloaded-modules
+              # lässt sie schon weg, das hier ist die zweite Sicherung.
+              module = "::" in target or "/.terraform/" in "/" + target
+              for item in result.get("Misconfigurations") or []:
+                  if item.get("Status") != "FAIL":
+                      continue
+                  rule = rule_id(item.get("ID"))
+                  if module:
+                      counts["modules"] += 1
+                      continue
+                  if rule in skip:
+                      counts["skipped"] += 1
+                      continue
+                  cause = item.get("CauseMetadata") or {}
+                  line = cause.get("StartLine") or 0
+                  key = (rule, target, line)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  severity = str(item.get("Severity") or "UNKNOWN").upper()
+                  kind = "error" if severity in ERROR_SEVERITIES or rule in raise_ else "warning"
+                  text = f"{rule} ({severity}) {cause.get('Resource') or ''}: {item.get('Message') or item.get('Title') or ''}"
+                  if item.get("Resolution"):
+                      text += f" Lösung: {str(item['Resolution']).strip().rstrip('.')}."
+                  if rule in raise_ and severity not in ERROR_SEVERITIES:
+                      text += f" Seed: {raise_[rule]}"
+                  if item.get("PrimaryURL"):
+                      text += f" {item['PrimaryURL']}"
+                  findings.append((kind, rule, target, line, text))
+          return findings, counts
+
+      def main(report_file, root, prefix):
+          root = Path(root)
+          prefix = prefix.strip("/")
+          skip = {rule_id(c["id"]): c.get("reason", "") for c in json.loads(os.environ.get("SEED_TRIVY_SKIP") or "[]")}
+          raise_ = {rule_id(c["id"]): c.get("reason", "") for c in json.loads(os.environ.get("SEED_TRIVY_ERRORS") or "[]")}
+
+          def source(path):
+              # Pfad für Annotationen relativ zum Checkout
+              return f"{prefix}/{path}" if prefix and prefix != "." else path
+
+          errors = 0
+
+          ignores = find_ignores(root)
+          valid = [i for i in ignores if not i[4]]
+          if valid:
+              print(f"Ausnahmen im Code ({len(valid)}):")
+              for path, line, rules, reason, _ in valid:
+                  print(clean(f"  {source(path)}:{line} {', '.join(rules)}: {reason}"))
+          for path, line, rules, reason, problem in ignores:
+              if problem:
+                  errors += 1
+                  issue("error", f"Ausnahme {', '.join(r or '?' for r in rules)} {problem}. Regel-ID und Begründung in dieselbe Zeile, z. B. # trivy:ignore:AZU-0011 Altes Lesegerät kann nur TLS 1.0", source(path), line)
+          for name in (".trivyignore", ".trivyignore.yaml", "trivy.yaml"):
+              if (root / name).exists():
+                  issue("warning", f"{source(name)} wirkt nicht: Der Seed-Scan nimmt Ausnahmen nur inline im .tf an (# trivy:ignore:<Regel> <Begründung>).", source(name))
+
+          report = json.load(open(report_file, encoding="utf-8"))
+          findings, counts = evaluate(report, skip, raise_)
+          for kind, rule, path, line, text in sorted(findings, key=lambda f: (f[0] != "error", f[2], f[3])):
+              issue(kind, text, source(path), line)
+          failed = sum(1 for f in findings if f[0] == "error")
+          warned = len(findings) - failed
+          errors += failed
+          print(f"Terraform-Sicherheitsscan: {counts['passed']} Prüfungen bestanden, {failed} Fehler, {warned} Warnungen, "
+                f"{counts['skipped']} Befunde vom Seed-Regelsatz ausgeblendet ({', '.join(sorted(skip)) or 'keine'}).")
+          if counts["modules"]:
+              print(f"{counts['modules']} Befunde in heruntergeladenen Modulen nicht gemeldet; die prüft deren Repo.")
+          if errors:
+              issue("error", "Terraform-Sicherheitsscan: Fehlkonfiguration beheben oder als begründete Ausnahme direkt darüber kennzeichnen: # trivy:ignore:<Regel> <Begründung> (README von seed-pipelines, Terraform-Sicherheitsscan).")
+          return 1 if errors else 0
+
+      if __name__ == "__main__":
+          sys.exit(main(*sys.argv[1:4]))
+      PY
+    displayName: Terraform-Sicherheitsscan (Trivy ${{ parameters.version }})
+    workingDirectory: ${{ parameters.workingDirectory }}
+    env:
+      SEED_TRIVY_SKIP: ${{ convertToJson(parameters.skipChecks) }}
+      SEED_TRIVY_ERRORS: ${{ convertToJson(parameters.errorChecks) }}

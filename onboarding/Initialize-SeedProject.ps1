@@ -15,10 +15,15 @@
       2. Pipeline-Definition für die YAML-Datei, ohne sie zu starten
       3. Berechtigungen der Pipeline für die Environments, die Azure-Service-Connection und
          die GitHub-Service-Connection
-      4. Nur mit -EnableBranchPolicy: Branch-Policy für die PR-Validierung
-      5. Nur mit -EnableBranchPolicy: Branch-Prüfung an der Azure-Service-Connection, nur Läufe
-         von -AllowedBranches (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs
-         (Standard refs/tags/v*) bekommen die Deployment-Identität
+      4. Branch-Policy für die PR-Validierung und Pflicht-Reviewer auf dem Default-Branch
+      5. Branch-Prüfung an der Azure-Service-Connection, nur Läufe von -AllowedBranches
+         (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs (Standard
+         refs/tags/v*) bekommen die Deployment-Identität
+         4 und 5 (Branch-Schutz) setzt das Skript standardmäßig, sobald die YAML-Datei auf dem
+         Default-Branch web-app.yml ab v0.5.0 einbindet, also nach dem Umschalten. Vorher sperrten
+         sie direkte Pushes und Testläufe der Migration; dann übergeht das Skript sie mit einem
+         Hinweis, und ein erneuter Lauf nach dem Umschalten holt sie nach. -SkipBranchPolicy lässt
+         sie ausdrücklich weg, -EnableBranchPolicy verlangt sie.
       6. Tags im Repo nur für Administratoren: Deny "Create tag" für Contributors, Build
          Administrators und die Build-Service-Identitäten, weil die Branch-Prüfung refs/tags/v*
          auch für das Projekt-Repo durchlässt (nicht mit -SkipBranchControl oder -AllowTagCreation)
@@ -72,15 +77,22 @@
     oder der Pool automatisch in jedes neue Projekt kommt (README, Eigene Agents).
 
 .PARAMETER EnableBranchPolicy
-    Branch-Policy für die PR-Validierung setzen. Erst nach dem Umschalten: Die Policy ist
-    Pflicht und sperrt direkte Pushes. Vorher prüft das Skript, dass die YAML-Datei auf dem
-    Default-Branch web-app.yml aus seed-pipelines ab v0.5.0 einbindet; mit der alten Datei
-    oder einer älteren Version würden PR-Läufe deployen.
+    Branch-Schutz (Schritte 4 und 5) verlangen. Bindet die YAML-Datei auf dem Default-Branch
+    web-app.yml aus seed-pipelines noch nicht ab v0.5.0 ein, fehlt die Branch-Policy, und das
+    Skript endet außerhalb des DryRuns mit Exit-Code 1; mit der alten Datei oder einer älteren
+    Version würden PR-Läufe deployen. Ohne den Schalter setzt das Skript den Branch-Schutz nach
+    dem Umschalten ebenso, übergeht ihn vorher aber ohne Fehler.
+
+.PARAMETER SkipBranchPolicy
+    Branch-Schutz (Schritte 4 und 5) weglassen, auch nach dem Umschalten, etwa solange ein
+    Projekt noch direkt auf den Default-Branch pushen muss. Nur ausdrücklich: Ohne Policy kommt
+    jede Änderung ungeprüft auf den Default-Branch, ohne Branch-Prüfung jede Pipeline-Datei an die
+    Service Connection. Vorhandene Policies und Prüfungen bleiben, wie sie sind.
 
 .PARAMETER MinReviewers
-    Nur mit -EnableBranchPolicy: Pull Requests brauchen so viele Zustimmungen anderer Personen,
-    die eigene Stimme zählt nicht. Standard 1, weil die Stage Plan die Service Connection vor
-    jeder Freigabe nutzt; 0: keine Pflicht.
+    Mit dem Branch-Schutz: Pull Requests brauchen so viele Zustimmungen anderer Personen, die
+    eigene Stimme zählt nicht. Standard 1, weil die Stage Plan die Service Connection vor jeder
+    Freigabe nutzt; 0: keine Pflicht.
 
 .PARAMETER SkipBranchControl
     Branch-Prüfung an der Service Connection nicht anfassen, etwa weil sie zentral an einer
@@ -88,9 +100,9 @@
 
 .PARAMETER AllowedBranches
     Branches, deren Läufe die Azure-Service-Connection nutzen dürfen (Check „Branch control“),
-    Standard der Default-Branch. Gesetzt wird die Prüfung erst mit -EnableBranchPolicy: Bis zum
-    Umschalten testet die Migration auf einem eigenen Branch. Gilt für alle Pipelines, die diese
-    Service Connection nutzen. Muster wie refs/heads/release/* sind erlaubt.
+    Standard der Default-Branch. Gesetzt wird die Prüfung mit dem Branch-Schutz erst nach dem
+    Umschalten: Bis dahin testet die Migration auf einem eigenen Branch. Gilt für alle Pipelines,
+    die diese Service Connection nutzen. Muster wie refs/heads/release/* sind erlaubt.
 
 .PARAMETER TemplateRefs
     Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*.
@@ -129,6 +141,7 @@ param(
     [string] $DefaultBranch = 'main',
     [string] $Pool = '',
     [switch] $EnableBranchPolicy,
+    [switch] $SkipBranchPolicy,
     [ValidateRange(0, 10)] [int] $MinReviewers = 1,
     [switch] $SkipBranchControl,
     [string[]] $AllowedBranches = @(),
@@ -157,6 +170,7 @@ if ($SeedProjectName -cnotmatch '^[a-z][a-z0-9-]{1,18}[a-z0-9]$') {
     throw 'SeedProjectName: 3-20 Zeichen, Kleinbuchstaben, Ziffern und Bindestriche, beginnt mit einem Buchstaben.'
 }
 if (-not $Environments) { throw 'Environments: mindestens eine Umgebung.' }
+if ($EnableBranchPolicy -and $SkipBranchPolicy) { throw '-EnableBranchPolicy und -SkipBranchPolicy schließen sich aus.' }
 # ado-project übergeht unbekannte Umgebungen; hier wäre das meist ein Tippfehler und die Freigabe fehlte.
 $unknown = $AppApprovalEnvironments | Where-Object { $_ -notin $Environments }
 if ($unknown) { throw "AppApprovalEnvironments: $($unknown -join ', ') steht nicht in Environments." }
@@ -422,6 +436,11 @@ try {
         (Invoke-AzDevOps get "$api/git/repositories/$($repo.id)/items?path=$([uri]::EscapeDataString($YamlPath))&versionDescriptor.version=$([uri]::EscapeDataString($DefaultBranch))&versionDescriptor.versionType=branch&includeContent=true&`$format=json&api-version=7.1").content
     }
     $seedYamlProblem = Test-SeedYaml $yaml
+    # Branch-Schutz (Schritte 4 und 5) als Standard, sobald umgestellt ist: Dann laufen PR-Läufe
+    # ohne Deploy, und Änderungen sollen ohnehin per PR kommen. Vorher sperrte er die Migration.
+    $protectBranch = -not $SkipBranchPolicy -and ($EnableBranchPolicy -or -not $seedYamlProblem)
+    $protectSkipped = if ($SkipBranchPolicy) { 'entfällt (-SkipBranchPolicy)' }
+        else { "entfällt bis zum Umschalten von $DefaultBranch ($seedYamlProblem); ein erneuter Lauf danach setzt sie" }
     if (-not $yaml) {
         Write-Host "          $YamlPath fehlt auf ${DefaultBranch}: Die Pipeline läuft dort erst nach dem Merge."
     } elseif ($seedYamlProblem) {
@@ -495,7 +514,7 @@ try {
 
     # --- 4. Branch-Policy -------------------------------------------------------------------
     # Pull Requests brauchen einen erfolgreichen PR-Lauf der Pipeline. Als Pflicht-Policy sperrt
-    # sie direkte Pushes; deshalb erst nach dem Umschalten und nur mit -EnableBranchPolicy.
+    # sie direkte Pushes; deshalb erst nach dem Umschalten ($protectBranch).
     Write-Host '4. Branch-Policy PR-Validierung'
     $policyTitle = "PR-Validierung auf $DefaultBranch (Pipeline $PipelineName)"
     $policy = if ($definition) {
@@ -506,9 +525,10 @@ try {
     }
     if ($policy) {
         Write-Host "  [ok]    $policyTitle"
-    } elseif (-not $EnableBranchPolicy) {
-        Write-Host "          entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
+    } elseif (-not $protectBranch) {
+        Write-Host "          $policyTitle $protectSkipped"
     } elseif ($seedYamlProblem) {
+        # Nur mit -EnableBranchPolicy
         Write-Missing $policyTitle "$YamlPath auf ${DefaultBranch}: $seedYamlProblem. Mit dieser Datei würden PR-Läufe deployen."
     } else {
         Invoke-Step $policyTitle { $null } {
@@ -535,8 +555,8 @@ try {
     # könnte eine Person ihre eigene Pipeline-Änderung mergen. Wie ado-project (min_reviewers).
     if ($MinReviewers -gt 0) {
         $reviewTitle = "Mindestens $MinReviewers Reviewer auf $DefaultBranch"
-        if (-not $EnableBranchPolicy) {
-            Write-Host "          $reviewTitle entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
+        if (-not $protectBranch) {
+            Write-Host "          $reviewTitle $protectSkipped"
         } else {
             Invoke-Step $reviewTitle {
                 (Invoke-AzDevOps get "$api/policy/configurations?policyType=$MinReviewersPolicyType&api-version=7.1").value | Where-Object {
@@ -565,13 +585,16 @@ try {
     # Freigaben hängen an den Environments. Eine geänderte Pipeline-Datei auf einem Feature-Branch,
     # die die Service Connection direkt nutzt, hielten sie nicht auf; die Branch-Prüfung schon.
     # Wie die Branch-Policy erst nach dem Umschalten, weil die Migration vorher auf einem Branch
-    # testet. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert.
+    # testet. Eine vorhandene Prüfung mit anderen Branches wird nur auf Wunsch aktualisiert
+    # (-EnableBranchPolicy, -AllowedBranches, -TemplateRefs): Seit der Branch-Schutz Standard ist,
+    # soll ein erneuter Lauf, etwa für eine weitere Umgebung, keine bewusst erweiterte Liste kürzen.
     Write-Host '5. Branch-Prüfung an der Azure-Service-Connection'
+    $updateBranches = $EnableBranchPolicy -or $PSBoundParameters.ContainsKey('AllowedBranches') -or $PSBoundParameters.ContainsKey('TemplateRefs')
     $branchTitle = "Branch-Prüfung an ${ServiceConnectionName}: $AllowedBranchRefs"
     if ($SkipBranchControl) {
         Write-Host '          entfällt (-SkipBranchControl): Sie hängt zentral an der Service Connection.'
-    } elseif (-not $EnableBranchPolicy) {
-        Write-Host "          entfällt: erst nach dem Umschalten von $DefaultBranch, mit -EnableBranchPolicy"
+    } elseif (-not $protectBranch) {
+        Write-Host "          $protectSkipped"
     } elseif (-not $azure) {
         Write-Missing $branchTitle 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.'
     } else {
@@ -590,7 +613,10 @@ try {
             timeout  = 1440
         }
         if ($existing -and $existing.settings.inputs.allowedBranches -ne $AllowedBranchRefs) {
-            if ($DryRun) {
+            if (-not $updateBranches) {
+                Write-Host "  [ok]    Branch-Prüfung an ${ServiceConnectionName}: $($existing.settings.inputs.allowedBranches)"
+                Write-Host "          bleibt; ändern mit -AllowedBranches, -TemplateRefs oder -EnableBranchPolicy (Standard $AllowedBranchRefs)"
+            } elseif ($DryRun) {
                 Write-Host "  [alt]   $branchTitle (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Yellow
                 $missing.Add($branchTitle)
             } else {

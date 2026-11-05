@@ -1,6 +1,6 @@
-# Vorschau-Beispiel: Prüflauf wie im PR (validationOnly). Erwartet: Secret-Scan, Build und Tests,
-# die eigenen Schritte (Anmeldung am Feed vor dotnet restore), aber weder Artefakte noch Plan,
-# Apply oder Deploy. Ohne Service Connection.
+# Vorschau-Beispiel: Prüflauf wie im PR (validationOnly). Erwartet: Secret-Scan, Hinweis auf
+# veraltetes Seed, Terraform-Sicherheitsscan, Build und Tests, die eigenen Schritte (Anmeldung am
+# Feed vor dotnet restore), aber weder Artefakte noch Plan, Apply oder Deploy. Ohne Service Connection.
 # Platzhalter: __GITHUB_CONNECTION__.
 trigger: none
 pr: none

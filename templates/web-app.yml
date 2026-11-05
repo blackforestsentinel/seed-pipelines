@@ -189,6 +189,11 @@ stages:
             vmImage: ${{ parameters.vmImage }}
           ${{ else }}:
             name: ${{ parameters.pool }}
+        # Ref und Name der Repository-Ressource seed für steps/seed-versions.yml; in Schritten nur
+        # über einen Laufzeitausdruck lesbar.
+        variables:
+          seedPipelinesRef: $[ resources.repositories.seed.ref ]
+          seedPipelinesRepository: $[ resources.repositories.seed.name ]
         steps:
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
@@ -219,6 +224,10 @@ stages:
                 exit 1
               fi
             displayName: project.yaml abgleichen
+          # Warnung, wenn Template-Ref, Modul-Refs oder Seed-Pakete hinter dem neuesten Release liegen
+          - template: steps/seed-versions.yml
+            parameters:
+              infraPath: ${{ parameters.infraPath }}
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
@@ -235,6 +244,10 @@ stages:
               terraform validate
             displayName: terraform fmt und validate
             workingDirectory: ${{ parameters.infraPath }}
+          # Fehlkonfigurationen in den .tf-Dateien des Projekts, nach init (Module unter .terraform)
+          - template: steps/terraform-scan.yml
+            parameters:
+              workingDirectory: ${{ parameters.infraPath }}
 
           # Das .NET SDK des Images genügt, wenn es zu global.json passt (sonst scheitert
           # dotnet --version); dann entfällt der Download durch UseDotNet.
