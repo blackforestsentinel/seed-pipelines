@@ -102,6 +102,15 @@ parameters:
     type: stepList
     default: []
 
+  # Warnungen brechen den Build der API (dotnet build und dotnet publish mit -warnaserror), auch im
+  # PR-Lauf: die des Compilers, zu Nullable, der Analyzer und von MSBuild-Tasks wie Bfs.Seed.OpenApi.
+  # Ausnahmen gehören sichtbar ins Projekt: NoWarn, WarningsNotAsErrors, .editorconfig oder
+  # [SuppressMessage(..., Justification = "...")]. Warnungen von NuGet, die vom Netz abhängen oder
+  # Lücken melden, bleiben Warnungen (README, Prüfungen im Build).
+  - name: treatWarningsAsErrors
+    type: boolean
+    default: true
+
   # Löschen von Daten bestätigen. Ein Plan, der Ressourcen aus protectedResourceTypes löscht
   # oder ersetzt, bricht sonst ab. Projekte reichen dafür einen Laufzeitparameter durch
   # (azure-pipelines.yml aus seed-template); bestätigt wird also nur in einem bewusst von Hand
@@ -147,7 +156,7 @@ parameters:
     default: ubuntu-24.04
 
   # Eigener Agent-Pool statt Microsoft-gehosteter Agents, z. B. Default. Linux-Agents mit bash,
-  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents).
+  # curl, unzip, tar, git, python3 mit PyYAML und Azure CLI (README, Eigene Agents).
   - name: pool
     type: string
     default: ''
@@ -195,13 +204,25 @@ stages:
           seedPipelinesRef: $[ resources.repositories.seed.ref ]
           seedPipelinesRepository: $[ resources.repositories.seed.name ]
         steps:
+          # Mit dem zweiten Checkout (seed-pipelines, Skripte der Prüfungen in steps/dotnet-checks.yml)
+          # käme das Projekt sonst nach s/<repo>; path: s hält es in $(Build.SourcesDirectory), dem
+          # Arbeitsverzeichnis aller Schritte. Die Repository-Ressource heißt in allen Seed-Projekten
+          # seed und hat die ref der Templates, also passt das Skript zum Template.
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
               - checkout: self
+                path: s
                 fetchDepth: 0
+              - checkout: seed
+                path: seed
+                fetchDepth: 1
               - template: steps/secret-scan.yml
           - ${{ else }}:
               - checkout: self
+                path: s
+              - checkout: seed
+                path: seed
+                fetchDepth: 1
 
           - bash: |
               set -euo pipefail
@@ -281,7 +302,19 @@ stages:
               fi
               exit "$code"
             displayName: dotnet restore
-          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore
+          # TODO(onboarding) in project.yaml, Formatierung, Pakete (Vorabversionen, Lücken, veraltete);
+          # vor dem Build, weil schnell und ohne Build möglich.
+          - template: steps/dotnet-checks.yml
+            parameters:
+              solution: ${{ parameters.apiSolution }}
+          # Eigener Build, weil dotnet test (Microsoft.Testing.Platform) -warnaserror an die Tests gäbe
+          # statt an MSBuild. Welche Warnungen trotzdem Warnungen bleiben und warum: README, Prüfungen
+          # im Build; dotnet publish nutzt dieselbe Liste.
+          - script: >-
+              dotnet build ${{ parameters.apiSolution }} --configuration Release --no-restore
+              ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
+            displayName: dotnet build
+          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-build
             displayName: dotnet test
           - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
               - script: >
@@ -291,6 +324,7 @@ stages:
                   --output $(Build.ArtifactStagingDirectory)/api
                   -p:InformationalVersion=$(Build.BuildNumber)
                   -p:SeedOpenApiPublishDir=$(Build.ArtifactStagingDirectory)/openapi
+                  ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
                 displayName: dotnet publish
               - task: ArchiveFiles@2
                 displayName: Paket packen
