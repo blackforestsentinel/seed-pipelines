@@ -1,0 +1,136 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Bestellungen",
+    "description": "Testdaten: bisherige Definition des Connectors.",
+    "version": "1.0.0"
+  },
+  "host": "api.example.org",
+  "basePath": "/api",
+  "schemes": ["https"],
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "ListOrders",
+        "parameters": [
+          { "name": "state", "in": "query", "required": false, "type": "string", "enum": ["Open", "Shipped", "Cancelled"] },
+          { "name": "top", "in": "query", "required": false, "type": "integer", "format": "int32" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/OrderPage" } }
+        }
+      },
+      "post": {
+        "operationId": "CreateOrder",
+        "parameters": [
+          { "name": "body", "in": "body", "required": true, "schema": { "$ref": "#/definitions/CreateOrderRequest" } }
+        ],
+        "responses": {
+          "201": { "description": "Created", "schema": { "$ref": "#/definitions/Order" } },
+          "400": { "description": "Eingabe ungültig" }
+        }
+      }
+    },
+    "/orders/{id}": {
+      "parameters": [
+        { "name": "id", "in": "path", "required": true, "type": "string" }
+      ],
+      "get": {
+        "operationId": "GetOrder",
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Order" } },
+          "404": { "description": "Not Found" }
+        }
+      }
+    },
+    "/orders/{id}/cancel": {
+      "post": {
+        "operationId": "CancelOrder",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "No Content" } }
+      }
+    },
+    "/orders/{id}/archive": {
+      "post": {
+        "operationId": "ArchiveOrder",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "No Content" } }
+      }
+    },
+    "/customers": {
+      "get": {
+        "operationId": "ListCustomers",
+        "responses": {
+          "200": { "description": "OK", "schema": { "type": "array", "items": { "$ref": "#/definitions/Customer" } } }
+        }
+      }
+    },
+    "/reports/legacy": {
+      "get": {
+        "operationId": "GetLegacyReport",
+        "responses": { "200": { "description": "OK", "schema": { "type": "string" } } }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "GetHealth",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "object", "properties": { "status": { "type": "string" }, "version": { "type": "string" } } }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "OrderPage": {
+      "type": "object",
+      "properties": {
+        "value": { "type": "array", "items": { "$ref": "#/definitions/Order" } },
+        "nextLink": { "type": "string" }
+      }
+    },
+    "Order": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "state": { "type": "string", "enum": ["Open", "Shipped", "Cancelled"] },
+        "customer": { "$ref": "#/definitions/Customer" },
+        "lines": { "type": "array", "items": { "$ref": "#/definitions/OrderLine" } },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "at": { "type": "string", "format": "date-time" }, "note": { "type": "string" } }
+          }
+        }
+      },
+      "required": ["id", "state"]
+    },
+    "Customer": {
+      "type": "object",
+      "properties": { "name": { "type": "string" }, "email": { "type": "string" } }
+    },
+    "OrderLine": {
+      "type": "object",
+      "properties": { "sku": { "type": "string" }, "quantity": { "type": "integer", "format": "int32" } },
+      "required": ["sku", "quantity"]
+    },
+    "CreateOrderRequest": {
+      "type": "object",
+      "properties": {
+        "customer": { "type": "string" },
+        "channel": { "type": "string", "enum": ["Web", "Phone", "Mail"] },
+        "priority": { "type": "integer", "format": "int32" },
+        "note": { "type": "string" },
+        "lines": { "type": "array", "items": { "$ref": "#/definitions/OrderLine" } }
+      },
+      "required": ["customer"]
+    }
+  }
+}

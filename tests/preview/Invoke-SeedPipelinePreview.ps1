@@ -15,9 +15,10 @@
 
     Das Ergebnis landet neben der YAML-Datei als <name>.final.yml. Mit -ExpectBuildSteps prüft
     das Skript, dass diese Schritte (displayName) im Job build in genau dieser Reihenfolge
-    vorkommen, mit -AbsentBuildSteps, dass sie dort fehlen; -ExpectDeploySteps und
-    -AbsentDeploySteps prüfen ebenso die erste Stage deploy_<umgebung>. Bei Abweichungen endet es
-    mit Fehler.
+    vorkommen, mit -AbsentBuildSteps, dass sie dort fehlen; -ExpectPlanSteps und -AbsentPlanSteps
+    prüfen ebenso die erste Stage plan_<umgebung> (alle Jobs, etwa connector_check),
+    -ExpectDeploySteps und -AbsentDeploySteps die erste Stage deploy_<umgebung>. Bei Abweichungen
+    endet es mit Fehler.
 
     Ausführen mit einem az-Login, der die Pipeline lesen darf. Mit -FinalYamlPath prüft das Skript
     stattdessen ein schon gespeichertes <name>.final.yml, ohne Azure DevOps.
@@ -60,6 +61,8 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Saved')] [string] $FinalYamlPath,
     [string[]] $ExpectBuildSteps = @(),
     [string[]] $AbsentBuildSteps = @(),
+    [string[]] $ExpectPlanSteps = @(),
+    [string[]] $AbsentPlanSteps = @(),
     [string[]] $ExpectDeploySteps = @(),
     [string[]] $AbsentDeploySteps = @()
 )
@@ -151,6 +154,14 @@ $steps | ForEach-Object { Write-Host "  - $_" }
 Test-Steps 'Build' $steps $ExpectBuildSteps $AbsentBuildSteps $errors
 
 # Erste Umgebung; PR-Läufe und validationOnly haben keine.
+$planSteps = Get-StageSteps $lines 'plan_\S+'
+if ($null -ne $planSteps) {
+    Write-Host "Schritte im ersten Plan ($($planSteps.Count)):"
+    $planSteps | ForEach-Object { Write-Host "  - $_" }
+    Test-Steps 'Plan' $planSteps $ExpectPlanSteps $AbsentPlanSteps $errors
+} elseif ($ExpectPlanSteps.Count) {
+    $errors.Add('Keine Stage plan_<umgebung> im aufgelösten YAML.')
+}
 $deploySteps = Get-StageSteps $lines 'deploy_\S+'
 if ($null -ne $deploySteps) {
     Write-Host "Schritte im ersten Deploy ($($deploySteps.Count)):"
@@ -166,6 +177,6 @@ if ($errors.Count) {
     $errors | ForEach-Object { Write-Host "  [fehler] $_" -ForegroundColor Red }
     throw "$($errors.Count) Abweichungen in der Vorschau."
 }
-if ($ExpectBuildSteps.Count -or $AbsentBuildSteps.Count -or $ExpectDeploySteps.Count -or $AbsentDeploySteps.Count) {
+if ($ExpectBuildSteps.Count -or $AbsentBuildSteps.Count -or $ExpectPlanSteps.Count -or $AbsentPlanSteps.Count -or $ExpectDeploySteps.Count -or $AbsentDeploySteps.Count) {
     Write-Host 'Reihenfolge und fehlende Schritte wie erwartet.' -ForegroundColor Green
 }
