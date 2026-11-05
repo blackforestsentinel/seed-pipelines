@@ -292,9 +292,12 @@ stages:
           # Fehlt die Anmeldung an einem privaten Feed, wiederholt dotnet restore die Anfrage mit
           # NU1301 (401) ohne Ende, und der Job stünde bis zu seinem Timeout. Sonst dauert der
           # Restore keine Minute.
+          # Ohne NuGetAudit: Über Lücken entscheidet allein „NuGet-Pakete prüfen“ (Schwere und
+          # build.ignoreAdvisories). Setzt ein Projekt selbst TreatWarningsAsErrors, machte NuGet die
+          # Audit-Warnungen NU1901–NU1904 sonst schon hier zu Fehlern, ohne Rücksicht auf die Ausnahmen.
           - bash: |
               set -uo pipefail
-              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }}
+              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }} -p:NuGetAudit=false
               code=$?
               # 124: timeout, 137: nach weiteren 30 s hart beendet
               if [ "$code" = 124 ] || [ "$code" = 137 ]; then

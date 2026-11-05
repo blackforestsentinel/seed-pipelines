@@ -270,7 +270,7 @@ Diese Warnungen bleiben auch mit `-warnaserror` Warnungen (`-warnNotAsError`):
 
 | Code | Warum keine Fehler |
 | --- | --- |
-| `NU1901` bis `NU1904` | Lücken; die prüft „NuGet-Pakete prüfen“ nach Schwere und mit den Ausnahmen aus `project.yaml` |
+| `NU1901` bis `NU1904` | Lücken; die prüft „NuGet-Pakete prüfen“ nach Schwere und mit den Ausnahmen aus `project.yaml`. Der Schritt `dotnet restore` läuft deshalb mit `-p:NuGetAudit=false`: Setzt ein Projekt selbst `TreatWarningsAsErrors`, brächen die Lücken sonst schon den Restore, ohne Rücksicht auf die Ausnahmen |
 | `NU1603`, `NU1801`, `NU1900`, `NU1905` | hängen vom Zustand der Feeds und des Netzes ab (Version fehlt im Feed, Quelle oder Daten zu Lücken nicht erreichbar) und würden Builds zufällig brechen |
 | `NU1608` | Paket außerhalb der Versionsgrenze einer Abhängigkeit; entsteht oft gerade dann, wenn ein Projekt ein transitives Paket wegen einer Lücke selbst anhebt |
 | `MSB3026` | Kopieren wird wiederholt, eine vorübergehende Sperre |
