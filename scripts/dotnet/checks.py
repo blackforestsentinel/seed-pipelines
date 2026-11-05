@@ -7,7 +7,7 @@
               build.prereleasePackages
             - bekannte Lücken, auch in transitiven Paketen: High und Critical sind Fehler, außer die
               Advisory steht mit reason in build.ignoreAdvisories; Low und Moderate sind Warnungen
-            - veraltete direkte Referenzen: Warnung
+            - veraltete direkte Referenzen: Warnung; Bfs.Seed.* meldet steps/seed-versions.yml
   format    dotnet format whitespace --verify-no-changes auf der Solution
 
 Läuft im Checkout des Projekts. Werte aus dem Repo und Ausgaben von dotnet kommen nur bereinigt ins
@@ -42,6 +42,8 @@ from typing import Callable, Iterator
 # dotnet list package meldet dann still keine. Abgefragt wird nur die Liste der Lücken, kein Paket.
 NUGET_ORG = "https://api.nuget.org/v3/index.json"
 TODO_MARKER = re.compile(r"TODO\(onboarding\)", re.IGNORECASE)
+# Pakete von Seed selbst; zurückliegende Versionen meldet steps/seed-versions.yml, nicht diese Prüfung.
+SEED_PACKAGE_PREFIX = "bfs.seed."
 SEVERITY_ERROR = ("high", "critical")
 SEVERITY_WARNING = ("low", "moderate")
 # dotnet list package wiederholt Anfragen an einen Feed ohne Anmeldung (401) wie dotnet restore
@@ -350,8 +352,13 @@ def check_todos(path: str, log: Log) -> None:
 
 def list_packages(dotnet: str, solution: str, options: list[str], label: str, runner: Runner, log: Log) -> dict | None:
     """dotnet list package mit --format json; bei Netz- oder Werkzeugfehlern eine Warnung und None."""
-    args = [dotnet, "list", solution, "package", *options, "--format", "json"]
+    # Ab .NET 10 stellt dotnet list package vorher selbst wieder her. Geprüft wird aber, was der Schritt
+    # dotnet restore aufgelöst hat; ein zweiter Restore kostet nur Zeit und Netz.
+    args = [dotnet, "list", solution, "package", *options, "--format", "json", "--no-restore"]
     result = runner(args, LIST_TIMEOUT)
+    if result.code not in (0, None) and "--no-restore" in result.stdout + result.stderr:
+        # Ein SDK vor .NET 10 kennt den Schalter nicht, stellt aber auch nicht selbst wieder her.
+        result = runner(args[:-1], LIST_TIMEOUT)
     command = " ".join(["dotnet list package", *options])
     data = parse_json(result.stdout) if result.code == 0 else None
     if data is None:
@@ -427,8 +434,14 @@ def check_vulnerabilities(data: dict, config: BuildConfig, log: Log) -> None:
 
 def check_outdated(data: dict, log: Log) -> None:
     found: dict[str, dict] = {}
+    seed: set[str] = set()
     for package in iter_packages(data):
         if package.transitive or package.auto_referenced or not package.latest or package.latest == package.resolved:
+            continue
+        if package.id.lower().startswith(SEED_PACKAGE_PREFIX):
+            # Meldet schon der Schritt „Seed-Versionen prüfen“ (steps/seed-versions.yml), samt Hinweis
+            # auf das passende Template; hier käme es doppelt.
+            seed.add(package.id)
             continue
         group = found.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": package.latest,
                                                       "projects": set()})
@@ -441,7 +454,9 @@ def check_outdated(data: dict, log: Log) -> None:
             continue
         log.warning(f"Veraltet: {group['id']} {joined(group['versions'])}, neueste Version {group['latest']} "
                     f"({projects(group['projects'])}).")
-    if not found:
+    if seed:
+        log.info(f"Nicht als veraltet gemeldet, das übernimmt „Seed-Versionen prüfen“: {joined(seed)}.")
+    if not found and not seed:
         log.info("Alle direkten Paketreferenzen sind aktuell.")
 
 
