@@ -18,7 +18,7 @@
          Storage Blob Data Contributor nur auf dem Container
       5. Azure DevOps: Service Connection per Workload Identity Federation, mit Branch-Prüfung:
          nur Läufe von -AllowedBranches (Standard main) bekommen die Identität (nicht mit
-         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 -EnableBranchPolicy); dazu
+         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 nach dem Umschalten); dazu
          Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
          Administrators und die Build-Service-Identitäten), außer mit -AllowTagCreation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
@@ -630,7 +630,7 @@ try {
         } | Out-Null
     }
     if ($SkipScaffold) {
-        Write-Host '          Branch-Prüfung folgt mit Initialize-SeedProject.ps1 -EnableBranchPolicy: bis zum Umschalten'
+        Write-Host '          Branch-Prüfung folgt mit Initialize-SeedProject.ps1 nach dem Umschalten: bis dahin'
         Write-Host '          testet die Migration auf einem eigenen Branch.'
     } elseif ($endpoint) {
         Set-BranchControl $endpoint $project.id
