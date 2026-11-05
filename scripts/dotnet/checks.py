@@ -7,7 +7,7 @@
               build.prereleasePackages
             - bekannte Lücken, auch in transitiven Paketen: High und Critical sind Fehler, außer die
               Advisory steht mit reason in build.ignoreAdvisories; Low und Moderate sind Warnungen
-            - veraltete direkte Referenzen: Warnung
+            - veraltete direkte Referenzen: Warnung; Bfs.Seed.* meldet steps/seed-versions.yml
   format    dotnet format whitespace --verify-no-changes auf der Solution
 
 Läuft im Checkout des Projekts. Werte aus dem Repo und Ausgaben von dotnet kommen nur bereinigt ins
@@ -42,6 +42,8 @@ from typing import Callable, Iterator
 # dotnet list package meldet dann still keine. Abgefragt wird nur die Liste der Lücken, kein Paket.
 NUGET_ORG = "https://api.nuget.org/v3/index.json"
 TODO_MARKER = re.compile(r"TODO\(onboarding\)", re.IGNORECASE)
+# Pakete von Seed selbst; zurückliegende Versionen meldet steps/seed-versions.yml, nicht diese Prüfung.
+SEED_PACKAGE_PREFIX = "bfs.seed."
 SEVERITY_ERROR = ("high", "critical")
 SEVERITY_WARNING = ("low", "moderate")
 # dotnet list package wiederholt Anfragen an einen Feed ohne Anmeldung (401) wie dotnet restore
@@ -427,8 +429,14 @@ def check_vulnerabilities(data: dict, config: BuildConfig, log: Log) -> None:
 
 def check_outdated(data: dict, log: Log) -> None:
     found: dict[str, dict] = {}
+    seed: set[str] = set()
     for package in iter_packages(data):
         if package.transitive or package.auto_referenced or not package.latest or package.latest == package.resolved:
+            continue
+        if package.id.lower().startswith(SEED_PACKAGE_PREFIX):
+            # Meldet schon der Schritt „Seed-Versionen prüfen“ (steps/seed-versions.yml), samt Hinweis
+            # auf das passende Template; hier käme es doppelt.
+            seed.add(package.id)
             continue
         group = found.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": package.latest,
                                                       "projects": set()})
@@ -441,7 +449,9 @@ def check_outdated(data: dict, log: Log) -> None:
             continue
         log.warning(f"Veraltet: {group['id']} {joined(group['versions'])}, neueste Version {group['latest']} "
                     f"({projects(group['projects'])}).")
-    if not found:
+    if seed:
+        log.info(f"Nicht als veraltet gemeldet, das übernimmt „Seed-Versionen prüfen“: {joined(seed)}.")
+    if not found and not seed:
         log.info("Alle direkten Paketreferenzen sind aktuell.")
 
 

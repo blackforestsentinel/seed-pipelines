@@ -288,6 +288,17 @@ class OutdatedTests(Work):
         self.assertIn("Veraltet: Worker 2.50.0 und 2.51.0, neueste Version 2.52.0 (Projekte Api und Api.Tests)", out)
         self.assertIn("Missing.Internal: keine Version in den Paketquellen gefunden", out)
 
+    def test_seed_packages_are_left_to_seed_versions(self):
+        # Zurückliegende Bfs.Seed.*-Pakete meldet „Seed-Versionen prüfen“; hier kämen sie doppelt.
+        top = [package("Bfs.Seed.Auth", "0.9.0", latest="0.10.0"), package("bfs.seed.openapi", "0.9.0", latest="0.10.0"),
+               package("Bfs.SeedLike", "1.0.0", latest="2.0.0")]
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])))
+        log, out = self.packages(fake, "project: x\n")
+        self.assertEqual((log.errors, log.warnings), (0, 1))
+        self.assertIn("Veraltet: Bfs.SeedLike 1.0.0", out)
+        self.assertNotIn("Veraltet: Bfs.Seed.Auth", out)
+        self.assertIn("das übernimmt „Seed-Versionen prüfen“: Bfs.Seed.Auth und bfs.seed.openapi", out)
+
 
 class ToolFailureTests(Work):
     def test_network_and_tool_errors_are_warnings(self):

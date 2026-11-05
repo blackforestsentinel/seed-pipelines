@@ -180,7 +180,7 @@ Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ei
 | Direkte NuGet-Referenz in einer Vorabversion (`-preview`, `-rc` …) | Fehler | `build.prereleasePackages` in `project.yaml` |
 | Bekannte Lücke High oder Critical, auch in transitiven Paketen | Fehler | `build.ignoreAdvisories` in `project.yaml` |
 | Bekannte Lücke Low oder Moderate | Warnung | – |
-| Veraltete direkte Referenz | Warnung | – |
+| Veraltete direkte Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
 | `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
 
@@ -214,7 +214,7 @@ Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration d
 
 - `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
 - `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
-- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
 
 Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
 
