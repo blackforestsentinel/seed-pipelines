@@ -1,0 +1,97 @@
+# Prüfung des Custom Connectors (features.customConnector) vor jeder Freigabe: Bricht die neue
+# OpenAPI-Definition aus dem Build Flows, die den Connector nutzen? Vergleicht die Definition des
+# bestehenden Connectors in Dataverse mit openapi.json und sucht die betroffenen Flows (README,
+# Prüfung des Custom Connectors). Anlegen und Aktualisieren bleibt bei custom-connector.yml im Deploy.
+#
+# Zwei Teile, beide aus web-app.yml eingebunden:
+#   detect  im Job plan nach terraform plan: setzt aus outputs.json die Ausgaben
+#           connector.enabled, connector.environmentUrl und connector.name. Die Werte kommen aus
+#           dem State, also vom letzten Apply; ohne Output custom_connector gibt es nichts zu prüfen
+#           (Feature aus oder Connector noch nie angelegt).
+#   check   der Job connector_check in plan_<env>, nur mit connector.enabled: Skript
+#           scripts/custom-connector/Test-SeedConnectorChange.ps1 aus seed-pipelines. Ein eigener
+#           Job, weil er seed-pipelines auscheckt: Ein zweiter Checkout im Job plan verschöbe dessen
+#           Checkout nach s/<repo>, und terraform plan arbeitet in $(Build.SourcesDirectory). So
+#           kostet die Prüfung Projekte ohne Connector keinen Agent-Start.
+parameters:
+  - name: part
+    type: string
+    values: [detect, check]
+  # detect: outputs.json aus terraform plan (steps/terraform.yml, outputsDir)
+  - name: outputsFile
+    type: string
+    default: ''
+  # check: Azure-Service-Connection der Umgebung, wie im Job plan
+  - name: serviceConnection
+    type: string
+    default: ''
+  # check: Werte aus detect, als Laufzeitvariablen
+  - name: environmentUrl
+    type: string
+    default: ''
+  - name: name
+    type: string
+    default: ''
+  # check: Fehler werden zu Warnungen (allowBreakingConnectorChanges in web-app.yml)
+  - name: allowBreakingChanges
+    type: boolean
+    default: false
+  # check: Verbindungen und App-Rollen ihrer Konten prüfen (checkConnectorConnections)
+  - name: checkConnections
+    type: boolean
+    default: false
+
+steps:
+  - ${{ if eq(parameters.part, 'detect') }}:
+      # Nur Werte, wie seed-template sie bildet; sie landen in Logging-Befehlen und OData-Filtern.
+      - bash: |
+          set -euo pipefail
+          python3 -c '
+          import json, re, sys
+          connector = json.load(open(sys.argv[1], encoding="utf-8")).get("custom_connector") or {}
+          url = str(connector.get("environmentUrl") or "").rstrip("/")
+          name = str(connector.get("name") or "")
+          enabled = bool(connector)
+          if enabled and not (re.fullmatch(r"https://[a-z0-9-]+(\.[a-z0-9-]+)+", url) and re.fullmatch(r"[a-z0-9]+", name)):
+              print("##vso[task.logissue type=error]Output custom_connector: environmentUrl oder name ungültig.")
+              sys.exit(1)
+          print("##vso[task.setvariable variable=enabled;isOutput=true]" + str(enabled).lower())
+          print("##vso[task.setvariable variable=environmentUrl;isOutput=true]" + url)
+          print("##vso[task.setvariable variable=name;isOutput=true]" + name)
+          print(f"Custom Connector {name} in {url} wird geprüft." if enabled else "Kein Custom Connector in dieser Umgebung, keine Prüfung.")
+          ' "${{ parameters.outputsFile }}"
+        name: connector
+        displayName: Custom Connector erkennen
+
+  - ${{ else }}:
+      # Skript aus seed-pipelines, derselbe Stand wie die Templates (Repository-Ressource seed), wie
+      # in extension-package.yml. Der feste Pfad macht den Aufruf unabhängig vom Checkout.
+      - checkout: seed
+        path: seed
+        fetchDepth: 1
+        displayName: seed-pipelines auschecken (Skript der Connector-Prüfung)
+      - download: current
+        artifact: openapi
+        displayName: Artefakt openapi laden
+      - task: AzureCLI@2
+        displayName: Custom Connector prüfen
+        env:
+          SEED_CONNECTOR_URL: ${{ parameters.environmentUrl }}
+          SEED_CONNECTOR_NAME: ${{ parameters.name }}
+        inputs:
+          azureSubscription: ${{ parameters.serviceConnection }}
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            $check = @{
+              EnvironmentUrl       = $env:SEED_CONNECTOR_URL
+              Name                 = $env:SEED_CONNECTOR_NAME
+              OpenApiFile          = '$(Pipeline.Workspace)/openapi/openapi.json'
+              # Nicht im Temp-Verzeichnis des Agents: Das leert er am Ende des Jobs, womöglich
+              # bevor die Zusammenfassung hochgeladen ist.
+              SummaryFile          = '$(Build.ArtifactStagingDirectory)/custom-connector-check.md'
+              AllowBreakingChanges = '${{ lower(parameters.allowBreakingChanges) }}' -eq 'true'
+              CheckConnections     = '${{ lower(parameters.checkConnections) }}' -eq 'true'
+            }
+            & '$(Pipeline.Workspace)/seed/scripts/custom-connector/Test-SeedConnectorChange.ps1' @check
+            exit $LASTEXITCODE

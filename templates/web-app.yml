@@ -2,7 +2,9 @@
 #
 # Projekte binden das Template per extends ein (siehe README). Nach Build und Tests
 # je Umgebung:
-#   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert
+#   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert; mit
+#                 features.customConnector prüft der Job connector_check, ob die neue
+#                 OpenAPI-Definition Flows bricht (steps/custom-connector-check.yml)
 #   apply_<env>   nur bei Änderungen: Freigabe (Check am Environment <project>-<env>),
 #                 dann terraform apply des geprüften Plans
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test, mit
@@ -123,6 +125,21 @@ parameters:
       - azurerm_key_vault
       - azurerm_log_analytics_workspace
       - azurerm_management_lock
+
+  # Breaking Changes am Custom Connector zulassen: Die Prüfung in plan_<env> (Job connector_check)
+  # meldet ihre Fehler dann als Warnungen, etwa für eine entfernte Operation, die nur ein Flow nutzt,
+  # der ohnehin abgeschaltet wird. Projekte reichen dafür wie bei confirmDataDeletion einen
+  # Laufzeitparameter durch; zugelassen wird also nur in einem bewusst von Hand gestarteten Lauf.
+  - name: allowBreakingConnectorChanges
+    type: boolean
+    default: false
+
+  # Zusätzlich die Verbindungen zum Custom Connector prüfen: je Verbindung, ob ihr Konto eine
+  # App-Rolle der API hat. Braucht weitere Rechte der Pipeline-Identität (Admin-Scope der Power Apps
+  # API, Graph); fehlen sie, gibt es nur eine Warnung (README, Prüfung des Custom Connectors).
+  - name: checkConnectorConnections
+    type: boolean
+    default: false
 
   # Microsoft-gehosteter Agent; gilt nur, solange pool leer ist.
   - name: vmImage
@@ -509,11 +526,41 @@ stages:
                         echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
                         mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                         cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
+                  # Für den Job connector_check
+                  - template: steps/custom-connector-check.yml
+                    parameters:
+                      part: detect
+                      outputsFile: $(Build.ArtifactStagingDirectory)/tfoutputs/outputs.json
                   # Ohne Änderungen gelten die Outputs aus dem State; sonst veröffentlicht apply sie.
                   - publish: $(Build.ArtifactStagingDirectory)/tfoutputs
                     artifact: tfoutputs_${{ env.name }}
                     displayName: Outputs als Artefakt
                     condition: and(succeeded(), eq(variables['tfplan.changes'], 'false'))
+
+              # Prüfung des Custom Connectors vor jeder Freigabe und vor dem Function-Deploy
+              # (steps/custom-connector-check.yml). Scheitert sie, endet plan_<env>, und Apply und
+              # Deploy entfallen. Ohne Connector entfällt der Job.
+              - job: connector_check
+                displayName: Custom Connector prüfen
+                dependsOn: plan
+                condition: and(succeeded(), eq(dependencies.plan.outputs['connector.enabled'], 'true'))
+                pool:
+                  ${{ if eq(parameters.pool, '') }}:
+                    vmImage: ${{ parameters.vmImage }}
+                  ${{ else }}:
+                    name: ${{ parameters.pool }}
+                variables:
+                  seedConnectorUrl: $[ dependencies.plan.outputs['connector.environmentUrl'] ]
+                  seedConnectorName: $[ dependencies.plan.outputs['connector.name'] ]
+                steps:
+                  - template: steps/custom-connector-check.yml
+                    parameters:
+                      part: check
+                      serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                      environmentUrl: $(seedConnectorUrl)
+                      name: $(seedConnectorName)
+                      allowBreakingChanges: ${{ parameters.allowBreakingConnectorChanges }}
+                      checkConnections: ${{ parameters.checkConnectorConnections }}
 
           - stage: apply_${{ env.name }}
             displayName: Apply ${{ env.name }}

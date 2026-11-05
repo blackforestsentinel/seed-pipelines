@@ -9,6 +9,12 @@ parameters:
     displayName: Datenlöschung bestätigen (Storage, Key Vault, Logs)
     type: boolean
     default: false
+  # Nur von Hand ankreuzen: Breaking Changes am Custom Connector zulassen (siehe Prüfung des
+  # Custom Connectors); nur mit features.customConnector
+  - name: allowBreakingConnectorChanges
+    displayName: Breaking Changes am Custom Connector zulassen
+    type: boolean
+    default: false
 
 resources:
   repositories:
@@ -32,6 +38,8 @@ extends:
       - name: prod
         serviceConnection: sc-kundenportal-prod   # optional, sonst serviceConnection
     confirmDataDeletion: ${{ parameters.confirmDataDeletion }}
+    allowBreakingConnectorChanges: ${{ parameters.allowBreakingConnectorChanges }}
+    # checkConnectorConnections: true             # Verbindungen des Connectors prüfen, braucht Rechte
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # pool: Default                               # eigener Agent-Pool, siehe Eigene Agents
@@ -51,7 +59,7 @@ extends:
 | Stage | Inhalt |
 | --- | --- |
 | `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
-| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
+| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>`. Mit `features.customConnector` prüft danach der Job `connector_check`, ob die neue OpenAPI-Definition Flows bricht (siehe Prüfung des Custom Connectors) |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
 
@@ -207,10 +215,16 @@ $common = @{
   -ExpectDeploySteps 'Browser-Erweiterung packen', 'seed-pipelines auschecken (Skript der Erweiterung)', `
     'Signaturschlüssel der Erweiterung', 'Erweiterung signieren und veröffentlichen', `
     "Artefakt extension_$($common.Replace.ENVIRONMENT)", "Artefakt extension_release_$($common.Replace.ENVIRONMENT)"
+# Prüfung des Custom Connectors: nach terraform plan der Job connector_check, vor jeder Freigabe
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/custom-connector.yml `
+  -TemplateParameters @{ allowBreakingConnectorChanges = 'true' } `
+  -ExpectPlanSteps 'terraform plan', 'Custom Connector erkennen', 'Outputs als Artefakt', `
+    'seed-pipelines auschecken (Skript der Connector-Prüfung)', 'Artefakt openapi laden', 'Custom Connector prüfen' `
+  -ExpectDeploySteps 'Custom Connector'
 ```
 
 - `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
-- `-ExpectDeploySteps` und `-AbsentDeploySteps` prüfen die erste Stage `deploy_<umgebung>` wie die Build-Schritte. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
+- `-ExpectPlanSteps` und `-AbsentPlanSteps` prüfen die erste Stage `plan_<umgebung>` samt aller ihrer Jobs, `-ExpectDeploySteps` und `-AbsentDeploySteps` die erste Stage `deploy_<umgebung>`, jeweils wie die Build-Schritte. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
 - Die Pipeline-ID dient nur als Rahmen (Projekt, GitHub-Service-Connection); ihre eigene YAML-Datei spielt keine Rolle. Service Connections und Environments, die das YAML nennt, müssen im Projekt existieren, sonst lehnt Azure DevOps schon die Vorschau ab. Deshalb nennt das Beispiel für den normalen Lauf ein vorhandenes Seed-Projekt und eine seiner Umgebungen; der Prüflauf braucht beides nicht.
 - Ebenso lässt sich das YAML eines Projekts vor dem Umstellen prüfen, etwa bei einer Migration, deren Projekt in Azure DevOps noch keine Seed-Service-Connection hat: `-Replace` bzw. eine angepasste Kopie mit einer Service Connection des Rahmenprojekts.
 
@@ -235,6 +249,63 @@ Mit `features.customConnector` in `project.yaml` liefert Terraform den Output `c
 4. Mit `customConnector.shareWith: everyone` (Standard) bekommt das Standardteam der Root-Business-Unit Lesezugriff, also alle Personen der Umgebung. Ohne Freigabe sähe nur die Pipeline den Connector, denn Basic User liest Connectors nur auf Benutzerebene. Was eine Person über den Connector darf, regeln wie im Browser App-Rollen und Capabilities der API.
 
 Voraussetzung: Die Service-Connection-Identität ist in der Power-Platform-Umgebung Anwendungsbenutzer mit der Rolle Environment Maker; das richtet das Onboarding mit `-PowerPlatformEnvironmentUrl` ein. Fehlt das, endet der Schritt mit einem Hinweis darauf. Ohne Output `custom_connector` (Feature aus oder keine Umgebung angegeben) tut er nichts; das Artefakt `openapi` gibt es trotzdem, im Zweifel mit einer Notiz statt des Dokuments.
+
+Ob die neue Definition Flows bricht, prüft die Pipeline schon vorher, in `plan_<env>` (nächster Abschnitt).
+
+### Prüfung des Custom Connectors
+
+Flows rufen Operationen des Connectors über ihre `operationId` auf. Entfällt eine Operation oder ändert sie sich, merkt das sonst erst der Flow, wenn er fehlschlägt. Deshalb vergleicht der Job `connector_check` in `plan_<env>` die Definition des bestehenden Connectors in Dataverse (Tabelle `connectors`, Spalte `openapidefinition`) mit `openapi.json` aus dem Build und sucht die Flows, die den Connector nutzen (Tabelle `workflows`, Spalte `clientdata`). Er läuft nach `terraform plan`, vor jeder Freigabe und vor dem Function-Deploy. Scheitert er, endet `plan_<env>`; Apply und Deploy entfallen, am Connector und an der API ändert sich nichts.
+
+Eine Operation abzulösen geht damit in drei Schritten: im Code als deprecated markieren (`deprecated: true` im OpenAPI-Dokument, siehe `Bfs.Seed.OpenApi`); die Pipeline nennt bei jedem Deploy die Flows, die sie noch nutzen, und deren Besitzer migrieren; dann die Operation entfernen. Nutzt sie dann noch ein aktiver Flow, bricht der Lauf ab.
+
+| Änderung, an einer Operation, die ein Flow nutzt | Ergebnis |
+| --- | --- |
+| Operation entfernt | Fehler |
+| neues Pflichtfeld oder neuer Pflichtparameter, den der Flow nicht setzt | Fehler |
+| Typ eines Feldes, das der Flow setzt, geändert (etwa `integer` zu `string`; `integer` zu `number` zählt nicht) | Fehler |
+| Enum-Wert entfernt, den der Flow fest einträgt | Fehler |
+| Operation deprecated | Warnung |
+| Eingabefeld entfernt, das der Flow setzt | Warnung: der Wert kommt still nicht mehr an |
+| Antwortfeld entfernt oder Typ geändert, das der Flow per Ausdruck liest | Warnung: die Suche in Ausdrücken ist unscharf |
+| der Flow setzt den ganzen Body oder das Feld per Ausdruck | Warnung „nicht prüfbar“ statt Fehler |
+| Operation entfernt oder deprecated, kein Flow nutzt sie | Hinweis im Log |
+
+- **Fehler nur für laufende Flows:** Fehler gelten Flows mit Status aktiv (Activated) oder angehalten (Suspended). Für ausgeschaltete Flows und Entwürfe wird daraus eine Warnung.
+- **Übersteuern:** Mit `allowBreakingConnectorChanges: true` werden alle Fehler der Prüfung zu Warnungen, etwa wenn der einzige betroffene Flow ohnehin abgeschaltet wird. Wie `confirmDataDeletion` reicht das Projekt den Parameter als Laufzeitparameter durch (Beispiel oben); zugelassen wird also nur in einem von Hand gestarteten Lauf. Ein Push bringt die Zulassung nicht mit.
+- **Ausgabe:** Jeder Fehler und jede Warnung erscheint als `##vso[task.logissue]` mit Flow, Status, Besitzer und dem Pfad der Action in der Definition (etwa `/Try/For_each/Check/else/Create_order`). Dazu kommt eine Zusammenfassung am Lauf (Reiter „Extensions“ bzw. Summary): Connector, Umgebung und bisheriges Backend, je Operation der Stand gegenüber dem letzten Deploy (neu, geändert, deprecated, entfernt, unverändert), die Befunde, die Flows mit Status, Besitzer und Link auf Power Automate und welche Prüfungen gelaufen sind. Namen aus Dataverse kommen ohne Steuerzeichen und `##vso[` ins Log und entschärft in die Zusammenfassung.
+- **Nutzung nicht prüfbar:** Liest die Pipeline-Identität Flows nicht auf Ebene Global (Rolle `Sentinel Seed Flow Reader` fehlt), sähe sie nur eigene Flows. Statt still 0 Treffer zu melden, warnt die Prüfung dann „Nutzung nicht prüfbar“; entfernte Operationen werden zu Warnungen, nicht zu Fehlern. Sie fragt die Tiefe mit `RetrieveUserPrivilegeByPrivilegeName` ab.
+- **Wann nichts geprüft wird:** ohne Output `custom_connector` im State (Feature aus, keine Umgebung angegeben oder noch nie angewendet); der Job entfällt dann samt Agent-Start. Gibt es den Connector in der Umgebung noch nicht, endet die Prüfung mit einem Hinweis. Die Angaben zum Connector kommen aus dem State, also vom letzten Apply; ändert ein Lauf `customConnector.environmentUrl`, prüft er noch gegen die bisherige Umgebung.
+- **Fehlt das OpenAPI-Dokument** im Build, endet die Prüfung mit dem Fehler, mit dem sonst erst der Deploy endete.
+- **Skript:** [`scripts/custom-connector/Test-SeedConnectorChange.ps1`](scripts/custom-connector/Test-SeedConnectorChange.ps1) aus seed-pipelines, die Vergleichslogik in `SeedConnectorCheck.psm1`. Der Job checkt dafür seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); die Repository-Ressource muss `seed` heißen. Er ist ein eigener Job, damit der Checkout von `terraform plan` bleibt, wo er ist. Das Skript liest nur und läuft lokal mit einem `az`-Login ebenso: `./scripts/custom-connector/Test-SeedConnectorChange.ps1 -EnvironmentUrl <url> -Name <custom_connector.name> -OpenApiFile <openapi.json>`. Tests mit Testdaten: `pwsh -NoProfile -File scripts/custom-connector/SeedConnectorCheck.Tests.ps1` (läuft in der GitHub-CI dieses Repos).
+
+**Verbindungen prüfen (Opt-in):** Der Connector meldet sich im Namen des Kontos an, mit dem eine Verbindung angelegt wurde. Fehlt diesem Konto eine App-Rolle der API, scheitert erst der Flow: Mit `assignmentRequired` bekommt es kein Token, sonst antwortet die API mit 403. Mit `checkConnectorConnections: true` listet die Prüfung zusätzlich alle Verbindungen zum Connector mit Konto und Status, ermittelt die App-Rollen des Kontos an der Unternehmensanwendung der API, auch über Gruppen, und warnt je Verbindung ohne Rolle oder mit Fehlerstatus. Verbindungen, die keine Connection Reference nutzt, sind nur ein Hinweis. Das Konto ist das angemeldete Konto der Verbindung; nennt die Verbindung keins, was bei OAuth-Verbindungen zum Custom Connector die Regel ist, die Person, die sie angelegt hat. Meist ist das dieselbe, zwingend ist es nicht. Fehlen die Rechte unten, gibt es die Warnung „Verbindungen nicht prüfbar“ und keinen Fehler.
+
+**Rechte der Pipeline-Identität:**
+
+| Wofür | Recht | Woher |
+| --- | --- | --- |
+| Connector lesen | Environment Maker (eigene Connectors) | Onboarding, Schritt 9 |
+| Flows aller Konten lesen | `prvReadWorkflow` auf Ebene Global, Rolle `Sentinel Seed Flow Reader` | Onboarding, Schritt 9 |
+| Connection References aller Konten lesen (nur mit `checkConnectorConnections`) | `prvReadconnectionreference` auf Ebene Global, dieselbe Rolle | Onboarding, Schritt 9 |
+| Verbindungen aller Konten lesen (nur mit `checkConnectorConnections`) | Admin-Scope der Power Apps API (`api.powerapps.com/.../scopes/admin/...`) | von Hand, siehe unten |
+| Unternehmensanwendung, Rollenzuweisungen, Konten, Gruppen (nur mit `checkConnectorConnections`) | Microsoft Graph, Anwendungsberechtigungen mit Admin-Consent | von Hand, siehe unten |
+
+Die Rolle `Sentinel Seed Flow Reader` hat nur diese zwei Leserechte; `prvReadflowrun` braucht die Prüfung nicht. Bestehende Umgebungen bekommen sie mit einem erneuten Lauf des Onboardings mit `-PowerPlatformEnvironmentUrl`. Mit ihr liest die Pipeline-Identität alle Flow-Definitionen der Umgebung, auch fest eingetragene Werte; in Log und Zusammenfassung erscheinen davon nur Namen, Besitzer, Status und Pfade der Actions (und ein beanstandeter Enum-Wert, gekürzt). Die Zusammenfassung sieht jede Person, die den Lauf lesen darf.
+
+Für die Verbindungsprüfung sind die Rechte eines Service Principals **nicht in einem Lauf geprüft**; gelaufen ist sie bisher nur unter einem Benutzerkonto mit Admin-Rechten. Nach heutigem Stand:
+
+- **Power Apps API, Admin-Scope:** Vermutlich muss die App-Registrierung der Deployment-Identität als Verwaltungsanwendung der Power Platform registriert sein (`pac admin application register --application-id <appId>` oder `New-PowerAppManagementApp`). Das gibt ihr Admin-Zugriff auf die Verwaltungs-APIs der Power Platform im ganzen Tenant, weit mehr als die Prüfung braucht. Deshalb ist die Verbindungsprüfung Opt-in.
+- **Microsoft Graph:** `Application.Read.All` (Unternehmensanwendung über `servicePrincipalNames`, `appRoleAssignedTo`), `User.ReadBasic.All` (Konto zur Verbindung) und `GroupMember.Read.All` (`transitiveMemberOf` für Rollen über Gruppen). Ob `Application.ReadWrite.OwnedBy` aus dem Onboarding für die eigene Unternehmensanwendung schon reicht, ist offen.
+
+Das Onboarding vergibt diese Rechte bewusst nicht; wer die Verbindungsprüfung will, vergibt sie von Hand und setzt `checkConnectorConnections: true` als festen Parameter im Projekt.
+
+**Grenzen:**
+
+- **Ausdruckssuche unscharf:** Antwortfelder erkennt die Prüfung in `body('Action')?['feld']`, `outputs('Action')?['body/feld']` und über `items('Schleife')` einer Schleife über eine Antwort, auch verschachtelt. Zugriffe über Variablen, `item()` in Select oder Filter oder Actions, die die ganze Antwort weiterreichen, sieht sie nicht; liest ein Flow ein übergeordnetes Objekt, meldet sie entfallene Unterfelder vorsichtshalber.
+- **Canvas Apps** prüft sie nicht: Dataverse zeigt nur, ob eine App den Connector nutzt, nicht welche Operation.
+- **Nur der Connector, den Seed anlegt** (Name `<Präfix>_<custom_connector.name>`); manuell oder per APIM-Export angelegte Connectoren nicht.
+- Maßgeblich ist die Flow-Definition, nicht ob eine Action zur Laufzeit erreicht wird.
+- **Links auf Power Automate** nutzen die `resourceid` des Flows; Entwürfe, die nie aktiv waren, haben keine und erscheinen ohne Link.
 
 ### Browser-Erweiterung
 
@@ -365,7 +436,7 @@ cd seed-pipelines
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
 7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
 8. GitHub-Service-Connection für alle Pipelines
-9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen.
+9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Dazu je Umgebung die eigene Sicherheitsrolle `Sentinel Seed Flow Reader` in der Root-Business-Unit, nur mit `prvReadWorkflow` und `prvReadconnectionreference` auf Ebene Global, für die [Prüfung des Custom Connectors](#prüfung-des-custom-connectors): Environment Maker liest Flows nur auf Ebene Basic, also eigene. Fehlt der Rolle ein Recht oder hat es eine kleinere Tiefe, ergänzt das Skript es; weitere Rechte, die jemand ergänzt hat, bleiben. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen; bestehende Umgebungen bekommen die Rolle ebenso.
 
 **Weitere Subscription im selben Tenant:** Das Skript erneut ausführen, mit eigener Identität und Service Connection (`-IdentityName`, `-ServiceConnectionName`). Der State-Account bekommt nach Default je Subscription einen eigenen Namen. Die Rolle `Sentinel Seed Lock Contributor` gibt es im Tenant nur einmal: Das Skript sucht sie in allen Subscriptions, die das Konto sieht, und nimmt die neue Subscription in ihre `assignableScopes` auf (im DryRun `[alt]`). Dafür braucht das Konto auch in den Subscriptions, in denen die Rolle schon zuweisbar ist, Owner oder User Access Administrator. Bestehende Identitäten fasst das Skript nicht an.
 
