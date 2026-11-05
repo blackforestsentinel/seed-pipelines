@@ -44,13 +44,14 @@ extends:
     #   - script: npm run lint
     #     displayName: Lint
     #     workingDirectory: frontend
+    # treatWarningsAsErrors: false                # Warnungen nicht als Fehler, siehe Prüfungen im Build
 ```
 
 ## templates/web-app.yml
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, die Prüfungen der API (offene `TODO(onboarding)`, Formatierung, NuGet-Pakete; siehe Prüfungen im Build), `dotnet build` mit Warnungen als Fehler, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
@@ -83,7 +84,7 @@ Liegt `.terraform.lock.hcl` im Ordner `infra` (seed-template legt sie an), läuf
 
 ### PR-Validierung
 
-Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt) bestehen nur aus `build`: Build, Tests, `terraform fmt` und `validate` ohne Backend und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
+Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt) bestehen nur aus `build`: Build, Tests, die Prüfungen im Build (unten), `terraform fmt` und `validate` ohne Backend und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
 
 Mit `validationOnly: true` läuft dieselbe Prüfung ohne PR, etwa um sie von Hand nachzustellen.
 
@@ -169,6 +170,87 @@ extends:
 - **Arbeitsverzeichnis** ist der Checkout, je Schritt änderbar mit `workingDirectory`.
 - **Rechte:** Der Build-Job hat keine Azure-Service-Connection und keine Secrets. Schritte, die etwas in Azure brauchen, gehören nicht in den Build.
 
+### Prüfungen im Build
+
+Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ein Hinweis in der README wirkt kaum. Der Build-Job prüft deshalb die API, auch im PR-Lauf und mit `validationOnly`. Ausnahmen gibt es, aber nur im Projekt und mit Begründung, damit sie im PR zu sehen sind.
+
+| Prüfung | Ergebnis | Ausnahme |
+| --- | --- | --- |
+| Warnungen des Compilers, zu Nullable, der Analyzer und von MSBuild-Tasks in `dotnet build` und `dotnet publish` | Fehler | je Warnung im Projekt (unten); alle mit `treatWarningsAsErrors: false` |
+| Direkte NuGet-Referenz in einer Vorabversion (`-preview`, `-rc` …) | Fehler | `build.prereleasePackages` in `project.yaml` |
+| Bekannte Lücke High oder Critical, auch in transitiven Paketen | Fehler | `build.ignoreAdvisories` in `project.yaml` |
+| Bekannte Lücke Low oder Moderate | Warnung | – |
+| Veraltete direkte Referenz | Warnung | – |
+| Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
+| `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
+
+Die Schritte „Offene TODOs in project.yaml“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` kommen nur bereinigt ins Log. Lokal gemessen dauern die drei Schritte zusammen rund 20 Sekunden (Pakete 11, Formatierung 5); auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+
+**Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
+
+- `[SuppressMessage("Usage", "CA2200", Justification = "…")]` an der Stelle im Code. Eine Unterdrückung ohne `Justification` meldet ein Analyzer aus den `Bfs.Seed`-Paketen als Fehler.
+- `.editorconfig`, mit Kommentar zum Grund und möglichst auf Pfade beschränkt, etwa Unterstriche in Testnamen:
+
+  ```ini
+  # Testnamen wie Methode_Fall_Ergebnis
+  [**/*.Tests/**.cs]
+  dotnet_diagnostic.CA1707.severity = none
+  ```
+
+- `NoWarn` (Warnung fällt weg) oder `WarningsNotAsErrors` (bleibt als Warnung sichtbar) in der Projektdatei oder in `Directory.Build.props`, mit Kommentar zum Grund; gilt für das ganze Projekt. Für eine einzelne Paketreferenz geht auch `<PackageReference … NoWarn="NU1701" />`.
+
+Diese Warnungen bleiben auch mit `-warnaserror` Warnungen (`-warnNotAsError`):
+
+| Code | Warum keine Fehler |
+| --- | --- |
+| `NU1901` bis `NU1904` | Lücken; die prüft „NuGet-Pakete prüfen“ nach Schwere und mit den Ausnahmen aus `project.yaml` |
+| `NU1603`, `NU1801`, `NU1900`, `NU1905` | hängen vom Zustand der Feeds und des Netzes ab (Version fehlt im Feed, Quelle oder Daten zu Lücken nicht erreichbar) und würden Builds zufällig brechen |
+| `NU1608` | Paket außerhalb der Versionsgrenze einer Abhängigkeit; entsteht oft gerade dann, wenn ein Projekt ein transitives Paket wegen einer Lücke selbst anhebt |
+| `MSB3026` | Kopieren wird wiederholt, eine vorübergehende Sperre |
+
+Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration des Projekts und lassen sich dort beheben oder begründet abschalten, etwa `NU1507` (mehrere Paketquellen ohne `packageSourceMapping`, siehe Privater Paket-Feed), `NU1510` (überflüssige Paketreferenz) oder `NU1701` (Paket nur für .NET Framework). Das gilt auch für den inneren Build der Function (`WorkerExtensions`), den das Functions-SDK während des Builds wiederherstellt.
+
+**Pakete** („NuGet-Pakete prüfen“), drei Abfragen mit `--format json`:
+
+- `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
+- `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`.
+
+Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
+
+```yaml
+# project.yaml
+build:
+  # Vorabversionen direkter Referenzen (NuGet-Paket-ID, Groß- und Kleinschreibung egal)
+  prereleasePackages:
+    - name: Some.Package
+      reason: Nur die Vorabversion unterstützt X; die stabile Version ist angekündigt.
+  # Bekannte Lücken bewusst hinnehmen (GHSA-Kennung aus der Meldung oder die URL der Advisory)
+  ignoreAdvisories:
+    - id: GHSA-xxxx-xxxx-xxxx
+      reason: Betrifft nur Y, das die API nicht nutzt.
+```
+
+- Ein Eintrag ohne `reason` ist ein Fehler, ebenso einer, dessen `reason` YAML nicht als Text liest (`no`, `2026-01-01`; dann in Anführungszeichen).
+- Trifft ein Eintrag nichts mehr, warnt der Schritt; der Eintrag gehört dann entfernt. So veralten Ausnahmen nicht unbemerkt.
+- Eine Ausnahme, die greift, steht mit ihrem Grund im Log.
+- Eine Lücke in einem transitiven Paket behebt meist eine direkte Referenz auf eine Version ohne die Lücke.
+
+**Formatierung** („Formatierung prüfen“): `dotnet format whitespace <solution> --verify-no-changes`, also Einrückung, Leerzeichen, Zeilenumbrüche, Zeilenende und letzte Zeile laut `.editorconfig`. Das prüft sonst niemand; der Teilbefehl braucht keinen Build und dauert wenige Sekunden. `style` und `analyzers` lässt der Schritt bewusst aus: Sie kompilieren die Solution ein zweites Mal und melden dieselben Regeln wie der Build, sobald das Projekt Code-Stil im Build prüft (`EnforceCodeStyleInBuild`, Schwere in `.editorconfig`). Dort zählen sie als Warnung und damit als Fehler; so gibt es je Regel eine Stelle. Die Meldung nennt je Datei die erste abweichende Zeile, bis zu 20 Dateien. Dateien mit `generated_code = true` in `.editorconfig` oder dem Kopf `<auto-generated>` prüft `dotnet format` nicht.
+
+**Offene TODOs** („Offene TODOs in project.yaml“): eine Warnung je Zeile mit `TODO(onboarding)` in `project.yaml`, mit Zeilennummer. So markiert ein Projekt Angaben, die beim Onboarding noch fehlen. Den Punkt erledigen und die Markierung entfernen.
+
+**Lokal**, im Checkout des Projekts, mit einem Klon von seed-pipelines daneben und Python mit PyYAML:
+
+```bash
+dotnet restore api/Api.slnx
+dotnet format whitespace api/Api.slnx                    # formatiert; danach committen
+dotnet build api/Api.slnx -c Release --no-restore -warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026
+python3 ../seed-pipelines/scripts/dotnet/checks.py todos --project-yaml project.yaml
+python3 ../seed-pipelines/scripts/dotnet/checks.py format --solution api/Api.slnx
+python3 ../seed-pipelines/scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
+```
+
 ### Vorschau ohne Lauf
 
 Ob ein Projekt-YAML mit dem Template zusammenpasst, zeigt die Vorschau-API von Azure DevOps (`previewRun`): Sie löst Templates und Ausdrücke auf und gibt das fertige YAML zurück, ohne einen Lauf zu starten, ohne Freigaben und ohne Service Connection. [`tests/preview/Invoke-SeedPipelinePreview.ps1`](tests/preview/Invoke-SeedPipelinePreview.ps1) schickt eine YAML-Datei als `yamlOverride` an eine beliebige vorhandene Pipeline des Azure-DevOps-Projekts, legt das Ergebnis als `<datei>.final.yml` ab und prüft optional die Reihenfolge von Schritten im Build-Job:
@@ -193,10 +275,14 @@ $common = @{
   -ExpectBuildSteps 'npm run build', 'npm ci (Erweiterung)', 'npm test (Erweiterung)', `
     'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Lint (Beispiel)', 'Artefakt web', `
     'Artefakt extension'
-# Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
+# Prüflauf wie im PR: eigene Schritte und Prüfungen im Build ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
-  -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
+  -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'Offene TODOs in project.yaml', `
+    'Formatierung prüfen', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm run build', 'Lint (Beispiel)' `
+  -AbsentBuildSteps 'Artefakt web', 'Artefakt api' -ExpectText 'warnaserror -warnNotAsError:NU1603'
+# Ohne Warnungen als Fehler (treatWarningsAsErrors: false), die übrigen Prüfungen bleiben
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/warnings-allowed.yml `
+  -ExpectBuildSteps 'dotnet restore', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test' -AbsentText 'warnaserror'
 # Erweiterung ohne signing: im Deploy nur Paket und Artefakt
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
   -ExpectDeploySteps 'Custom Connector', 'Browser-Erweiterung packen', "Artefakt extension_$($common.Replace.ENVIRONMENT)" `
@@ -210,7 +296,7 @@ $common = @{
 ```
 
 - `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
-- `-ExpectDeploySteps` und `-AbsentDeploySteps` prüfen die erste Stage `deploy_<umgebung>` wie die Build-Schritte. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
+- `-ExpectDeploySteps` und `-AbsentDeploySteps` prüfen die erste Stage `deploy_<umgebung>` wie die Build-Schritte, `-ExpectText` und `-AbsentText` beliebigen Text im fertigen YAML, etwa ein Argument in einem Skript. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
 - Die Pipeline-ID dient nur als Rahmen (Projekt, GitHub-Service-Connection); ihre eigene YAML-Datei spielt keine Rolle. Service Connections und Environments, die das YAML nennt, müssen im Projekt existieren, sonst lehnt Azure DevOps schon die Vorschau ab. Deshalb nennt das Beispiel für den normalen Lauf ein vorhandenes Seed-Projekt und eine seiner Umgebungen; der Prüflauf braucht beides nicht.
 - Ebenso lässt sich das YAML eines Projekts vor dem Umstellen prüfen, etwa bei einer Migration, deren Projekt in Azure DevOps noch keine Seed-Service-Connection hat: `-Replace` bzw. eine angepasste Kopie mit einer Service Connection des Rahmenprojekts.
 
@@ -317,7 +403,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
-- **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 und der Azure CLI. Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
+- **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 mit PyYAML und der Azure CLI. PyYAML (Paket `python3-yaml`) haben Ubuntu-Server, gehostete Agents und Ubuntu unter WSL schon, als Abhängigkeit von netplan und cloud-init; sonst `apt install python3-yaml`. Die Paketprüfung im Build liest damit `project.yaml` (siehe Prüfungen im Build). Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
 - **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents. Terraform und gitleaks prüft sie per SHA-256; Terraform lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider).
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.

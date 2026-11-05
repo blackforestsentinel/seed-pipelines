@@ -1,0 +1,25 @@
+# Vorschau-Beispiel: Prüflauf wie im PR (validationOnly) mit treatWarningsAsErrors: false.
+# Erwartet: dieselben Prüfungen im Build (TODOs, Formatierung, Pakete), aber dotnet build und
+# dotnet test ohne -warnaserror. Ohne Service Connection. Platzhalter: __GITHUB_CONNECTION__.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: preview-app
+    serviceConnection: sc-wird-nicht-gebraucht
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    validationOnly: true
+    treatWarningsAsErrors: false
