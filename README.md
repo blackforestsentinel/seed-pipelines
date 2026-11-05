@@ -87,7 +87,14 @@ Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `m
 
 Mit `validationOnly: true` läuft dieselbe Prüfung ohne PR, etwa um sie von Hand nachzustellen.
 
-Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester Version, der Download wird per SHA-256 geprüft. Er prüft alle Commits des PRs (`HEAD^1..HEAD^2` des Merge-Commits), nicht nur den Endstand: Ein Secret, das ein späterer Commit entfernt, bliebe sonst in der Historie. Gefundene Werte erscheinen geschwärzt im Log. Bei falschem Alarm den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`. In Läufen auf `main` scannt die Pipeline nicht: Mit der Pflicht-Policy kommt jede Änderung über einen PR.
+Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester Version, der Download wird per SHA-256 geprüft. Er prüft alle Commits des PRs (`HEAD^1..HEAD^2` des Merge-Commits), nicht nur den Endstand: Ein Secret, das ein späterer Commit entfernt, bliebe sonst in der Historie. Gefundene Werte erscheinen geschwärzt im Log. In Läufen auf `main` scannt die Pipeline nicht: Mit der Pflicht-Policy kommt jede Änderung über einen PR.
+
+Was bei einem Fund zu tun ist, steht auch in der Fehlermeldung:
+
+- **Ein weiterer Commit, der das Secret löscht, reicht nicht.** Der Scan bleibt rot, weil das Secret in einem Commit des PRs steht und mit dem Merge in die Historie von `main` käme.
+- **Branch neu schreiben**, ohne den betroffenen Commit: etwa `git rebase -i <basis>`, den Commit bearbeiten (`edit`) oder verwerfen (`drop`), dann `git push --force-with-lease`. Das braucht in Azure Repos „Force push“ am Branch; wer ihn angelegt hat, hat es meist. Alternativ einen neuen Branch ohne den Commit anlegen und den PR neu stellen.
+- **Secret widerrufen** und beim Anbieter ersetzen, auch nach dem Umschreiben: Es lag schon im Repo und gilt damit als bekannt.
+- **Falscher Alarm:** den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`.
 
 ### Schutz vor Datenverlust
 
