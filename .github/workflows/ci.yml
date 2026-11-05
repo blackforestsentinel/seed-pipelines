@@ -18,7 +18,8 @@ jobs:
         with:
           persist-credentials: false
       # Python 3.12 und openssl aus dem Image, wie auf den Agents der Pipelines; alle Tests unter
-      # scripts/ (extension, intune), nur Standardbibliothek
+      # scripts/ (extension, intune, scaffold, dotnet), Standardbibliothek und für dotnet PyYAML
+      # (python3-yaml, im Image wie auf den Agents)
       - name: Tests der Skripte
         run: python3 -m unittest discover -s scripts -p "test_*.py" -v
       # Nur Syntax: Die Skripte selbst brauchen Azure und Azure DevOps.
