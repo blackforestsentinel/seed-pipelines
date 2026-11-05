@@ -88,8 +88,8 @@ steps:
               Name                 = $env:SEED_CONNECTOR_NAME
               OpenApiFile          = '$(Pipeline.Workspace)/openapi/openapi.json'
               # Nicht im Temp-Verzeichnis des Agents: Das leert er am Ende des Jobs, womöglich
-              # bevor die Zusammenfassung hochgeladen ist.
-              SummaryFile          = '$(Build.ArtifactStagingDirectory)/custom-connector-check.md'
+              # bevor die Zusammenfassung hochgeladen ist. Der Dateiname ist ihr Titel am Lauf.
+              SummaryFile          = '$(Build.ArtifactStagingDirectory)/Custom Connector ${{ parameters.name }}.md'
               AllowBreakingChanges = '${{ lower(parameters.allowBreakingChanges) }}' -eq 'true'
               CheckConnections     = '${{ lower(parameters.checkConnections) }}' -eq 'true'
             }
