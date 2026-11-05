@@ -50,7 +50,7 @@ extends:
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), der Hinweis auf veraltetes Seed, `terraform fmt` und `validate`, der Terraform-Sicherheitsscan, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
@@ -83,7 +83,7 @@ Liegt `.terraform.lock.hcl` im Ordner `infra` (seed-template legt sie an), läuf
 
 ### PR-Validierung
 
-Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt) bestehen nur aus `build`: Build, Tests, `terraform fmt` und `validate` ohne Backend und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
+Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt und `Initialize-SeedProject.ps1` nach dem Umschalten setzt) bestehen nur aus `build`: Build, Tests, `terraform fmt` und `validate` ohne Backend, der Terraform-Sicherheitsscan, der Hinweis auf veraltetes Seed und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
 
 Mit `validationOnly: true` läuft dieselbe Prüfung ohne PR, etwa um sie von Hand nachzustellen.
 
@@ -95,6 +95,58 @@ Was bei einem Fund zu tun ist, steht auch in der Fehlermeldung:
 - **Branch neu schreiben**, ohne den betroffenen Commit: etwa `git rebase -i <basis>`, den Commit bearbeiten (`edit`) oder verwerfen (`drop`), dann `git push --force-with-lease`. Das braucht in Azure Repos „Force push“ am Branch; wer ihn angelegt hat, hat es meist. Alternativ einen neuen Branch ohne den Commit anlegen und den PR neu stellen.
 - **Secret widerrufen** und beim Anbieter ersetzen, auch nach dem Umschreiben: Es lag schon im Repo und gilt damit als bekannt.
 - **Falscher Alarm:** den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`.
+
+### Terraform-Sicherheitsscan
+
+Im Build-Job, auch im PR-Lauf, prüft [Trivy](https://github.com/aquasecurity/trivy) (`trivy config`, [`templates/steps/terraform-scan.yml`](templates/steps/terraform-scan.yml)) die `.tf`-Dateien unter `infraPath` statisch auf Fehlkonfigurationen, etwa öffentlichen Blob-Zugriff, TLS unter 1.2, nicht erzwungenes HTTPS, FTP an App Services oder einen Key Vault ohne Purge-Schutz. Der Scan läuft nach `terraform init -backend=false` und dauert mit Download rund 3 bis 7 Sekunden.
+
+- **Was gemeldet wird:** Befunde in den Dateien des Projekts, also im Wurzelmodul und in lokalen Modulen (`source = "./modules/…"`). Trivy wertet die heruntergeladenen Module aus `.terraform/modules` mit aus, damit Werte aus Modul-Outputs bekannt sind, meldet deren Befunde aber nicht (`--tf-exclude-downloaded-modules`): Ein Projekt könnte sie weder beheben noch begründet ausnehmen. Die Module aus seed-terraform prüft deren Repo; Module anderer Herkunft verantwortet das Projekt, das sie einbindet.
+- **Schwere:** `CRITICAL` und `HIGH` sind Fehler und brechen den Build, `MEDIUM`, `LOW` und `UNKNOWN` sind Warnungen. Einige `MEDIUM`-Regeln sind trotzdem Fehler, weil sie Klartext-Verbindungen oder endgültigen Datenverlust bedeuten (`errorChecks`): AZU-0016 (Key Vault ohne Purge-Schutz), AZU-0020 und AZU-0026 (Datenbank ohne TLS bzw. unter 1.2), AZU-0071 (App Service mit FTP), AZU-0072 (Web App mit HTTP).
+- **Seed-Regelsatz** (`skipChecks`, aus für alle Projekte, Gründe im Template und im Log):
+
+  | Regel | Schwere | Warum aus |
+  | --- | --- | --- |
+  | AZU-0012 | CRITICAL | Storage-Netzwerkregeln mit Deny: Seed betreibt keine VNets, die Function erreicht Storage über den öffentlichen Endpunkt, geschützt durch Entra ID ohne Shared Key |
+  | AZU-0013 | CRITICAL | `network_acls` am Key Vault: wie AZU-0012, Zugriff per RBAC |
+  | AZU-0009, AZU-0057 | MEDIUM | klassische Storage-Analytics-Protokolle, veraltet; Protokolle laufen über Diagnoseeinstellungen |
+  | AZU-0058 | LOW | Georedundanz: Kostenentscheidung; Seed schützt Daten mit Soft Delete, Versionierung und Löschsperre |
+  | AZU-0060 | MEDIUM | kundenseitig verwaltete Schlüssel: Compliance-Vorgabe, keine Grundsicherung |
+  | AZU-0061 | MEDIUM | doppelte Verschlüsselung: Compliance-Option |
+  | AZU-0003 | MEDIUM | App Service Authentication: Seed prüft Tokens in der API (`Bfs.Seed.Auth`) |
+  | AZU-0001 | LOW | Client-Zertifikate: Seed authentifiziert mit Entra-Tokens |
+  | AZU-0015 | LOW | `content_type` an Secrets: Beschreibung ohne Schutzwirkung |
+  | AZU-0017 | LOW | Ablaufdatum an Secrets: Seed erzwingt keines, Werte setzt ein Mensch außerhalb von Terraform |
+
+- **Ausnahmen** stehen inline im `.tf`, als Kommentar direkt über dem Block oder der Zeile mit dem Befund (oder am Ende dieser Zeile), mit Regel-ID und Begründung in derselben Zeile. So erscheinen sie im Diff des PRs, und der Scan listet sie im Log:
+
+  ```hcl
+  # trivy:ignore:AZU-0011 Lesegerät im Lager kann nur TLS 1.0, Austausch bis Ende 2027
+  resource "azurerm_storage_account" "scanner" {
+    min_tls_version = "TLS1_0"
+    # ...
+  }
+
+  # Mit Ablaufdatum: ab 2028 wieder ein Befund
+  # trivy:ignore:AZU-0011:exp:2027-12-31 Lesegerät im Lager kann nur TLS 1.0
+  ```
+
+  Die Regel-ID steht im Befund (`AZU-0011`); die lange Form (`azure-storage-use-secure-tls-policy`) geht auch, ebenso mehrere Regeln in einer Zeile. Ein Fehler sind: eine Ausnahme ohne Begründung (weniger als zehn Zeichen Text nach der Regel) und `trivy:ignore:*`. Das gilt auch für die ältere Form `tfsec:ignore:`, die Trivy ebenfalls liest. Ein Befund kann mehrere Regeln auslösen, etwa TLS 1.0 an Storage AZU-0011 und AZU-0059; jede braucht ihre Ausnahme.
+- **Nur Einstellungen des Templates:** `.trivyignore`, `.trivyignore.yaml` und `trivy.yaml` im Projekt wirken nicht (der Scan warnt, wenn es sie gibt), Umgebungsvariablen `TRIVY_*` ebenso wenig. Die Regeln stecken im Programm (`--skip-check-update`) und ändern sich nur mit dessen Version; der Scan braucht außer dem Download kein Netz und sendet keine Telemetrie.
+- **Version:** Trivy kommt wie gitleaks in fester Version mit SHA-256 aus `trivy_<version>_checksums.txt` (Parameter `version` und `sha256` des Schritt-Templates). Beim Anheben eine Version nehmen, die mindestens zwei Wochen alt ist, die Prüfsumme mit dem Digest des Release-Assets auf GitHub abgleichen und den Scan gegen seed-template und die Module von seed-terraform laufen lassen: Neue Regeln können neue Fehler bringen.
+- **Abdeckung:** Trivy kennt die `azurerm`-Ressourcen. Ressourcen über `azapi` (etwa die Function mit Flex Consumption im Modul `core`) prüft es nicht.
+
+### Hinweis auf veraltetes Seed
+
+Ebenfalls im Build-Job, auch im PR-Lauf, vergleicht [`templates/steps/seed-versions.yml`](templates/steps/seed-versions.yml), was das Projekt nutzt, mit dem neuesten Release, und warnt je Quelle, wenn etwas zurückliegt:
+
+| Was | Woher im Projekt | Neueste Version |
+| --- | --- | --- |
+| seed-pipelines | `ref` der Repository-Ressource `seed` in `azure-pipelines.yml`, zur Laufzeit (`resources.repositories.seed.ref`) | Tags per `git ls-remote` |
+| Module aus seed-terraform | `?ref=vX.Y.Z` in den `.tf`-Dateien unter `infraPath` | Tags per `git ls-remote` |
+| `Bfs.Seed.*` | `PackageReference` und `PackageVersion` in `.csproj`, `.props`, `.targets` | `https://api.nuget.org/v3-flatcontainer/<id>/index.json` |
+| `@blackforestsentinel/seed-web-*` | `package.json`, aufgelöst aus `package-lock.json` | npm-Registry |
+
+Neueste Version ist die höchste ohne Vorabkennung (`-preview`, `-rc` …). Branches statt Tags (`refs/heads/…`, `?ref=main`) und Versionen aus MSBuild-Variablen vergleicht der Schritt nicht, er nennt sie nur im Log. Er bricht nie den Build: Ist GitHub, NuGet oder npm nicht erreichbar, steht das als Zeile im Log, ohne Warnung. Er dauert ein bis drei Sekunden. Die Repository-Ressource muss `seed` heißen, wie in den Beispielen; sonst entfällt der Vergleich für seed-pipelines.
 
 ### Schutz vor Datenverlust
 
@@ -120,7 +172,7 @@ extends:
           workingFile: frontend/.npmrc
 ```
 
-- **Reihenfolge:** nach Checkout, Abgleich mit `project.yaml`, `terraform validate` und dem .NET SDK laut `global.json`, vor `dotnet restore`. Node in der Version `nodeVersion` richtet das Template erst danach ein; bis dahin gilt die des Images.
+- **Reihenfolge:** nach Checkout, Abgleich mit `project.yaml`, Hinweis auf veraltetes Seed, `terraform validate`, Terraform-Sicherheitsscan und dem .NET SDK laut `global.json`, vor `dotnet restore`. Node in der Version `nodeVersion` richtet das Template erst danach ein; bis dahin gilt die des Images.
 - **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`, denn ohne Restore gibt es keinen Build.
 - **Rechte:** `NuGetAuthenticate@1` und `npmAuthenticate@0` melden sich ohne Secret mit dem Job-Token an, also als `<Projekt> Build Service (<org>)` oder, wenn das Projekt den Job-Scope nicht auf sich beschränkt, als `Project Collection Build Service (<org>)`. Diese Identität braucht am Feed mindestens die Rolle Feed Reader (Feed settings, Permissions). Liegt der Feed in einem anderen Projekt, braucht sie zusätzlich Lesezugriff auf dieses Projekt (Gruppe Readers). Für Feeds einer anderen Organisation oder außerhalb von Azure DevOps nennt der Schritt eine NuGet-Service-Connection des Projekts (`nuGetServiceConnections`). Eine Azure-Service-Connection bekommen die Schritte nicht.
 - Für die Anmeldung taugt `extraBuildSteps` nicht: Diese Schritte laufen erst nach Build und Tests.
@@ -200,9 +252,11 @@ $common = @{
   -ExpectBuildSteps 'npm run build', 'npm ci (Erweiterung)', 'npm test (Erweiterung)', `
     'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Lint (Beispiel)', 'Artefakt web', `
     'Artefakt extension'
-# Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
+# Prüflauf wie im PR: Scans und eigene Schritte ja, Artefakte nein
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
+  -ExpectBuildSteps 'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
+    'Terraform-Sicherheitsscan (Trivy 0.76.1)', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', `
+    'Lint (Beispiel)' `
   -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
 # Erweiterung ohne signing: im Deploy nur Paket und Artefakt
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
@@ -325,7 +379,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
 - **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 und der Azure CLI. Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
-- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents. Terraform und gitleaks prüft sie per SHA-256; Terraform lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider).
+- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform, gitleaks und Trivy. Terraform, gitleaks und Trivy prüft sie per SHA-256 und lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider). Der Hinweis auf veraltetes Seed fragt github.com, api.nuget.org und registry.npmjs.org ab; ohne diese Ziele entfällt er still.
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
 - **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).

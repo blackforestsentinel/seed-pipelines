@@ -1,0 +1,239 @@
+# Hinweis auf veraltetes Seed, im Build-Job, auch im PR-Lauf. Warnt, wenn etwas hinter dem
+# neuesten Release liegt:
+#   seed-pipelines   ref der Repository-Ressource seed (azure-pipelines.yml), Tags auf GitHub
+#   seed-terraform   ?ref=vX.Y.Z der Module in den .tf-Dateien, Tags des Modul-Repos auf GitHub
+#   Bfs.Seed.*       PackageReference und PackageVersion in .csproj, .props und .targets, nuget.org
+#   seed-web-*       @blackforestsentinel/seed-web-* in package.json (aufgelöst aus
+#                    package-lock.json, wenn vorhanden), npm-Registry
+# Neueste Version ist die höchste ohne Vorabkennung (-preview, -rc …). Tags kommen per
+# git ls-remote, ohne GitHub-API und deren Rate-Limit.
+#
+# Nur ein Hinweis: Netzfehler ergeben eine Zeile im Log, nie eine Warnung oder einen Fehler, und
+# der Schritt scheitert nicht.
+parameters:
+  # Ordner mit den .tf-Dateien (infraPath), relativ zum Checkout
+  - name: infraPath
+    type: string
+  # ref und name der Repository-Ressource seed. web-app.yml setzt die Variablen im Build-Job per
+  # Laufzeitausdruck (resources.repositories.seed.ref); nur so sind sie in Schritten lesbar.
+  - name: pipelinesRef
+    type: string
+    default: $(seedPipelinesRef)
+  - name: pipelinesRepository
+    type: string
+    default: $(seedPipelinesRepository)
+
+steps:
+  - bash: |
+      set -uo pipefail
+      python3 - . "${{ parameters.infraPath }}" <<'PY' || echo "Seed-Versionen: Prüfung übersprungen (Fehler im Skript)."
+      # seed-versions
+      import json, os, re, subprocess, sys, urllib.parse, urllib.request
+      import xml.etree.ElementTree as ElementTree
+      from concurrent.futures import ThreadPoolExecutor
+      from pathlib import Path
+
+      TIMEOUT = 15
+      NPM_SCOPE = "@blackforestsentinel/seed-web-"
+      NUGET_PREFIX = "bfs.seed."
+      SKIP_DIRS = {".git", ".terraform", "node_modules", "bin", "obj", "dist"}
+      RELEASE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+      MODULE = re.compile(r'source\s*=\s*"git::https://github\.com/([A-Za-z0-9-]+)/seed-terraform(?:\.git)?//[^"?]*\?(?:[^"]*&)?ref=([^"&]+)"')
+      GITHUB_REPO = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+
+      def clean(text):
+          # Text aus dem Repo und aus dem Netz nur ohne Steuerzeichen und ##vso[ ins Log (Logging-Befehle).
+          return re.sub(r"[\x00-\x1f\x7f]", " ", str(text)).replace("##vso[", "##vso_[")
+
+      def release(text):
+          """(1, 2, 3) für 1.2.3 oder v1.2.3, None für Vorabversionen, Branches und alles andere."""
+          match = RELEASE.fullmatch(str(text).strip())
+          return tuple(int(part) for part in match.groups()) if match else None
+
+      def newest(versions):
+          releases = [v for v in (release(text) for text in versions) if v]
+          return max(releases) if releases else None
+
+      def show(version, prefix=""):
+          return prefix + ".".join(map(str, version))
+
+      def walk(root, suffixes=None, names=None):
+          for directory, subdirs, files in os.walk(root):
+              subdirs[:] = sorted(d for d in subdirs if d not in SKIP_DIRS)
+              for name in sorted(files):
+                  if (names and name in names) or (suffixes and name.endswith(suffixes)):
+                      yield Path(directory, name)
+
+      # --- Was das Projekt nutzt -----------------------------------------------------------
+
+      def module_refs(infra):
+          """{besitzer: {ref: [datei:zeile]}} der Module aus seed-terraform."""
+          found = {}
+          for path in walk(infra, suffixes=(".tf",)):
+              for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                  for owner, ref in MODULE.findall(line):
+                      found.setdefault(owner, {}).setdefault(ref, []).append(f"{path.as_posix()}:{number}")
+          return found
+
+      def nuget_refs(root):
+          """{paket-id: {version}} der Bfs.Seed.*-Pakete aus Projekt- und props-Dateien."""
+          found = {}
+          for path in walk(root, suffixes=(".csproj", ".fsproj", ".vbproj", ".props", ".targets")):
+              try:
+                  tree = ElementTree.parse(path)
+              except ElementTree.ParseError:
+                  continue
+              for element in tree.iter():
+                  tag = str(element.tag).rsplit("}", 1)[-1]
+                  if tag not in ("PackageReference", "PackageVersion"):
+                      continue
+                  package = element.get("Include") or element.get("Update") or ""
+                  if not package.lower().startswith(NUGET_PREFIX):
+                      continue
+                  version = element.get("VersionOverride") or element.get("Version")
+                  if version is None:
+                      child = next((c for c in element if str(c.tag).rsplit("}", 1)[-1] in ("VersionOverride", "Version")), None)
+                      version = child.text if child is not None else None
+                  if version:
+                      # [1.2.3] ist eine exakte Version in Bereichsschreibweise.
+                      found.setdefault(package, set()).add(version.strip().strip("[]"))
+          return found
+
+      def npm_refs(root):
+          """{paket: {version}} der seed-web-Pakete, aufgelöst aus package-lock.json, wenn vorhanden."""
+          found = {}
+          for path in walk(root, names=("package.json",)):
+              try:
+                  manifest = json.loads(path.read_text(encoding="utf-8"))
+                  lock_file = path.with_name("package-lock.json")
+                  lock = json.loads(lock_file.read_text(encoding="utf-8")) if lock_file.exists() else {}
+              except (ValueError, OSError):
+                  continue
+              for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                  for package, spec in (manifest.get(section) or {}).items():
+                      if not str(package).startswith(NPM_SCOPE):
+                          continue
+                      resolved = ((lock.get("packages") or {}).get(f"node_modules/{package}") or {}).get("version")
+                      found.setdefault(package, set()).add(str(resolved or spec).strip().lstrip("^~=v"))
+          return found
+
+      # --- Was es Neues gibt ----------------------------------------------------------------
+
+      def ls_remote_tags(url):
+          result = subprocess.run(["git", "ls-remote", "--tags", "--refs", url], capture_output=True, text=True,
+                                  timeout=TIMEOUT, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+          if result.returncode:
+              raise OSError(f"git ls-remote: {(result.stderr.strip().splitlines() or ['Exit ' + str(result.returncode)])[-1]}")
+          return [line.split("refs/tags/", 1)[1] for line in result.stdout.splitlines() if "refs/tags/" in line]
+
+      def fetch_json(url, accept="application/json"):
+          request = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "seed-pipelines"})
+          with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+              return json.load(response)
+
+      def nuget_versions(package, fetch=fetch_json):
+          return fetch(f"https://api.nuget.org/v3-flatcontainer/{package.lower()}/index.json").get("versions") or []
+
+      def npm_versions(package, fetch=fetch_json):
+          # Kurzform der Metadaten: nur Versionen und dist-tags
+          data = fetch(f"https://registry.npmjs.org/{urllib.parse.quote(package, safe='@')}",
+                       "application/vnd.npm.install-v1+json")
+          return list((data.get("versions") or {}).keys())
+
+      # --- Vergleich -----------------------------------------------------------------------
+
+      def compare(title, used, lookup, hint):
+          """used: {name: {version}}, lookup: name -> Versionen. Liefert die Warnung oder None."""
+          behind, current, failed = [], [], []
+          names = sorted(used)
+          with ThreadPoolExecutor(max_workers=8) as pool:
+              answers = list(pool.map(lambda name: _safe(lookup, name), names))
+          for name, (latest_list, error) in zip(names, answers):
+              if error:
+                  failed.append((name, error))
+                  continue
+              latest = newest(latest_list)
+              if not latest:
+                  print(clean(f"  {name}: kein Release gefunden."))
+                  continue
+              for version in sorted(used[name]):
+                  parsed = release(version)
+                  if not parsed:
+                      print(clean(f"  {name} {version}: keine feste Release-Version, kein Vergleich."))
+                  elif parsed < latest:
+                      behind.append(f"{name} {version} (neu: {show(latest, 'v' if version.startswith('v') else '')})")
+                  else:
+                      current.append(f"{name} {version}")
+          if failed:
+              # Netzfehler: eine Zeile je Quelle, keine Warnung
+              print(clean(f"  neueste Version nicht abrufbar ({failed[0][1]}), übersprungen: {', '.join(n for n, _ in failed)}"))
+          if current:
+              print(clean(f"  aktuell: {', '.join(current)}"))
+          if behind:
+              print(clean(f"  nicht aktuell: {', '.join(behind)}"))
+              return clean(f"{title} nicht aktuell: {', '.join(behind)}. {hint}")
+          return None
+
+      def _safe(lookup, name):
+          try:
+              return lookup(name), None
+          except Exception as error:  # Netz, Zeitlimit, Antwort ohne JSON: nur ein Hinweis
+              return [], f"{type(error).__name__}: {error}"
+
+      def main(root, infra, env=os.environ, tags=ls_remote_tags, fetch=fetch_json):
+          root, infra = Path(root), Path(root, infra)
+          warnings = []
+
+          print("seed-pipelines:")
+          ref = str(env.get("SEED_PIPELINES_REF") or "").strip()
+          repository = str(env.get("SEED_PIPELINES_REPOSITORY") or "").strip()
+          tag = ref[len("refs/tags/"):] if ref.startswith("refs/tags/") else ref
+          # Ohne die Variablen aus web-app.yml bleibt der Makro-Text stehen, er beginnt mit $.
+          if not ref or ref.startswith("$") or not GITHUB_REPO.fullmatch(repository):
+              print("  Ref der Repository-Ressource seed nicht ermittelt (heißt sie anders?), kein Vergleich.")
+          elif not release(tag):
+              print(clean(f"  {ref} ist kein Release-Tag, kein Vergleich."))
+          else:
+              warnings.append(compare("seed-pipelines", {repository: {tag}},
+                                      lambda name: tags(f"https://github.com/{name}.git"),
+                                      "ref der Repository-Ressource seed in azure-pipelines.yml anheben."))
+
+          print("seed-terraform:")
+          modules = module_refs(infra)
+          if not modules:
+              print("  keine Module aus seed-terraform mit ?ref=.")
+          for owner, refs in sorted(modules.items()):
+              warnings.append(compare("Module aus seed-terraform", {f"{owner}/seed-terraform": set(refs)},
+                                      lambda name: tags(f"https://github.com/{name}.git"),
+                                      "?ref= der Module in " + ", ".join(sorted({p.rsplit(':', 1)[0] for r in refs.values() for p in r})) + " anheben."))
+
+          print("Bfs.Seed.*:")
+          packages = nuget_refs(root)
+          if packages:
+              warnings.append(compare("NuGet-Pakete Bfs.Seed.*", packages, lambda name: nuget_versions(name, fetch),
+                                      "Versionen in den Projektdateien anheben (Bfs.Seed.* gemeinsam)."))
+          else:
+              print("  keine Pakete Bfs.Seed.*.")
+
+          print(f"{NPM_SCOPE}*:")
+          packages = npm_refs(root)
+          if packages:
+              warnings.append(compare("npm-Pakete seed-web-*", packages, lambda name: npm_versions(name, fetch),
+                                      "Versionen in package.json anheben und npm install ausführen."))
+          else:
+              print("  keine Pakete seed-web-*.")
+
+          for warning in filter(None, warnings):
+              print(f"##vso[task.logissue type=warning]{warning}")
+          return 0
+
+      if __name__ == "__main__":
+          try:
+              main(*sys.argv[1:3])
+          except Exception as error:  # nie den Build aufhalten
+              print(clean(f"Seed-Versionen: Prüfung übersprungen ({type(error).__name__}: {error})."))
+      PY
+    displayName: Seed-Versionen prüfen
+    env:
+      SEED_PIPELINES_REF: ${{ parameters.pipelinesRef }}
+      SEED_PIPELINES_REPOSITORY: ${{ parameters.pipelinesRepository }}

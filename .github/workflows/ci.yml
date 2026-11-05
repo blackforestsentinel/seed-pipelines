@@ -21,6 +21,9 @@ jobs:
       # scripts/ (extension, intune), nur Standardbibliothek
       - name: Tests der Skripte
         run: python3 -m unittest discover -s scripts -p "test_*.py" -v
+      # Python, das Schritte im Build-Job inline mitbringen (Heredoc im YAML, tests/steps/embedded.py)
+      - name: Tests der Pipeline-Schritte
+        run: python3 -m unittest discover -s tests/steps -p "test_*.py" -v
       # Nur Syntax: Die Skripte selbst brauchen Azure und Azure DevOps.
       - name: PowerShell-Syntax
         shell: pwsh
