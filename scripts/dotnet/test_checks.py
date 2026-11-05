@@ -313,6 +313,26 @@ class ToolFailureTests(Work):
         # Ohne Ergebnis keine Hinweise auf unbenutzte Einträge.
         self.assertNotIn("nennt", out)
 
+    def test_no_second_restore(self):
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing())
+        self.packages(fake, "project: x\n")
+        self.assertEqual(len(fake.calls), 3)
+        self.assertTrue(all(call[-1] == "--no-restore" for call in fake.calls))
+
+    def test_older_sdk_without_no_restore(self):
+        calls = []
+
+        def runner(args, timeout):
+            calls.append(args)
+            if "--no-restore" in args:
+                return checks.Result(1, "Unrecognized command or argument '--no-restore'.", "")
+            return checks.Result(0, listing(), "")
+
+        log, out = self.packages(runner, "project: x\n")
+        self.assertEqual((log.errors, log.warnings), (0, 0))
+        self.assertEqual(len(calls), 6)
+        self.assertNotIn("nicht möglich", out)
+
     def test_json_after_sdk_notice(self):
         data = checks.parse_json("Willkommen bei .NET\n{\"x\": 1}\n" + listing(("/a/Api.csproj", [], [])))
         self.assertEqual(len(data["projects"]), 1)

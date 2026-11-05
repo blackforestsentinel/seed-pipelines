@@ -352,8 +352,13 @@ def check_todos(path: str, log: Log) -> None:
 
 def list_packages(dotnet: str, solution: str, options: list[str], label: str, runner: Runner, log: Log) -> dict | None:
     """dotnet list package mit --format json; bei Netz- oder Werkzeugfehlern eine Warnung und None."""
-    args = [dotnet, "list", solution, "package", *options, "--format", "json"]
+    # Ab .NET 10 stellt dotnet list package vorher selbst wieder her. Geprüft wird aber, was der Schritt
+    # dotnet restore aufgelöst hat; ein zweiter Restore kostet nur Zeit und Netz.
+    args = [dotnet, "list", solution, "package", *options, "--format", "json", "--no-restore"]
     result = runner(args, LIST_TIMEOUT)
+    if result.code not in (0, None) and "--no-restore" in result.stdout + result.stderr:
+        # Ein SDK vor .NET 10 kennt den Schalter nicht, stellt aber auch nicht selbst wieder her.
+        result = runner(args[:-1], LIST_TIMEOUT)
     command = " ".join(["dotnet list package", *options])
     data = parse_json(result.stdout) if result.code == 0 else None
     if data is None:
