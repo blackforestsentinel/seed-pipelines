@@ -35,7 +35,9 @@
       8. Azure DevOps: GitHub-Service-Connection für alle Pipelines
       9. Power Platform (nur mit -PowerPlatformEnvironmentUrl): die Deployment-Identität als
          Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Umgebung, damit
-         die Pipeline Custom Connectors anlegen, aktualisieren und teilen kann
+         die Pipeline Custom Connectors anlegen, aktualisieren und teilen kann; dazu die eigene
+         Rolle "Sentinel Seed Flow Reader" nur mit Leserechten auf Ebene Global (Flows,
+         Connection References) für die Prüfung des Custom Connectors in plan_<env>
 
     Weitere Subscription im selben Tenant: Skript erneut ausführen, mit eigener -IdentityName
     und eigener -ServiceConnectionName. Die Rolle "Sentinel Seed Lock Contributor" ist im
@@ -193,6 +195,12 @@ $AssignableRoles = @(
 # Eigene Rolle für Löschsperren: Contributor darf keine Sperren setzen, Owner oder User Access
 # Administrator wären viel zu weit. Diese Rolle darf nur Sperren lesen, setzen und entfernen.
 $LockRoleName = 'Sentinel Seed Lock Contributor'
+
+# Sicherheitsrolle in jeder Power-Platform-Umgebung (Schritt 9) für die Prüfung des Custom
+# Connectors: Sie liest Flows und Connection References aller Konten. Environment Maker hat diese
+# Rechte nur auf Ebene Basic (eigene Datensätze); die Prüfung sähe sonst fast nichts.
+$FlowReaderRoleName = 'Sentinel Seed Flow Reader'
+$FlowReaderPrivileges = @('prvReadWorkflow', 'prvReadconnectionreference')
 
 # Die Identität des zentralen Scaffolds liest, schreibt und löscht im State-Container nur Blobs unter
 # scaffold/ (Registry und eigener State, scaffold/<projekt-id>/<name>.tfstate). Im selben Container
@@ -887,7 +895,8 @@ try {
 
     # --- 9. Power Platform -------------------------------------------------------------------
     # Custom Connectors liegen in Dataverse (Tabelle connector). Environment Maker darf eigene
-    # Connectors anlegen, ändern und teilen; mehr braucht die Pipeline nicht.
+    # Connectors anlegen, ändern und teilen. Die Prüfung des Custom Connectors liest dazu Flows
+    # aller Konten; dafür die Rolle $FlowReaderRoleName, nur mit Leserechten.
     if ($PowerPlatformEnvironmentUrl) {
         Write-Host '9. Power Platform'
         foreach ($environmentUrl in $PowerPlatformEnvironmentUrl | ForEach-Object { $_.TrimEnd('/') }) {
@@ -910,6 +919,41 @@ try {
                 if ($user) { (Invoke-RestMethod @dv "$api/systemusers($($user.systemuserid))/systemuserroles_association?`$select=roleid").value | Where-Object roleid -eq $role.roleid }
             } {
                 $body = @{ '@odata.id' = "$api/roles($($role.roleid))" } | ConvertTo-Json
+                Invoke-RestMethod @dv -Method Post -Body $body "$api/systemusers($($user.systemuserid))/systemuserroles_association/`$ref" | Out-Null
+                $true
+            } | Out-Null
+
+            # Eigene Rolle in der Root-Business-Unit, erkannt am Namen. Fehlt ein Recht oder hat es
+            # eine kleinere Tiefe als Global, ergänzt AddPrivilegesRole es; andere Rechte der Rolle
+            # bleiben, wie sie sind.
+            $readerRole = Invoke-Step "Rolle $FlowReaderRoleName in $environmentUrl" {
+                (Invoke-RestMethod @dv "$api/roles?`$select=roleid,name&`$filter=name eq '$FlowReaderRoleName' and _businessunitid_value eq $rootUnit").value | Select-Object -First 1
+            } {
+                $body = @{ name = $FlowReaderRoleName; 'businessunitid@odata.bind' = "/businessunits($rootUnit)" } | ConvertTo-Json
+                $create = $dv.Clone()
+                $create.Headers = $dv.Headers + @{ Prefer = 'return=representation' }
+                Invoke-RestMethod @create -Method Post -Body $body "$api/roles?`$select=roleid,name"
+            }
+            Invoke-Step "Rechte $($FlowReaderPrivileges -join ', ') (Global) für $FlowReaderRoleName in $environmentUrl" {
+                if ($readerRole) {
+                    $granted = @((Invoke-RestMethod @dv "$api/RetrieveRolePrivilegesRole(RoleId=$($readerRole.roleid))").RolePrivileges |
+                            Where-Object Depth -eq 'Global' | ForEach-Object PrivilegeName)
+                    -not ($FlowReaderPrivileges | Where-Object { $_ -notin $granted })
+                }
+            } {
+                $privileges = foreach ($name in $FlowReaderPrivileges) {
+                    $id = (Invoke-RestMethod @dv "$api/privileges?`$select=privilegeid&`$filter=name eq '$name'").value | Select-Object -First 1 -ExpandProperty privilegeid
+                    if (-not $id) { throw "Recht $name in $environmentUrl nicht gefunden." }
+                    @{ PrivilegeId = $id; PrivilegeName = $name; BusinessUnitId = $rootUnit; Depth = 'Global' }
+                }
+                $body = @{ Privileges = @($privileges) } | ConvertTo-Json -Depth 5
+                Invoke-RestMethod @dv -Method Post -Body $body "$api/roles($($readerRole.roleid))/Microsoft.Dynamics.CRM.AddPrivilegesRole" | Out-Null
+                $true
+            } | Out-Null
+            Invoke-Step "Rolle $FlowReaderRoleName für $IdentityName in $environmentUrl" {
+                if ($user -and $readerRole) { (Invoke-RestMethod @dv "$api/systemusers($($user.systemuserid))/systemuserroles_association?`$select=roleid").value | Where-Object roleid -eq $readerRole.roleid }
+            } {
+                $body = @{ '@odata.id' = "$api/roles($($readerRole.roleid))" } | ConvertTo-Json
                 Invoke-RestMethod @dv -Method Post -Body $body "$api/systemusers($($user.systemuserid))/systemuserroles_association/`$ref" | Out-Null
                 $true
             } | Out-Null
