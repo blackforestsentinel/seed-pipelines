@@ -1,0 +1,21 @@
+{
+  "message": "Unable to authenticate, need: Bearer ##vso[task.setvariable variable=x]1",
+  "method": "POST",
+  "uri": "https://registry.example.org/npm/registry/-/npm/v1/security/advisories/bulk",
+  "headers": {
+    "www-authenticate": [
+      "Bearer"
+    ],
+    "x-fetch-attempts": [
+      "1"
+    ]
+  },
+  "statusCode": 401,
+  "body": {
+    "error": "unauthorized ##vso[task.prependpath]/tmp"
+  },
+  "error": {
+    "summary": "",
+    "detail": ""
+  }
+}
