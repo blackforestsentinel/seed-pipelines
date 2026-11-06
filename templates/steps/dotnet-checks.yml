@@ -5,7 +5,9 @@
 #     mit Begründung abgeschaltet, im ganzen Repo; Analyzer pauschal aus gibt eine Warnung;
 #   - NuGet-Pakete: Vorabversionen direkter Referenzen und Lücken High/Critical sind Fehler, außer sie
 #     stehen mit Begründung in project.yaml (build.prereleasePackages, build.ignoreAdvisories);
-#     Lücken Low/Moderate und veraltete direkte Referenzen sind Warnungen;
+#     Lücken Low/Moderate und veraltete direkte Referenzen sind Warnungen. Dieselben Listen gelten für
+#     npm (steps/npm-checks.yml); ob ein Eintrag nichts mehr trifft, entscheidet mit stateFile erst
+#     jener Schritt, für beide;
 #   - Formatierung: dotnet format whitespace --verify-no-changes.
 # Warnungen des Compilers, der Analyzer und von MSBuild prüft nicht dieser Schritt, sondern der Build
 # selbst (Parameter treatWarningsAsErrors in web-app.yml).
@@ -20,6 +22,11 @@ parameters:
   - name: projectYaml
     type: string
     default: project.yaml
+  # Datei für das Ergebnis der Paketprüfung, die steps/npm-checks.yml mit demselben Wert liest; leer:
+  # Die Prüfung urteilt selbst, ob Einträge in project.yaml nichts mehr treffen.
+  - name: stateFile
+    type: string
+    default: ''
 
 steps:
   - bash: python3 "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" todos --project-yaml "$SEED_PROJECT_YAML"
@@ -47,9 +54,14 @@ steps:
       if ! python3 -c 'import yaml' 2> /dev/null && [ -x /usr/bin/python3 ]; then
         python=/usr/bin/python3
       fi
+      set --
+      if [ -n "$SEED_STATE_FILE" ]; then
+        set -- --state-file "$SEED_STATE_FILE"
+      fi
       "$python" "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" packages \
-        --solution "$SEED_SOLUTION" --project-yaml "$SEED_PROJECT_YAML"
+        --solution "$SEED_SOLUTION" --project-yaml "$SEED_PROJECT_YAML" "$@"
     displayName: NuGet-Pakete prüfen
     env:
       SEED_SOLUTION: ${{ parameters.solution }}
       SEED_PROJECT_YAML: ${{ parameters.projectYaml }}
+      SEED_STATE_FILE: ${{ parameters.stateFile }}

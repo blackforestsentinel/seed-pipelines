@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sentinel Seed: Prüfungen der API im Build-Job (templates/steps/dotnet-checks.yml).
+"""Sentinel Seed: Prüfungen im Build-Job (templates/steps/dotnet-checks.yml und npm-checks.yml).
 
   todos     eine Warnung je TODO(onboarding) in project.yaml, mit Zeilennummer
   packages  NuGet-Pakete der Solution, nach dotnet restore:
@@ -8,6 +8,11 @@
             - bekannte Lücken, auch in transitiven Paketen: High und Critical sind Fehler, außer die
               Advisory steht mit reason in build.ignoreAdvisories; Low und Moderate sind Warnungen
             - veraltete direkte Referenzen: Warnung; Bfs.Seed.* meldet steps/seed-versions.yml
+  npm       npm-Projekte im Repo, je package-lock.json (ohne node_modules), ohne npm ci:
+            - bekannte Lücken der Laufzeit-Abhängigkeiten (npm audit --omit=dev
+              --package-lock-only), auch transitiv: wie bei NuGet, dieselbe Liste build.ignoreAdvisories
+            - Vorabversionen direkter Laufzeit-Abhängigkeiten: wie bei NuGet, dieselbe Liste
+              build.prereleasePackages
   format    dotnet format whitespace --verify-no-changes auf der Solution
   suppressions
             RS0030 (verbotene APIs) und die Regeln aus Bfs.Seed (SEEDAUTH…, SEEDSUPPRESS…,
@@ -16,15 +21,23 @@
             Kommentar in der Zeile davor mit mindestens 10 Zeichen; ohne ist es ein Fehler. Analyzer
             pauschal aus (RunAnalyzers false, dotnet_analyzer_diagnostic.severity) gibt eine Warnung.
 
-Läuft im Checkout des Projekts. Werte aus dem Repo und Ausgaben von dotnet kommen nur bereinigt ins
-Log. Scheitert dotnet list package am Netz oder an sich selbst, gibt es eine Warnung statt eines
-Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Ausnahmen in
-project.yaml prüft das Skript trotzdem; ein Eintrag ohne reason ist immer ein Fehler.
+Läuft im Checkout des Projekts. Werte aus dem Repo und Ausgaben von dotnet und npm kommen nur
+bereinigt ins Log. Scheitert dotnet list package oder npm audit am Netz oder an sich selbst, gibt es
+eine Warnung statt eines Fehlers: Ein Ausfall von nuget.org oder der npm-Registry soll weder PR noch
+Deploy aufhalten. Die Ausnahmen in project.yaml prüft das Skript trotzdem; ein Eintrag ohne reason
+ist immer ein Fehler.
 
-Braucht Python ab 3.10 und für packages PyYAML (Paket python3-yaml, auf Ubuntu vorinstalliert).
+Ob ein Eintrag in build.prereleasePackages oder build.ignoreAdvisories nichts mehr trifft, entscheidet
+über beide Prüfungen hinweg: packages mit --state-file legt sein Ergebnis in der Datei ab und
+urteilt nicht selbst, npm mit derselben Datei urteilt für beide. Ohne die Datei urteilt jede
+Prüfung nur für sich.
+
+Braucht Python ab 3.10, für packages und npm PyYAML (Paket python3-yaml, auf Ubuntu vorinstalliert)
+und für npm ein npm ab Version 7.
 
   python3 scripts/dotnet/checks.py todos --project-yaml project.yaml
-  python3 scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
+  python3 scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml --state-file /tmp/seed.json
+  python3 scripts/dotnet/checks.py npm --project-yaml project.yaml --state-file /tmp/seed.json
   python3 scripts/dotnet/checks.py format --solution api/Api.slnx
   python3 scripts/dotnet/checks.py suppressions
 """
@@ -35,11 +48,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -63,6 +78,16 @@ FORMAT_TIMEOUT = 600
 # So viele Dateien nennt die Formatprüfung einzeln, danach nur noch die Zahl.
 MAX_FILES = 20
 CHECK_DOC = "README von seed-pipelines, „Prüfungen im Build“"
+# npm audit braucht je Projekt wenige Sekunden. Antwortet die Registry nicht, wiederholt npm die
+# Anfrage; ohne Grenze stünde der Job minutenlang.
+NPM_TIMEOUT = 120
+NPM_DEFAULT_REGISTRY = "registry.npmjs.org"
+# Lock-Dateien, die npm audit liest; die Shrinkwrap-Datei hat bei npm Vorrang.
+NPM_LOCK_FILES = ("npm-shrinkwrap.json", "package-lock.json")
+# Lock-Dateien anderer Paketmanager: npm audit liest sie nicht.
+OTHER_LOCK_FILES = ("yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb")
+# So viele Advisories nennt eine Meldung je npm-Paket, die übrigen stehen im Log.
+MAX_ADVISORIES = 8
 
 
 # --- Log ---------------------------------------------------------------------------------------
@@ -137,17 +162,20 @@ class Result:
         return short(" | ".join(rows[-lines:]), 600) if rows else "keine Ausgabe"
 
 
-Runner = Callable[[list, int], Result]
+# (Befehl, Timeout) für dotnet, dazu das Arbeitsverzeichnis für npm
+Runner = Callable[..., Result]
 
 
-def run(args: list[str], timeout: int) -> Result:
+def run(args: list[str], timeout: int, cwd: str | None = None) -> Result:
     """Startet einen Befehl ohne Shell und fängt seine Ausgabe ab, damit nichts unbereinigt ins Log
     kommt. Nach dem Timeout endet die ganze Prozessgruppe, auch Knoten von MSBuild."""
-    env = dict(os.environ, DOTNET_NOLOGO="1", DOTNET_CLI_TELEMETRY_OPTOUT="1", MSBUILDDISABLENODEREUSE="1")
+    # npm fragt sonst bei jedem Aufruf nach einer neueren eigenen Version.
+    env = dict(os.environ, DOTNET_NOLOGO="1", DOTNET_CLI_TELEMETRY_OPTOUT="1", MSBUILDDISABLENODEREUSE="1",
+               npm_config_update_notifier="false", npm_config_fund="false")
     posix = os.name == "posix"
     started = time.monotonic()
     try:
-        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
                                    encoding="utf-8", errors="replace", env=env, start_new_session=posix)
     except OSError as error:
         return Result(None, "", "", 0.0, f"{args[0]} ließ sich nicht starten: {error}")
@@ -345,6 +373,60 @@ def load_build_config(path: str) -> BuildConfig:
     return config
 
 
+# --- Unbenutzte Ausnahmen über NuGet und npm hinweg --------------------------------------------
+# build.prereleasePackages und build.ignoreAdvisories gelten für NuGet und npm. Ob ein Eintrag nichts
+# mehr trifft, weiß erst, wer beide Ergebnisse kennt. Im Build-Job sind es zwei Schritte: „NuGet-Pakete
+# prüfen“ vor dotnet build, „npm-Pakete prüfen“ nach der Einrichtung von Node. Der erste legt sein
+# Ergebnis in einer Datei ab (--state-file, im Temp-Ordner des Jobs), der zweite urteilt für beide.
+
+LISTS = {"prerelease": "build.prereleasePackages", "advisories": "build.ignoreAdvisories"}
+
+
+@dataclass
+class Usage:
+    ran: bool                  # Prüfung vollständig gelaufen; sonst ist kein Eintrag sicher unbenutzt
+    used: set[str] = field(default_factory=set)   # Schlüssel der getroffenen Einträge, klein geschrieben
+
+
+def used_keys(entries: dict[str, Entry]) -> set[str]:
+    return {key for key, entry in entries.items() if entry.used}
+
+
+def save_state(path: str, check: str, usage: dict[str, Usage]) -> None:
+    """Überschreibt die Datei: Sie gilt nur für den laufenden Job."""
+    data = {check: {name: {"ran": item.ran, "used": sorted(item.used)} for name, item in usage.items()}}
+    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_state(path: str, check: str) -> dict[str, Usage] | None:
+    """Ergebnis einer anderen Prüfung aus der Datei; None, wenn es fehlt oder nicht lesbar ist."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8")).get(check)
+        return {name: Usage(bool(data[name]["ran"]), {str(key) for key in data[name]["used"]}) for name in LISTS}
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return None
+
+
+def warn_unused(config: BuildConfig, path: str, usage: dict[str, Usage], scope: str, log: Log) -> None:
+    """Eine Warnung je Eintrag, den keine Prüfung getroffen hat; nur für Listen, deren Prüfungen alle
+    liefen. Sonst wäre jeder Eintrag „unbenutzt“, etwa wenn die Registry nicht erreichbar war."""
+    for name, entries in (("prerelease", config.prerelease), ("advisories", config.advisories)):
+        unused = [entry for key, entry in entries.items() if key not in usage[name].used]
+        if not unused:
+            continue
+        if not usage[name].ran:
+            log.info(f"Ob alle Einträge in {LISTS[name]} noch nötig sind, bleibt offen: Die Prüfung ({scope}) lief "
+                     "nicht vollständig.")
+            continue
+        for entry in unused:
+            if name == "prerelease":
+                log.warning(f"build.prereleasePackages nennt {short(entry.key, 120)}, aber keine direkte Referenz ({scope}) "
+                            "nutzt davon eine Vorabversion. Den Eintrag entfernen.", path, entry.line)
+            else:
+                log.warning(f"build.ignoreAdvisories nennt {short(entry.key, 120)}, die Prüfung ({scope}) findet diese "
+                            "Lücke nicht mehr. Den Eintrag entfernen.", path, entry.line)
+
+
 # --- Prüfungen ---------------------------------------------------------------------------------
 
 def check_todos(path: str, log: Log) -> None:
@@ -407,10 +489,6 @@ def check_prerelease(data: dict, config: BuildConfig, log: Log) -> None:
                       f"reason in {config.path} unter build.prereleasePackages eintragen ({CHECK_DOC}).")
     if not found:
         log.info("Keine Vorabversionen unter den direkten Paketreferenzen.")
-    for entry in config.prerelease.values():
-        if not entry.used:
-            log.warning(f"build.prereleasePackages nennt {short(entry.key, 120)}, aber keine direkte Referenz nutzt davon eine "
-                        "Vorabversion. Den Eintrag entfernen.", config.path, entry.line)
 
 
 def advisory_id(url: str) -> str:
@@ -475,7 +553,8 @@ def check_outdated(data: dict, log: Log) -> None:
         log.info("Alle direkten Paketreferenzen sind aktuell.")
 
 
-def check_packages(dotnet: str, solution: str, project_yaml: str, runner: Runner, log: Log) -> None:
+def check_packages(dotnet: str, solution: str, project_yaml: str, runner: Runner, log: Log,
+                   state_file: str | None = None) -> None:
     try:
         config = load_build_config(project_yaml)
     except ConfigError as error:
@@ -492,15 +571,21 @@ def check_packages(dotnet: str, solution: str, project_yaml: str, runner: Runner
                                "Prüfung auf bekannte Lücken", runner, log)
     if vulnerable is not None:
         check_vulnerabilities(vulnerable, config, log)
-        # Nur wenn die Prüfung lief: Sonst wäre jeder Eintrag „unbenutzt“.
-        for entry in config.advisories.values():
-            if not entry.used:
-                log.warning(f"build.ignoreAdvisories nennt {short(entry.key, 120)}, die Prüfung findet diese Lücke nicht "
-                            "mehr. Den Eintrag entfernen.", project_yaml, entry.line)
 
     outdated = list_packages(dotnet, solution, ["--outdated"], "Prüfung auf veraltete Pakete", runner, log)
     if outdated is not None:
         check_outdated(outdated, log)
+
+    # Nur wenn eine Abfrage lief, zählt ein Eintrag ihrer Liste als „unbenutzt“.
+    usage = {"prerelease": Usage(plain is not None, used_keys(config.prerelease)),
+             "advisories": Usage(vulnerable is not None, used_keys(config.advisories))}
+    if state_file:
+        save_state(state_file, "nuget", usage)
+        if config.prerelease or config.advisories:
+            log.info("Ob Einträge in build.prereleasePackages und build.ignoreAdvisories nichts mehr treffen, entscheidet "
+                     "„npm-Pakete prüfen“ für NuGet und npm zusammen.")
+    else:
+        warn_unused(config, project_yaml, usage, "NuGet", log)
 
 
 def read_format_report(path: Path, root: Path) -> list[tuple[str, int, int, int]]:
@@ -558,6 +643,378 @@ def check_format(dotnet: str, solution: str, runner: Runner, log: Log, root: Pat
         return
     reason = result.problem or f"Code {result.code}"
     log.warning(f"Formatierung nicht geprüft (dotnet format whitespace: {reason}): {result.tail()}")
+
+
+# --- npm ---------------------------------------------------------------------------------------
+# Geprüft wird jede Lock-Datei im Repo, nicht nur Frontend und Erweiterung: auch npm-Projekte, die
+# ein Projekt in extraBuildSteps baut. npm audit liest mit --package-lock-only nur die Lock-Datei und
+# braucht weder npm ci noch node_modules; so läuft die Prüfung vor jedem npm ci, also bevor
+# Install-Skripte eines Pakets mit bekannter Lücke laufen.
+# .terraform: Module, die terraform init lädt, gehören nicht zum Projekt.
+NPM_SKIP_DIRECTORIES = ("bin", "obj", "node_modules", ".git", ".terraform")
+# Nur Laufzeit-Abhängigkeiten: Lücken in Werkzeugen des Builds (Vite, Vitest, jsdom …) betreffen die
+# ausgelieferte App nicht und wären der größte Teil der Meldungen. --no-offline: Mit offline=true in
+# einer .npmrc fragte npm audit gar nicht und meldete still keine Lücken.
+NPM_AUDIT = ["audit", "--json", "--omit=dev", "--package-lock-only", "--no-offline"]
+
+
+@dataclass
+class NpmProject:
+    directory: Path      # Ordner mit der Lock-Datei
+    label: str           # Ordner relativ zum Checkout, für Meldungen
+    lock_path: str       # Lock-Datei relativ zum Checkout, für Annotationen
+    lock: dict | None    # None: nicht lesbar
+    problem: str = ""
+
+
+@dataclass
+class NpmUnchecked:
+    label: str           # Ordner mit package.json, aber ohne npm-Lock-Datei
+    other_lock: str      # yarn.lock und Co., sonst leer
+
+
+def _relative(path: Path, root: Path) -> str:
+    text = path.relative_to(root).as_posix()
+    return "." if text in ("", ".") else text
+
+
+def _label(directory: Path, root: Path) -> str:
+    """Ordner eines npm-Projekts für Meldungen."""
+    text = _relative(directory, root)
+    return "Wurzelordner" if text == "." else text
+
+
+def _read_json(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("kein JSON-Objekt")
+    return data
+
+
+def _has_runtime_dependencies(manifest: Path) -> bool:
+    try:
+        data = _read_json(manifest)
+    except (OSError, ValueError):
+        return True   # im Zweifel melden
+    return any(isinstance(data.get(section), dict) and data[section]
+               for section in ("dependencies", "optionalDependencies"))
+
+
+def find_npm_projects(root: Path) -> tuple[list[NpmProject], list[NpmUnchecked]]:
+    """Ordner mit npm-Lock-Datei, dazu Ordner mit package.json und Laufzeit-Abhängigkeiten, die keine
+    Lock-Datei abdeckt. Mitglieder eines Workspaces deckt die Lock-Datei des Workspaces ab."""
+    root = root.resolve()
+    projects: list[NpmProject] = []
+    manifests: dict[str, tuple[Path, str]] = {}   # package.json ohne npm-Lock-Datei: Ordner, andere Lock-Datei
+    for directory, subdirectories, files in os.walk(root):
+        subdirectories[:] = sorted(d for d in subdirectories if d.lower() not in NPM_SKIP_DIRECTORIES)
+        here = Path(directory)
+        lock_name = next((name for name in NPM_LOCK_FILES if name in files), None)
+        if lock_name:
+            path = here / lock_name
+            project = NpmProject(here, _label(here, root), _relative(path, root), None)
+            try:
+                project.lock = _read_json(path)
+            except (OSError, ValueError) as error:
+                project.problem = short(getattr(error, "strerror", None) or error, 200)
+            projects.append(project)
+        elif "package.json" in files:
+            manifests[os.path.normcase(directory)] = (here, next((name for name in OTHER_LOCK_FILES if name in files), ""))
+
+    covered = set()
+    for project in projects:
+        covered.add(os.path.normcase(project.directory))
+        packages = (project.lock or {}).get("packages")
+        for key in packages if isinstance(packages, dict) else ():
+            # Workspaces stehen mit ihrem Ordner in packages, installierte Pakete unter node_modules.
+            if key and "node_modules" not in key.split("/"):
+                covered.add(os.path.normcase(os.path.normpath(project.directory / key)))
+    unchecked = [NpmUnchecked(_relative(here, root), other)
+                 for key, (here, other) in sorted(manifests.items())
+                 if key not in covered and _has_runtime_dependencies(here / "package.json")]
+    return projects, unchecked
+
+
+def lock_version(lock: dict, node: str) -> str:
+    """Version eines Pakets an seinem Ort in der Lock-Datei, etwa node_modules/axios."""
+    packages = lock.get("packages")
+    if isinstance(packages, dict):
+        entry = packages.get(node)
+        return str(entry.get("version") or "") if isinstance(entry, dict) else ""
+    # lockfileVersion 1 (npm 6): verschachtelte dependencies statt packages
+    entry: object = lock
+    for name in (part.strip("/") for part in node.split("node_modules/")):
+        if name:
+            entry = ((entry.get("dependencies") if isinstance(entry, dict) else None) or {}).get(name)
+    return str(entry.get("version") or "") if isinstance(entry, dict) and entry is not lock else ""
+
+
+def npm_direct_dependencies(project: NpmProject) -> Iterator[tuple[str, dict]]:
+    """(Name, Eintrag in der Lock-Datei) der direkten Laufzeit-Abhängigkeiten, auch der Workspaces."""
+    lock = project.lock or {}
+    packages = lock.get("packages")
+    if isinstance(packages, dict):
+        for key, entry in packages.items():
+            if "node_modules" in key.split("/") or not isinstance(entry, dict):
+                continue
+            for section in ("dependencies", "optionalDependencies"):
+                for name in entry.get(section) or {}:
+                    # Auflösung wie bei Node: node_modules des Workspaces, dann die Ordner darüber.
+                    parts = key.split("/") if key else []
+                    for depth in range(len(parts), -1, -1):
+                        found = packages.get("/".join([*parts[:depth], "node_modules", name]))
+                        if isinstance(found, dict):
+                            yield name, found
+                            break
+        return
+    # lockfileVersion 1: direkte Abhängigkeiten nur aus package.json
+    try:
+        manifest = _read_json(project.directory / "package.json")
+    except (OSError, ValueError):
+        return
+    installed = lock.get("dependencies") if isinstance(lock.get("dependencies"), dict) else {}
+    for section in ("dependencies", "optionalDependencies"):
+        names = manifest.get(section) if isinstance(manifest.get(section), dict) else {}
+        for name in names:
+            if isinstance(installed.get(name), dict):
+                yield name, installed[name]
+
+
+def check_npm_prerelease(projects: list[NpmProject], config: BuildConfig, path: str, log: Log) -> None:
+    found: dict[str, dict] = {}
+    for project in projects:
+        for name, entry in npm_direct_dependencies(project):
+            version = str(entry.get("version") or "")
+            resolved = str(entry.get("resolved") or "")
+            # Nur Pakete aus einer Registry: Workspaces (link), Ordner (file:) und Git-Repos tragen die
+            # Version aus ihrer eigenen package.json, die keine Vorabversion im Sinne der Regel ist.
+            if entry.get("link") or resolved.startswith(("git", "file:")) or not is_prerelease(version):
+                continue
+            group = found.setdefault(name.lower(), {"id": name, "versions": set(), "projects": set(), "locks": set()})
+            group["versions"].add(version)
+            group["projects"].add(project.label)
+            group["locks"].add(project.lock_path)
+    for key, group in sorted(found.items()):
+        what = f"npm-Paket {group['id']} {joined(group['versions'])} ({joined(group['projects'])})"
+        entry = config.prerelease.get(key)
+        if entry:
+            entry.used = True
+            log.info(f"Vorabversion erlaubt: {what}. Grund laut {path}: {short(entry.reason, 300)}")
+        else:
+            lock = next(iter(group["locks"])) if len(group["locks"]) == 1 else None
+            log.error(f"Vorabversion ohne Begründung: {what}. Eine stabile Version in package.json eintragen oder das "
+                      f"Paket mit reason in {path} unter build.prereleasePackages eintragen ({CHECK_DOC}).", lock)
+    if projects and not found:
+        log.info("Keine Vorabversionen unter den direkten Laufzeit-Abhängigkeiten (npm).")
+
+
+def redact(text: str) -> str:
+    """Anmeldedaten in einer URL (https://user:token@host/) aus Meldungen von npm entfernen."""
+    return re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", text)
+
+
+def parse_npm_json(text: str) -> dict | None:
+    """Das erste JSON-Objekt in der Ausgabe von npm --json."""
+    for match in re.finditer(r"^\s*\{", text, re.MULTILINE):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text, match.end() - 1)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def audit_failure(data: dict | None, result: Result) -> str:
+    """Warum npm audit keinen Bericht lieferte, für die Warnung. Den Body der Antwort lässt die
+    Meldung weg: Er kommt von der Registry oder einem Proxy und kann alles enthalten."""
+    if data:
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        parts = [str(part) for part in (data.get("message"), error.get("code"), error.get("summary")) if part]
+        if data.get("statusCode"):
+            parts.append(f"HTTP {data['statusCode']}")
+        if parts:
+            return short(redact(", ".join(parts)), 400)
+        if "advisories" in data or "actions" in data:
+            return "Ausgabe von npm vor Version 7, die Prüfung braucht npm ab Version 7"
+    if result.problem:
+        return result.problem
+    return f"Code {result.code}: {short(redact(result.tail()), 400)}"
+
+
+def npm_registry(npm: str, project: NpmProject, runner: Runner) -> str:
+    """Registry, die npm audit in diesem Ordner fragt (.npmrc), ohne Anmeldedaten; leer, wenn unbekannt."""
+    result = runner([npm, "config", "get", "registry"], 30, str(project.directory))
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()] if result.code == 0 else []
+    if not lines:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(lines[-1])
+        host = f"{parts.hostname}:{parts.port}" if parts.port else parts.hostname
+    except ValueError:
+        return ""
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", "")) if host else ""
+
+
+@dataclass
+class NpmAdvisory:
+    id: str
+    url: str
+    severity: str
+    title: str
+
+
+@dataclass
+class NpmFinding:
+    """Ein npm-Paket mit Lücken, über alle Projekte."""
+    name: str
+    versions: set[str] = field(default_factory=set)
+    projects: set[str] = field(default_factory=set)
+    locks: set[str] = field(default_factory=set)
+    advisories: dict[str, NpmAdvisory] = field(default_factory=dict)   # Schlüssel: Kennung klein
+
+
+def collect_npm_vulnerabilities(report: dict, project: NpmProject, found: dict[str, NpmFinding]) -> None:
+    for name, item in sorted(report["vulnerabilities"].items()):
+        if not isinstance(item, dict):
+            continue
+        # via nennt Advisories als Objekt und verwundbare Abhängigkeiten als Namen. Ein Paket nur mit
+        # Namen ist allein über eine Abhängigkeit betroffen; die meldet ihr eigener Eintrag.
+        advisories = [via for via in item.get("via") or [] if isinstance(via, dict)]
+        if not advisories:
+            continue
+        finding = found.setdefault(name, NpmFinding(name))
+        versions = {lock_version(project.lock or {}, str(node)) for node in item.get("nodes") or []} - {""}
+        finding.versions |= versions or {"?"}
+        finding.projects.add(project.label if item.get("isDirect") else f"{project.label} (transitiv)")
+        finding.locks.add(project.lock_path)
+        for via in advisories:
+            url = str(via.get("url") or "")
+            ident = advisory_id(url) if url else f"npm-Advisory {via.get('source') or '?'}"
+            finding.advisories.setdefault(ident.lower(), NpmAdvisory(ident, url, str(via.get("severity") or ""),
+                                                                     str(via.get("title") or "")))
+
+
+def _advisory_list(advisories: list[NpmAdvisory]) -> str:
+    shown = [f"{a.id} ({a.severity or 'Schwere unbekannt'})" for a in advisories[:MAX_ADVISORIES]]
+    more = len(advisories) - len(shown)
+    return ", ".join(shown) + (f" und {more} weitere (siehe Log)" if more else "")
+
+
+def _gaps(count: int) -> str:
+    return "1 Lücke" if count == 1 else f"{count} Lücken"
+
+
+def check_npm_vulnerabilities(found: dict[str, NpmFinding], config: BuildConfig, path: str, log: Log) -> None:
+    """Eine Meldung je Paket statt je Advisory: Ein altes Paket hat bei npm oft ein Dutzend, und
+    behoben werden sie alle mit derselben neuen Version. Die Ausnahmen gelten je Advisory."""
+    for name, finding in sorted(found.items()):
+        what = f"npm-Paket {name} {joined(finding.versions)} in {joined(finding.projects)}"
+        open_advisories = []
+        for key, advisory in sorted(finding.advisories.items()):
+            entry = config.advisories.get(key) or config.advisories.get(advisory.url.lower())
+            if entry:
+                entry.used = True
+                log.info(f"Lücke {advisory.id} ({advisory.severity or 'Schwere unbekannt'}) in {what}: {advisory.url}. "
+                         f"Hingenommen laut {path}: {short(entry.reason, 300)}")
+            else:
+                open_advisories.append(advisory)
+        if not open_advisories:
+            continue
+        severe = [a for a in open_advisories if a.severity.lower() in SEVERITY_ERROR]
+        other = [a for a in open_advisories if a not in severe]
+        lock = next(iter(finding.locks)) if len(finding.locks) == 1 else None
+        if severe:
+            also = f"; dazu {_gaps(len(other))} Low oder Moderate" if other else ""
+            log.error(f"{what}: {_gaps(len(severe))} High oder Critical: {_advisory_list(severe)}{also}. Das Paket auf "
+                      "eine Version ohne diese Lücken heben (etwa npm audit fix im Ordner des Projekts; ein transitives "
+                      "Paket über die direkte Abhängigkeit oder overrides in package.json) oder jede Advisory mit reason "
+                      f"in {path} unter build.ignoreAdvisories eintragen ({CHECK_DOC}).", lock)
+        else:
+            # Low, Moderate und unbekannte Schwere: sichtbar, aber kein Halt, wie bei NuGet.
+            log.warning(f"{what}: {_gaps(len(other))} Low oder Moderate: {_advisory_list(other)}. Das Paket bei "
+                        "Gelegenheit heben.", lock)
+        for advisory in severe + other:
+            log.info(f"  {advisory.id} ({advisory.severity or 'Schwere unbekannt'}) {name}: {short(advisory.title, 160)} "
+                     f"{advisory.url}")
+
+
+def audit_npm(projects: list[NpmProject], npm: str | None, config: BuildConfig, path: str, runner: Runner,
+              log: Log) -> bool:
+    """npm audit je Projekt; True, wenn alle Projekte geprüft sind."""
+    if not projects:
+        return True
+    if npm is None:
+        log.warning(f"npm-Pakete nicht auf Lücken geprüft: kein npm auf dem Agent ({joined({p.lock_path for p in projects})}). "
+                    f"Node einrichten, etwa mit UseNode@1 in preBuildSteps ({CHECK_DOC}).")
+        return False
+    complete = True
+    found: dict[str, NpmFinding] = {}
+    for project in projects:
+        registry = npm_registry(npm, project, runner)
+        if registry and urllib.parse.urlsplit(registry).hostname != NPM_DEFAULT_REGISTRY:
+            log.info(f"{project.label}: npm audit fragt {registry} (npm-Konfiguration, etwa .npmrc). Diese Registry "
+                     "muss Daten zu Lücken liefern, wie Azure Artifacts über npmjs; sonst meldet npm still keine.")
+        result = runner([npm, *NPM_AUDIT], NPM_TIMEOUT, str(project.directory))
+        data = parse_npm_json(result.stdout)
+        # Der Exit-Code sagt nichts: 1 auch bei Lücken, 0 trotz Lücken mit audit-level in .npmrc.
+        if data is None or "auditReportVersion" not in data or not isinstance(data.get("vulnerabilities"), dict):
+            complete = False
+            log.warning(f"Prüfung auf bekannte Lücken in {project.label} nicht möglich (npm audit: "
+                        f"{audit_failure(data, result)}). Der Build läuft weiter; meist ist die Registry nicht "
+                        "erreichbar oder verlangt eine Anmeldung (preBuildSteps).", project.lock_path)
+            continue
+        counts = (data.get("metadata") or {}).get("dependencies") or {}
+        prod = f"{counts['prod']} Laufzeit-Pakete, " if isinstance(counts, dict) and "prod" in counts else ""
+        log.info(f"npm audit in {project.label}: {prod}{result.seconds:.0f} s")
+        collect_npm_vulnerabilities(data, project, found)
+    check_npm_vulnerabilities(found, config, path, log)
+    if complete and not found:
+        log.info("Keine bekannten Lücken in den Laufzeit-Abhängigkeiten (npm, direkt und transitiv).")
+    return complete
+
+
+def check_npm(root: Path, project_yaml: str, npm: str | None, runner: Runner, log: Log,
+              state_file: str | None = None) -> None:
+    try:
+        config = load_build_config(project_yaml)
+    except ConfigError as error:
+        log.error(f"{project_yaml} {error}", project_yaml)
+        return
+    for message, line in config.problems:
+        log.error(message, project_yaml, line)
+
+    projects, unchecked = find_npm_projects(root)
+    for item in unchecked:
+        other = f" ({item.other_lock}; die Prüfung liest nur package-lock.json)" if item.other_lock else ""
+        manifest = "package.json" if item.label == "." else f"{item.label}/package.json"
+        log.warning(f"{manifest} hat Laufzeit-Abhängigkeiten, aber keine package-lock.json{other}. Lücken und "
+                    "Vorabversionen sind dort nicht prüfbar. Die Lock-Datei mit npm install erzeugen und einchecken.",
+                    manifest)
+    readable = [project for project in projects if project.lock is not None]
+    for project in projects:
+        if project.lock is None:
+            log.warning(f"{project.lock_path} nicht lesbar: {project.problem}", project.lock_path)
+    if projects:
+        log.info(f"npm-Projekte: {joined({project.label for project in projects})}.")
+    else:
+        log.info("Keine package-lock.json im Repo, keine npm-Pakete zu prüfen.")
+
+    check_npm_prerelease(readable, config, project_yaml, log)
+    audited = audit_npm(readable, npm, config, project_yaml, runner, log)
+
+    complete = len(readable) == len(projects)
+    usage = {"prerelease": Usage(complete, used_keys(config.prerelease)),
+             "advisories": Usage(complete and audited, used_keys(config.advisories))}
+    scope = "npm"
+    if state_file:
+        nuget = load_state(state_file, "nuget")
+        if nuget is None:
+            log.info(f"Kein Ergebnis von „NuGet-Pakete prüfen“ in {state_file}.")
+            nuget = {name: Usage(False) for name in LISTS}
+        usage = {name: Usage(item.ran and nuget[name].ran, item.used | nuget[name].used) for name, item in usage.items()}
+        scope = "NuGet und npm"
+    warn_unused(config, project_yaml, usage, scope, log)
 
 
 # --- Abgeschaltete Regeln ----------------------------------------------------------------------
@@ -744,10 +1201,18 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     todos = commands.add_parser("todos", help="TODO(onboarding) in project.yaml")
     todos.add_argument("--project-yaml", default="project.yaml")
+    state_help = ("Datei, über die packages und npm unbenutzte Ausnahmen gemeinsam beurteilen; packages schreibt "
+                  "sie, npm liest sie")
     packages = commands.add_parser("packages", help="Vorabversionen, Lücken und veraltete Pakete")
     packages.add_argument("--solution", required=True)
     packages.add_argument("--project-yaml", default="project.yaml")
     packages.add_argument("--dotnet", default="dotnet")
+    packages.add_argument("--state-file", help=state_help)
+    npm = commands.add_parser("npm", help="Lücken und Vorabversionen der npm-Projekte im Repo")
+    npm.add_argument("--project-yaml", default="project.yaml")
+    npm.add_argument("--root", default=".")
+    npm.add_argument("--npm", default="npm")
+    npm.add_argument("--state-file", help=state_help)
     fmt = commands.add_parser("format", help="dotnet format whitespace --verify-no-changes")
     fmt.add_argument("--solution", required=True)
     fmt.add_argument("--dotnet", default="dotnet")
@@ -762,7 +1227,10 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
     if args.command == "todos":
         check_todos(args.project_yaml, log)
     elif args.command == "packages":
-        check_packages(args.dotnet, args.solution, args.project_yaml, runner, log)
+        check_packages(args.dotnet, args.solution, args.project_yaml, runner, log, args.state_file)
+    elif args.command == "npm":
+        # Unter Windows (lokal) findet erst which npm.cmd.
+        check_npm(Path(args.root), args.project_yaml, shutil.which(args.npm), runner, log, args.state_file)
     elif args.command == "suppressions":
         check_suppressions(Path(args.root).resolve(), log)
     else:

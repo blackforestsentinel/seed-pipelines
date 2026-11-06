@@ -1,0 +1,43 @@
+# Prüfung der npm-Pakete im Build-Job, nach der Einrichtung von Node und vor dotnet build und jedem
+# npm ci, auch im PR-Lauf und mit validationOnly (README, Prüfungen im Build). Geprüft wird jede
+# package-lock.json im Repo (ohne node_modules), also Frontend, Browser-Erweiterung und eigene
+# npm-Projekte, etwa aus extraBuildSteps:
+#   - Lücken der Laufzeit-Abhängigkeiten, auch transitiv (npm audit --omit=dev --package-lock-only):
+#     High und Critical sind Fehler, außer die Advisory steht mit Begründung in project.yaml
+#     (build.ignoreAdvisories, dieselbe Liste wie für NuGet); Low und Moderate sind Warnungen;
+#   - direkte Laufzeit-Abhängigkeiten in einer Vorabversion: Fehler, außer das Paket steht mit
+#     Begründung in build.prereleasePackages;
+#   - package.json mit Laufzeit-Abhängigkeiten ohne package-lock.json: Warnung.
+# Ist die Registry nicht erreichbar oder fehlt npm auf dem Agent, gibt es eine Warnung statt eines
+# Fehlers. npm kommt aus UseNode@1 in web-app.yml (mit Frontend oder Erweiterung), sonst vom Agent.
+#
+# Die Logik steht in scripts/dotnet/checks.py (Unterbefehl npm, mit Tests), wie die der NuGet-Prüfung
+# in steps/dotnet-checks.yml. Über stateFile urteilt dieser Schritt auch für „NuGet-Pakete prüfen“, ob
+# ein Eintrag in build.prereleasePackages oder build.ignoreAdvisories nichts mehr trifft. Werte aus dem
+# Repo und Ausgaben von npm gibt das Skript nur bereinigt aus.
+parameters:
+  - name: projectYaml
+    type: string
+    default: project.yaml
+  # Dieselbe Datei wie stateFile in steps/dotnet-checks.yml; leer: Die Prüfung urteilt nur für npm.
+  - name: stateFile
+    type: string
+    default: ''
+
+steps:
+  - bash: |
+      set -euo pipefail
+      # PyYAML wie in steps/dotnet-checks.yml: notfalls das python3 des Systems.
+      python=python3
+      if ! python3 -c 'import yaml' 2> /dev/null && [ -x /usr/bin/python3 ]; then
+        python=/usr/bin/python3
+      fi
+      set --
+      if [ -n "$SEED_STATE_FILE" ]; then
+        set -- --state-file "$SEED_STATE_FILE"
+      fi
+      "$python" "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" npm --project-yaml "$SEED_PROJECT_YAML" "$@"
+    displayName: npm-Pakete prüfen
+    env:
+      SEED_PROJECT_YAML: ${{ parameters.projectYaml }}
+      SEED_STATE_FILE: ${{ parameters.stateFile }}

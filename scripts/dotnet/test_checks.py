@@ -296,6 +296,43 @@ class VulnerabilityTests(Work):
         self.assertIn("GHSA-5crp-9r3c-p9vr ohne reason", out)
 
 
+class StateFileTests(Work):
+    """Mit --state-file urteilt „npm-Pakete prüfen“ über unbenutzte Einträge, für NuGet und npm."""
+
+    def packages_with_state(self, fake):
+        state = self.root / "state.json"
+        log = checks.Log()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            checks.check_packages("dotnet", "api/Api.slnx", str(self.project_yaml), fake, log, str(state))
+        return log, out.getvalue(), json.loads(state.read_text(encoding="utf-8"))
+
+    def test_unused_entries_are_left_to_npm_step(self):
+        fake = FakeDotnet(plain=listing(("/a/api/Api/Api.csproj", [package("Example.Preview", "1.0.0-rc.1")], [])),
+                          vulnerable=listing(), outdated=listing())
+        log, out, state = self.packages_with_state(fake)
+        self.assertEqual((log.errors, log.warnings), (0, 0), out)
+        self.assertNotIn("nennt", out)
+        self.assertIn("entscheidet „npm-Pakete prüfen“", out)
+        self.assertEqual(state, {"nuget": {"prerelease": {"ran": True, "used": ["example.preview"]},
+                                           "advisories": {"ran": True, "used": []}}})
+        loaded = checks.load_state(str(self.root / "state.json"), "nuget")
+        self.assertEqual(loaded["prerelease"].used, {"example.preview"})
+
+    def test_failed_query_is_recorded(self):
+        fake = FakeDotnet(plain=listing(), vulnerable=checks.Result(1, "error: Unable to load the service index", ""),
+                          outdated=listing())
+        _, _, state = self.packages_with_state(fake)
+        self.assertEqual(state["nuget"]["advisories"], {"ran": False, "used": []})
+        self.assertTrue(state["nuget"]["prerelease"]["ran"])
+
+    def test_unreadable_state(self):
+        path = self.root / "state.json"
+        for text in ("kein JSON", "[]", '{"nuget": {"prerelease": {}}}'):
+            path.write_text(text, encoding="utf-8")
+            self.assertIsNone(checks.load_state(str(path), "nuget"), text)
+        self.assertIsNone(checks.load_state(str(self.root / "fehlt.json"), "nuget"))
+
+
 class OutdatedTests(Work):
     def test_one_warning_per_package(self):
         top = [package("Worker", "2.51.0", latest="2.52.0"), package("Missing.Internal", "1.0.0", latest="Not found at the sources")]

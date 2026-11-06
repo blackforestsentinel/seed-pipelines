@@ -59,7 +59,7 @@ extends:
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), der Hinweis auf veraltetes Seed, `terraform fmt` und `validate`, der Terraform-Sicherheitsscan, die eigenen Schritte aus `preBuildSteps`, die Prüfungen der API (offene `TODO(onboarding)`, Formatierung, NuGet-Pakete; siehe Prüfungen im Build), `dotnet build` mit Warnungen als Fehler, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), der Hinweis auf veraltetes Seed, `terraform fmt` und `validate`, der Terraform-Sicherheitsscan, die eigenen Schritte aus `preBuildSteps`, die Prüfungen im Build (offene `TODO(onboarding)`, Formatierung, NuGet- und npm-Pakete; siehe Prüfungen im Build), `dotnet build` mit Warnungen als Fehler, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
 | `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>`. Mit `features.customConnector` prüft danach der Job `connector_check`, ob die neue OpenAPI-Definition Flows bricht (siehe Prüfung des Custom Connectors) |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
@@ -191,6 +191,7 @@ extends:
 - **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`, denn ohne Restore gibt es keinen Build.
 - **Rechte:** `NuGetAuthenticate@1` und `npmAuthenticate@0` melden sich ohne Secret mit dem Job-Token an, also als `<Projekt> Build Service (<org>)` oder, wenn das Projekt den Job-Scope nicht auf sich beschränkt, als `Project Collection Build Service (<org>)`. Diese Identität braucht am Feed mindestens die Rolle Feed Reader (Feed settings, Permissions). Liegt der Feed in einem anderen Projekt, braucht sie zusätzlich Lesezugriff auf dieses Projekt (Gruppe Readers). Für Feeds einer anderen Organisation oder außerhalb von Azure DevOps nennt der Schritt eine NuGet-Service-Connection des Projekts (`nuGetServiceConnections`). Eine Azure-Service-Connection bekommen die Schritte nicht.
 - Für die Anmeldung taugt `extraBuildSteps` nicht: Diese Schritte laufen erst nach Build und Tests.
+- **Lücken:** Die NuGet-Prüfung fragt immer nuget.org, die npm-Prüfung die Registry aus `.npmrc`; Azure Artifacts leitet `npm audit` an npmjs weiter (siehe Prüfungen im Build).
 
 **Dependency Confusion:** Kennt der Restore neben dem privaten Feed auch nuget.org oder npmjs.com, kann ein öffentliches Paket mit dem Namen eines internen (und höherer Version) das interne ersetzen; sein Code liefe dann im Build und in der App. Deshalb legt jedes Paket fest, woher es kommt:
 
@@ -245,21 +246,22 @@ extends:
 
 ### Prüfungen im Build
 
-Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ein Hinweis in der README wirkt kaum. Der Build-Job prüft deshalb die API, auch im PR-Lauf und mit `validationOnly`. Ausnahmen gibt es, aber nur im Projekt und mit Begründung, damit sie im PR zu sehen sind.
+Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ein Hinweis in der README wirkt kaum. Der Build-Job prüft deshalb die API und die npm-Pakete, auch im PR-Lauf und mit `validationOnly`. Ausnahmen gibt es, aber nur im Projekt und mit Begründung, damit sie im PR zu sehen sind.
 
 | Prüfung | Ergebnis | Ausnahme |
 | --- | --- | --- |
 | Warnungen des Compilers, zu Nullable, der Analyzer und von MSBuild-Tasks in `dotnet build` und `dotnet publish` | Fehler | je Warnung im Projekt (unten); alle mit `treatWarningsAsErrors: false` |
-| Direkte NuGet-Referenz in einer Vorabversion (`-preview`, `-rc` …) | Fehler | `build.prereleasePackages` in `project.yaml` |
-| Bekannte Lücke High oder Critical, auch in transitiven Paketen | Fehler | `build.ignoreAdvisories` in `project.yaml` |
+| Direkte NuGet-Referenz oder direkte npm-Laufzeit-Abhängigkeit in einer Vorabversion (`-preview`, `-rc`, `-beta` …) | Fehler | `build.prereleasePackages` in `project.yaml` |
+| Bekannte Lücke High oder Critical, auch in transitiven Paketen (bei npm nur in Laufzeit-Abhängigkeiten) | Fehler | `build.ignoreAdvisories` in `project.yaml` |
 | Bekannte Lücke Low oder Moderate | Warnung | – |
-| Veraltete direkte Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| `package.json` mit Laufzeit-Abhängigkeiten, aber ohne `package-lock.json` | Warnung | – |
+| Veraltete direkte NuGet-Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
 | `RS0030` (verbotene APIs) oder eine Regel aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) abgeschaltet | Fehler | Kommentar mit dem Grund in der Zeile davor |
 | Analyzer pauschal abgeschaltet (`RunAnalyzers`, `dotnet_analyzer_diagnostic.severity` …) | Warnung | – |
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
 | `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
 
-Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte zusammen rund 15 Sekunden (Pakete 10, Formatierung 5); auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Danach richtet das Template Node in `nodeVersion` ein (mit Frontend oder `extension`), und „npm-Pakete prüfen“ ([`templates/steps/npm-checks.yml`](templates/steps/npm-checks.yml)) folgt, ebenfalls vor `dotnet build` und vor jedem `npm ci`. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` und `npm` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte der API zusammen rund 15 Sekunden (Pakete 10, Formatierung 5), die npm-Prüfung 2 bis 4 Sekunden je npm-Projekt; auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
 
 **Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
 
@@ -287,7 +289,7 @@ Diese Warnungen bleiben auch mit `-warnaserror` Warnungen (`-warnNotAsError`):
 
 Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration des Projekts und lassen sich dort beheben oder begründet abschalten, etwa `NU1507` (mehrere Paketquellen ohne `packageSourceMapping`, siehe Privater Paket-Feed), `NU1510` (überflüssige Paketreferenz) oder `NU1701` (Paket nur für .NET Framework). Das gilt auch für den inneren Build der Function (`WorkerExtensions`), den das Functions-SDK während des Builds wiederherstellt.
 
-**Pakete** („NuGet-Pakete prüfen“), drei Abfragen mit `--format json`:
+**NuGet-Pakete** („NuGet-Pakete prüfen“), drei Abfragen mit `--format json`:
 
 - `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
 - `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
@@ -295,23 +297,37 @@ Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration d
 
 Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
 
+**npm-Pakete** („npm-Pakete prüfen“): jede `package-lock.json` (oder `npm-shrinkwrap.json`) im Repo, ohne `node_modules`, `bin`, `obj` und `.terraform`. Das sind Frontend und Browser-Erweiterung, aber auch npm-Projekte, die ein Projekt selbst in `extraBuildSteps` baut. Je Ordner mit Lock-Datei:
+
+- `npm audit --json --omit=dev --package-lock-only --no-offline`: bekannte Lücken der Laufzeit-Abhängigkeiten, direkt und transitiv, aus der GitHub Advisory Database. `--package-lock-only` liest nur die Lock-Datei; die Prüfung braucht also kein `npm ci` und läuft davor, bevor Install-Skripte eines Pakets mit bekannter Lücke laufen. `--no-offline`, weil npm mit `offline=true` in einer `.npmrc` gar nicht fragt und still keine Lücken meldet. Maßgeblich ist das JSON, nicht der Exit-Code: Den verschiebt `audit-level` in einer `.npmrc`.
+- Schwere und Ausnahmen wie bei NuGet: High und Critical sind Fehler, außer die Advisory steht in `build.ignoreAdvisories`; Low und Moderate sind Warnungen. Gemeldet wird je Paket, nicht je Advisory: Eine alte Version hat bei npm oft ein Dutzend, behoben werden sie mit derselben neuen Version. Die Meldung nennt bis zu acht Kennungen, das Log jede mit Titel und Link. Die Ausnahmen gelten je Advisory; nennt npm dieselbe Advisory für zwei Pakete (etwa eine Bibliothek und ihre eingebaute Abhängigkeit), gilt der Eintrag für beide.
+- Vorabversionen: direkte Laufzeit-Abhängigkeiten (`dependencies`, `optionalDependencies`, auch der Workspaces) in einer Vorabversion laut Lock-Datei sind Fehler, außer das Paket steht in `build.prereleasePackages`. Workspaces selbst, Ordner (`file:`) und Git-Repos zählen nicht. Dieser Teil liest nur die Lock-Datei und braucht weder npm noch Netz.
+- Workspaces prüft der Aufruf im Ordner der gemeinsamen Lock-Datei mit; Mitglieder ohne eigene Lock-Datei sind damit abgedeckt. Lock-Dateien von npm 6 (`lockfileVersion` 1) gehen auch.
+- Ein Ordner mit `package.json` und Laufzeit-Abhängigkeiten, aber ohne Lock-Datei, gibt eine Warnung; `yarn.lock` und `pnpm-lock.yaml` liest `npm audit` nicht. Ordner nur mit `devDependencies` (etwa für Werkzeuge) übergeht die Prüfung.
+- **npm** kommt aus `UseNode@1` (Version `nodeVersion`), das das Template mit Frontend oder `extension` vor diesem Schritt einrichtet. Ohne beides nimmt die Prüfung das npm des Agents; gehostete Agents bringen eins mit. Fehlt npm, obwohl es Lock-Dateien gibt, warnt der Schritt „nicht auf Lücken geprüft“; dann Node in `preBuildSteps` einrichten (`- task: UseNode@1` mit `inputs: { version: '24.x' }`). Geprüft mit npm 10, 11 (Node 24) und 12; npm vor Version 7 kennt das Format nicht.
+- **Registry:** `npm audit` fragt die Registry aus der npm-Konfiguration des Ordners (`.npmrc`), wie `npm ci`. Ist das nicht registry.npmjs.org, nennt das Log sie: Sie muss Daten zu Lücken liefern. Azure Artifacts leitet die Anfrage an npmjs weiter; dabei gehen, wie bei jedem `npm ci`, die Namen und Versionen aller Pakete an die öffentliche Registry. Ist die Registry nicht erreichbar, verlangt sie eine Anmeldung oder dauert die Antwort länger als 2 Minuten, gibt es eine Warnung „… nicht möglich“ statt eines Fehlers.
+
 ```yaml
 # project.yaml
 build:
-  # Vorabversionen direkter Referenzen (NuGet-Paket-ID, Groß- und Kleinschreibung egal)
+  # Vorabversionen direkter Abhängigkeiten (NuGet-Paket-ID oder npm-Paketname, Groß- und
+  # Kleinschreibung egal)
   prereleasePackages:
     - name: Some.Package
       reason: Nur die Vorabversion unterstützt X; die stabile Version ist angekündigt.
-  # Bekannte Lücken bewusst hinnehmen (GHSA-Kennung aus der Meldung oder die URL der Advisory)
+  # Bekannte Lücken bewusst hinnehmen, NuGet und npm (GHSA-Kennung aus der Meldung oder die URL
+  # der Advisory)
   ignoreAdvisories:
     - id: GHSA-xxxx-xxxx-xxxx
       reason: Betrifft nur Y, das die API nicht nutzt.
 ```
 
 - Ein Eintrag ohne `reason` ist ein Fehler, ebenso einer mit weniger als 10 Zeichen (ohne Leerraum am Rand) und einer, dessen `reason` YAML nicht als Text liest (`no`, `2026-01-01`; dann in Anführungszeichen). Dieselbe Grenze gilt für die Begründungen der Analyzer aus Bfs.Seed und des Terraform-Scans.
-- Trifft ein Eintrag nichts mehr, warnt der Schritt; der Eintrag gehört dann entfernt. So veralten Ausnahmen nicht unbemerkt.
+- Trifft ein Eintrag weder bei NuGet noch bei npm etwas, warnt „npm-Pakete prüfen“; der Eintrag gehört dann entfernt. So veralten Ausnahmen nicht unbemerkt. Das Ergebnis der NuGet-Prüfung liest der Schritt aus `$(Agent.TempDirectory)/seed-package-checks.json` (Parameter `stateFile` beider Schritt-Templates). Lief eine der Prüfungen nicht vollständig (Netz, kein npm), bleibt es bei einem Hinweis im Log.
 - Eine Ausnahme, die greift, steht mit ihrem Grund im Log.
-- Eine Lücke in einem transitiven Paket behebt meist eine direkte Referenz auf eine Version ohne die Lücke.
+- Eine Lücke in einem transitiven Paket behebt meist eine direkte Referenz auf eine Version ohne die Lücke; bei npm geht auch `overrides` in `package.json`. `npm audit fix` im Ordner des Projekts hebt, was ohne neue Hauptversion geht.
+
+**Grenzen der npm-Prüfung:** Lücken in `devDependencies` (Vite, Vitest, jsdom …) meldet sie nicht; sie laufen nur im Build und auf Entwicklerrechnern, nicht in der ausgelieferten App. Ohne `--omit=dev` wären sie die meisten Meldungen. Sie prüft nur, was in Lock-Dateien steht, und nur Pakete mit Einträgen in der GitHub Advisory Database; ein Paket mit Schadcode, für das es noch keine Advisory gibt, erkennt sie nicht. Veraltete npm-Pakete meldet sie nicht, außer `@blackforestsentinel/seed-web-*` über „Seed-Versionen prüfen“.
 
 **Abgeschaltete Regeln** („Abgeschaltete Regeln prüfen“): `RS0030` (verbotene APIs, `BannedApiAnalyzers`) und die Regeln aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) darf ein Projekt nur mit Begründung abschalten. Der Schritt durchsucht alle `.editorconfig`, `.globalconfig`, Projektdateien, `.props`, `.targets` und `.rsp` im Repo, ohne `bin`, `obj` und `node_modules`, nach:
 
@@ -330,7 +346,7 @@ Die Begründung ist ein Kommentar in der Zeile direkt davor (`#` bzw. `<!-- -->`
 
 **Offene TODOs** („Offene TODOs in project.yaml“): eine Warnung je Zeile mit `TODO(onboarding)` in `project.yaml` (auch `TODO (onboarding)`), mit Zeilennummer. So markiert ein Projekt Angaben, die beim Onboarding noch fehlen. Den Punkt erledigen und die Markierung entfernen.
 
-**Lokal**, im Checkout des Projekts, mit einem Klon von seed-pipelines daneben und Python mit PyYAML:
+**Lokal**, im Checkout des Projekts, mit einem Klon von seed-pipelines daneben, Python mit PyYAML und npm:
 
 ```bash
 dotnet restore api/Api.slnx
@@ -339,8 +355,13 @@ dotnet build api/Api.slnx -c Release --no-restore -warnaserror -warnNotAsError:N
 python3 ../seed-pipelines/scripts/dotnet/checks.py todos --project-yaml project.yaml
 python3 ../seed-pipelines/scripts/dotnet/checks.py suppressions
 python3 ../seed-pipelines/scripts/dotnet/checks.py format --solution api/Api.slnx
-python3 ../seed-pipelines/scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
+# Mit derselben --state-file urteilt die npm-Prüfung wie in der Pipeline über NuGet und npm, ob
+# Ausnahmen nichts mehr treffen; ohne urteilt jede Prüfung nur für sich.
+python3 ../seed-pipelines/scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml --state-file /tmp/seed-package-checks.json
+python3 ../seed-pipelines/scripts/dotnet/checks.py npm --project-yaml project.yaml --state-file /tmp/seed-package-checks.json
 ```
+
+Nur die Lücken eines npm-Projekts zeigt auch `npm audit --omit=dev --package-lock-only` in dessen Ordner.
 
 ### Vorschau ohne Lauf
 
@@ -363,19 +384,30 @@ $common = @{
   -AbsentBuildSteps 'npm ci (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Artefakt extension'
 # Mit Browser-Erweiterung: ihr Build nach dem Frontend und vor den eigenen Schritten
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
-  -ExpectBuildSteps 'npm run build', 'npm ci (Erweiterung)', 'npm test (Erweiterung)', `
-    'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Lint (Beispiel)', 'Artefakt web', `
-    'Artefakt extension'
+  -ExpectBuildSteps 'Node 24.x', 'npm-Pakete prüfen', 'dotnet build', 'npm ci', 'npm run build', `
+    'npm ci (Erweiterung)', 'npm test (Erweiterung)', 'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', `
+    'Lint (Beispiel)', 'Artefakt web', 'Artefakt extension'
 # Prüflauf wie im PR: Scans, Prüfungen im Build und eigene Schritte ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
   -ExpectBuildSteps 'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
     'Terraform-Sicherheitsscan (Trivy 0.76.1)', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
     'Offene TODOs in project.yaml', 'Abgeschaltete Regeln prüfen', 'Formatierung prüfen', 'NuGet-Pakete prüfen', `
-    'dotnet build', 'dotnet test', 'npm run build', 'Lint (Beispiel)' `
-  -AbsentBuildSteps 'Artefakt web', 'Artefakt api' -ExpectText 'warnaserror -warnNotAsError:NU1603'
+    'Node 24.x', 'npm-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm ci', 'npm run build', 'Lint (Beispiel)' `
+  -AbsentBuildSteps 'Artefakt web', 'Artefakt api' -ExpectText 'warnaserror -warnNotAsError:NU1603', `
+    'seed-package-checks.json'
+# Ohne Frontend und Erweiterung: npm-Prüfung mit dem npm des Agents, kein Node, kein npm ci
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/api-only.yml `
+  -ExpectBuildSteps 'NuGet-Pakete prüfen', 'npm-Pakete prüfen', 'dotnet build', 'dotnet test' `
+  -AbsentBuildSteps 'Node 24.x', 'npm ci', 'npm ci (Erweiterung)'
+# Erweiterung ohne Frontend: Node genau einmal, vor der npm-Prüfung
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension-only.yml `
+  -ExpectBuildSteps 'NuGet-Pakete prüfen', 'Node 24.x', 'npm-Pakete prüfen', 'dotnet build', 'npm ci (Erweiterung)', `
+    'Manifest der Erweiterung prüfen' `
+  -AbsentBuildSteps 'npm ci', 'npm run build', 'Artefakt extension'
 # Ohne Warnungen als Fehler (treatWarningsAsErrors: false), die übrigen Prüfungen bleiben
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/warnings-allowed.yml `
-  -ExpectBuildSteps 'dotnet restore', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test' -AbsentText 'warnaserror'
+  -ExpectBuildSteps 'dotnet restore', 'NuGet-Pakete prüfen', 'npm-Pakete prüfen', 'dotnet build', 'dotnet test' `
+  -AbsentText 'warnaserror'
 # Erweiterung ohne signing: im Deploy nur Paket und Artefakt
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
   -ExpectDeploySteps 'Custom Connector', 'Browser-Erweiterung packen', "Artefakt extension_$($common.Replace.ENVIRONMENT)" `
@@ -563,7 +595,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
 - **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 mit PyYAML und der Azure CLI. PyYAML (Paket `python3-yaml`) haben Ubuntu-Server, gehostete Agents und Ubuntu unter WSL schon, als Abhängigkeit von netplan und cloud-init; sonst `apt install python3-yaml`. Die Paketprüfung im Build liest damit `project.yaml` (siehe Prüfungen im Build). Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7.2 oder neuer (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
-- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform, gitleaks und Trivy. Terraform, gitleaks und Trivy prüft sie per SHA-256 und lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider). Der Hinweis auf veraltetes Seed fragt github.com, api.nuget.org und registry.npmjs.org ab; ohne diese Ziele entfällt er still.
+- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion` (mit Frontend oder `extension`), Terraform, gitleaks und Trivy. Terraform, gitleaks und Trivy prüft sie per SHA-256 und lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider). Der Hinweis auf veraltetes Seed fragt github.com, api.nuget.org und registry.npmjs.org ab; ohne diese Ziele entfällt er still. Die Paketprüfungen fragen nuget.org und die npm-Registry aus `.npmrc`; ohne Netz warnen sie. Ohne Frontend und Erweiterung nimmt „npm-Pakete prüfen“ das npm des Agents und warnt, wenn es fehlt, obwohl das Repo npm-Projekte hat (siehe Prüfungen im Build).
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
 - **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).

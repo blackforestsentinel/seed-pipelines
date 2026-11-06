@@ -1,0 +1,26 @@
+# Vorschau-Beispiel: Prüflauf (validationOnly) eines Projekts ohne Frontend und ohne Erweiterung.
+# Erwartet: „npm-Pakete prüfen“ nach „NuGet-Pakete prüfen“ und vor dotnet build, mit dem npm des
+# Agents, also ohne UseNode und ohne npm ci. Ohne Service Connection. Platzhalter:
+# __GITHUB_CONNECTION__.
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: seed
+      type: github
+      name: blackforestsentinel/seed-pipelines
+      ref: refs/heads/main
+      endpoint: __GITHUB_CONNECTION__
+
+extends:
+  template: templates/web-app.yml@seed
+  parameters:
+    project: preview-app
+    serviceConnection: sc-wird-nicht-gebraucht
+    terraformState:
+      resourceGroup: rg-preview
+      storageAccount: stpreview
+      container: tfstate
+    validationOnly: true
+    frontend: false
