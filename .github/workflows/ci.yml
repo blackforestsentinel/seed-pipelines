@@ -18,9 +18,18 @@ jobs:
         with:
           persist-credentials: false
       # Python 3.12 und openssl aus dem Image, wie auf den Agents der Pipelines; alle Tests unter
-      # scripts/ (extension, intune), nur Standardbibliothek
+      # scripts/ (extension, intune, scaffold, dotnet), Standardbibliothek und für dotnet PyYAML
+      # (python3-yaml, im Image wie auf den Agents)
       - name: Tests der Skripte
         run: python3 -m unittest discover -s scripts -p "test_*.py" -v
+      # Prüfung des Custom Connectors (PowerShell wie custom-connector.yml), mit Testdaten, ohne
+      # weitere Module
+      - name: Tests der Connector-Prüfung
+        shell: pwsh
+        run: ./scripts/custom-connector/SeedConnectorCheck.Tests.ps1
+      # Python, das Schritte im Build-Job inline mitbringen (Heredoc im YAML, tests/steps/embedded.py)
+      - name: Tests der Pipeline-Schritte
+        run: python3 -m unittest discover -s tests/steps -p "test_*.py" -v
       # Nur Syntax: Die Skripte selbst brauchen Azure und Azure DevOps.
       - name: PowerShell-Syntax
         shell: pwsh

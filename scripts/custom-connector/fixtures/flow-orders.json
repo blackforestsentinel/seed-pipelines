@@ -1,0 +1,143 @@
+{
+  "properties": {
+    "connectionReferences": {
+      "shared_example-5forders": {
+        "runtimeSource": "embedded",
+        "connection": { "connectionReferenceLogicalName": "new_sharedexampleorders" },
+        "api": { "name": "shared_example-5fordersdev-5f0000000000000000" }
+      },
+      "shared_office365": {
+        "runtimeSource": "embedded",
+        "connection": { "connectionReferenceLogicalName": "new_sharedoffice365" },
+        "api": { "name": "shared_office365" }
+      }
+    },
+    "definition": {
+      "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+      "contentVersion": "1.0.0.0",
+      "parameters": {
+        "$connections": { "defaultValue": {}, "type": "Object" },
+        "$authentication": { "defaultValue": {}, "type": "SecureObject" }
+      },
+      "triggers": {
+        "Recurrence": { "type": "Recurrence", "recurrence": { "frequency": "Day", "interval": 1 } }
+      },
+      "actions": {
+        "Try": {
+          "type": "Scope",
+          "actions": {
+            "List_orders": {
+              "type": "OpenApiConnection",
+              "inputs": {
+                "host": {
+                  "connectionName": "shared_example-5forders",
+                  "operationId": "ListOrders",
+                  "apiId": "/providers/Microsoft.PowerApps/apis/shared_example-5fordersdev-5f0000000000000000"
+                },
+                "parameters": { "state": "Open", "top": 50 },
+                "authentication": "@parameters('$authentication')"
+              }
+            },
+            "For_each_order": {
+              "type": "Foreach",
+              "foreach": "@body('List_orders')?['value']",
+              "actions": {
+                "Check_state": {
+                  "type": "If",
+                  "expression": { "and": [ { "equals": [ "@items('For_each_order')?['state']", "Cancelled" ] } ] },
+                  "actions": {
+                    "Cancel_order": {
+                      "type": "OpenApiConnection",
+                      "inputs": {
+                        "host": { "connectionName": "shared_example-5forders", "operationId": "CancelOrder" },
+                        "parameters": { "id": "@items('For_each_order')?['id']" }
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Archive_order": {
+                        "type": "OpenApiConnection",
+                        "inputs": {
+                          "host": { "connectionName": "shared_example-5forders", "operationId": "ArchiveOrder" },
+                          "parameters": { "id": "@items('For_each_order')?['id']" }
+                        }
+                      }
+                    }
+                  }
+                },
+                "Send_mail": {
+                  "type": "OpenApiConnection",
+                  "inputs": {
+                    "host": { "connectionName": "shared_office365", "operationId": "SendEmailV2" },
+                    "parameters": {
+                      "emailMessage/To": "@items('For_each_order')?['customer']?['email']",
+                      "emailMessage/Subject": "Bestellung"
+                    }
+                  },
+                  "runAfter": { "Check_state": ["Succeeded"] }
+                }
+              },
+              "runAfter": { "List_orders": ["Succeeded"] }
+            },
+            "Switch_channel": {
+              "type": "Switch",
+              "expression": "@triggerOutputs()?['channel']",
+              "cases": {
+                "Case_web": {
+                  "case": "Web",
+                  "actions": {
+                    "Create_web_order": {
+                      "type": "OpenApiConnection",
+                      "inputs": {
+                        "host": { "connectionName": "shared_example-5forders", "operationId": "CreateOrder" },
+                        "parameters": {
+                          "body/customer": "Kundin A",
+                          "body/channel": "Mail",
+                          "body/priority": 2,
+                          "body/note": "Eilt",
+                          "body/lines": [ { "sku": "A-1", "quantity": 1 } ]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "default": {
+                "actions": {
+                  "Create_other_order": {
+                    "type": "OpenApiConnection",
+                    "inputs": {
+                      "host": { "connection": "shared_example-5forders", "operationId": "CreateOrder" },
+                      "parameters": { "body": "@variables('payload')" }
+                    }
+                  }
+                }
+              },
+              "runAfter": { "For_each_order": ["Succeeded"] }
+            },
+            "Get_order": {
+              "type": "OpenApiConnection",
+              "inputs": {
+                "host": { "connectionName": "shared_example-5forders", "operationId": "GetOrder" },
+                "parameters": { "id": "@triggerOutputs()?['body/id']" }
+              },
+              "runAfter": { "Switch_channel": ["Succeeded"] }
+            },
+            "Compose_summary": {
+              "type": "Compose",
+              "inputs": "Kunde @{body('Get_order')?['customer']?['email']}, Verlauf @{length(outputs('Get_order')?['body/history'])}",
+              "runAfter": { "Get_order": ["Succeeded"] }
+            }
+          }
+        },
+        "Catch": {
+          "type": "Scope",
+          "actions": {},
+          "runAfter": { "Try": ["Failed", "TimedOut"] }
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0.0"
+}

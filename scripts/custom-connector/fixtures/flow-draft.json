@@ -1,0 +1,55 @@
+{
+  "properties": {
+    "connectionReferences": {
+      "shared_example-5forders-1": {
+        "runtimeSource": "embedded",
+        "connection": { "connectionReferenceLogicalName": "new_sharedexampleorders" },
+        "api": { "name": "shared_example-5fordersdev-5f0000000000000000" }
+      }
+    },
+    "definition": {
+      "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+      "contentVersion": "1.0.0.0",
+      "triggers": {
+        "manual": {
+          "type": "Request",
+          "kind": "Button",
+          "inputs": { "schema": { "type": "object", "properties": { "text": { "type": "string" } } } }
+        }
+      },
+      "actions": {
+        "Until_done": {
+          "type": "Until",
+          "expression": "@equals(variables('done'), true)",
+          "limit": { "count": 10, "timeout": "PT1H" },
+          "actions": {
+            "Cancel_old_order": {
+              "type": "OpenApiConnection",
+              "inputs": {
+                "host": {
+                  "apiId": "/providers/Microsoft.PowerApps/apis/shared_example-5fordersdev-5f0000000000000000",
+                  "operationId": "CancelOrder"
+                },
+                "parameters": { "id": "@triggerBody()?['text']" }
+              }
+            }
+          }
+        },
+        "Create_phone_order": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5forders-1", "operationId": "CreateOrder" },
+            "parameters": {
+              "body/customer": "@triggerBody()?['text']",
+              "body/channel": "@{triggerBody()?['text_1']}",
+              "body/costCenter": "4711",
+              "body/priority": "@int(triggerBody()?['number'])"
+            }
+          },
+          "runAfter": { "Until_done": ["Succeeded"] }
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0.0"
+}

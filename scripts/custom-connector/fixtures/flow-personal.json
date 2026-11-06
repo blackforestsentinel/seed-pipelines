@@ -1,0 +1,33 @@
+{
+  "properties": {
+    "connectionReferences": {
+      "shared_example-5fordersdev-5f0000000000000000": {
+        "connectionName": "shared-example-5forders-00000000-1111-2222-3333-444444444444",
+        "source": "Embedded",
+        "id": "/providers/Microsoft.PowerApps/apis/shared_example-5fordersdev-5f0000000000000000",
+        "tier": "NotSpecified"
+      }
+    },
+    "definition": {
+      "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+      "contentVersion": "1.0.0.0",
+      "triggers": {
+        "manual": { "type": "Request", "kind": "Button", "inputs": { "schema": { "type": "object", "properties": {} } } }
+      },
+      "actions": {
+        "Get_order": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": {
+              "connectionName": "shared_example-5fordersdev-5f0000000000000000",
+              "operationId": "GetOrder",
+              "apiId": "/providers/Microsoft.PowerApps/apis/shared_example-5fordersdev-5f0000000000000000"
+            },
+            "parameters": { "id": "@triggerBody()?['id']" }
+          }
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0.0"
+}

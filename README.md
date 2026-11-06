@@ -9,6 +9,12 @@ parameters:
     displayName: Datenlöschung bestätigen (Storage, Key Vault, Logs)
     type: boolean
     default: false
+  # Nur von Hand ankreuzen: Breaking Changes am Custom Connector zulassen (siehe Prüfung des
+  # Custom Connectors); nur mit features.customConnector
+  - name: allowBreakingConnectorChanges
+    displayName: Breaking Changes am Custom Connector zulassen
+    type: boolean
+    default: false
 
 resources:
   repositories:
@@ -32,6 +38,8 @@ extends:
       - name: prod
         serviceConnection: sc-kundenportal-prod   # optional, sonst serviceConnection
     confirmDataDeletion: ${{ parameters.confirmDataDeletion }}
+    allowBreakingConnectorChanges: ${{ parameters.allowBreakingConnectorChanges }}
+    # checkConnectorConnections: true             # Verbindungen des Connectors prüfen, braucht Rechte
     smokeTest:
       protectedPath: api/me                       # mit sso: 401 ohne Token erwartet
     # pool: Default                               # eigener Agent-Pool, siehe Eigene Agents
@@ -44,14 +52,15 @@ extends:
     #   - script: npm run lint
     #     displayName: Lint
     #     workingDirectory: frontend
+    # treatWarningsAsErrors: false                # Warnungen nicht als Fehler, siehe Prüfungen im Build
 ```
 
 ## templates/web-app.yml
 
 | Stage | Inhalt |
 | --- | --- |
-| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), `terraform fmt` und `validate`, die eigenen Schritte aus `preBuildSteps`, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
-| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>` |
+| `build` | Ein Job: Abgleich mit `project.yaml` (Projektname, `hosting.staticWebApp: none` passend zu `frontend: false`), der Hinweis auf veraltetes Seed, `terraform fmt` und `validate`, der Terraform-Sicherheitsscan, die eigenen Schritte aus `preBuildSteps`, die Prüfungen der API (offene `TODO(onboarding)`, Formatierung, NuGet-Pakete; siehe Prüfungen im Build), `dotnet build` mit Warnungen als Fehler, `dotnet test` und `dotnet publish` der API samt OpenAPI-Dokument als Artefakt `openapi` (mit `Bfs.Seed.OpenApi`), `npm test` und `npm run build` des Frontends (nur mit Frontend), mit `extension` Build, Tests und Manifest-Prüfung der Browser-Erweiterung, danach die eigenen Schritte aus `extraBuildSteps`; im PR-Lauf zusätzlich der Secret-Scan |
+| `plan_<env>` | `terraform plan` gegen den Remote-State `<project>/<env>.tfstate`; merkt sich, ob sich die Infrastruktur ändert. Bei Änderungen liegt der Plan neben dem State (siehe Plan neben dem State), ohne Änderungen kommen die Outputs als Artefakt `tfoutputs_<env>`. Mit `features.customConnector` prüft danach der Job `connector_check`, ob die neue OpenAPI-Definition Flows bricht (siehe Prüfung des Custom Connectors) |
 | `apply_<env>` | Nur bei Änderungen: Deployment-Job auf das Environment `<project>-<env>` (dort hängt die Freigabe), `terraform apply` des geprüften Plans, danach die Outputs als Artefakt `tfoutputs_<env>` |
 | `deploy_<env>` | Deployment-Job auf das Environment `<project>-<env>-app`, ohne Checkout (außer mit `extension.signing`) und ohne `terraform init`: Outputs aus `tfoutputs_<env>`, `config.json` aus dem Output `frontend_config`, `__API_ORIGIN__` in der CSP ersetzen, Function und Static Web App deployen, Status eigener Domains melden, Smoke-Test, mit `features.customConnector` der Custom Connector, mit `extension` das Paket der Browser-Erweiterung als Artefakt `extension_<env>`, mit `extension.signing` zusätzlich signiert und im Projekt-Storage veröffentlicht (Artefakt `extension_release_<env>`) |
 
@@ -83,11 +92,76 @@ Liegt `.terraform.lock.hcl` im Ordner `infra` (seed-template legt sie an), läuf
 
 ### PR-Validierung
 
-Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt) bestehen nur aus `build`: Build, Tests, `terraform fmt` und `validate` ohne Backend und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
+Läufe mit `Build.Reason` `PullRequest` (ausgelöst von der Branch-Policy auf `main`, die `seed-scaffold` anlegt und `Initialize-SeedProject.ps1` nach dem Umschalten setzt) bestehen nur aus `build`: Build, Tests, die Prüfungen im Build (unten), `terraform fmt` und `validate` ohne Backend, der Terraform-Sicherheitsscan, der Hinweis auf veraltetes Seed und ein Secret-Scan. Plan, Apply und Deploy entstehen gar nicht erst, der Lauf braucht also weder die Azure-Service-Connection noch Environments. Es bleibt bei einer Pipeline-Definition je Projekt; eine zweite bräuchte eigene Freigaben für Environments und Service Connection. `pr: none` im Projekt bleibt stehen: In Azure Repos startet die Branch-Policy PR-Läufe, nicht der Trigger.
 
 Mit `validationOnly: true` läuft dieselbe Prüfung ohne PR, etwa um sie von Hand nachzustellen.
 
-Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester Version, der Download wird per SHA-256 geprüft. Er prüft alle Commits des PRs (`HEAD^1..HEAD^2` des Merge-Commits), nicht nur den Endstand: Ein Secret, das ein späterer Commit entfernt, bliebe sonst in der Historie. Gefundene Werte erscheinen geschwärzt im Log. Bei falschem Alarm den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`. In Läufen auf `main` scannt die Pipeline nicht: Mit der Pflicht-Policy kommt jede Änderung über einen PR.
+Der Secret-Scan nutzt [gitleaks](https://github.com/gitleaks/gitleaks) in fester Version, der Download wird per SHA-256 geprüft. Er prüft alle Commits des PRs (`HEAD^1..HEAD^2` des Merge-Commits), nicht nur den Endstand: Ein Secret, das ein späterer Commit entfernt, bliebe sonst in der Historie. Gefundene Werte erscheinen geschwärzt im Log. In Läufen auf `main` scannt die Pipeline nicht: Mit der Pflicht-Policy kommt jede Änderung über einen PR.
+
+Was bei einem Fund zu tun ist, steht auch in der Fehlermeldung:
+
+- **Ein weiterer Commit, der das Secret löscht, reicht nicht.** Der Scan bleibt rot, weil das Secret in einem Commit des PRs steht und mit dem Merge in die Historie von `main` käme.
+- **Branch neu schreiben**, ohne den betroffenen Commit: etwa `git rebase -i <basis>`, den Commit bearbeiten (`edit`) oder verwerfen (`drop`), dann `git push --force-with-lease`. Das braucht in Azure Repos „Force push“ am Branch; wer ihn angelegt hat, hat es meist. Alternativ einen neuen Branch ohne den Commit anlegen und den PR neu stellen.
+- **Secret widerrufen** und beim Anbieter ersetzen, auch nach dem Umschreiben: Es lag schon im Repo und gilt damit als bekannt.
+- **Falscher Alarm:** den Fingerprint aus dem Log in `.gitleaksignore` im Projekt eintragen; eigene Regeln gehören in `.gitleaks.toml`.
+
+### Terraform-Sicherheitsscan
+
+Im Build-Job, auch im PR-Lauf, prüft [Trivy](https://github.com/aquasecurity/trivy) (`trivy config`, [`templates/steps/terraform-scan.yml`](templates/steps/terraform-scan.yml)) die `.tf`-Dateien unter `infraPath` statisch auf Fehlkonfigurationen, etwa öffentlichen Blob-Zugriff, TLS unter 1.2, nicht erzwungenes HTTPS, FTP an App Services oder einen Key Vault ohne Purge-Schutz. Der Scan läuft nach `terraform init -backend=false` und dauert mit Download rund 3 bis 7 Sekunden.
+
+- **Was gemeldet wird:** Befunde in den Dateien des Projekts, also im Wurzelmodul und in lokalen Modulen (`source = "./modules/…"`). Trivy wertet die heruntergeladenen Module aus `.terraform/modules` mit aus, damit Werte aus Modul-Outputs bekannt sind, meldet deren Befunde aber nicht (`--tf-exclude-downloaded-modules`): Ein Projekt könnte sie weder beheben noch begründet ausnehmen. Die Module aus seed-terraform prüft deren Repo; Module anderer Herkunft verantwortet das Projekt, das sie einbindet.
+- **Schwere:** `CRITICAL` und `HIGH` sind Fehler und brechen den Build, `MEDIUM`, `LOW` und `UNKNOWN` sind Warnungen. Einige `MEDIUM`-Regeln sind trotzdem Fehler, weil sie Klartext-Verbindungen oder endgültigen Datenverlust bedeuten (`errorChecks`): AZU-0016 (Key Vault ohne Purge-Schutz), AZU-0020 und AZU-0026 (Datenbank ohne TLS bzw. unter 1.2), AZU-0071 (App Service mit FTP), AZU-0072 (Web App mit HTTP).
+- **Seed-Regelsatz** (`skipChecks`, aus für alle Projekte, Gründe im Template und im Log):
+
+  | Regel | Schwere | Warum aus |
+  | --- | --- | --- |
+  | AZU-0012 | CRITICAL | Storage-Netzwerkregeln mit Deny: Seed betreibt keine VNets, die Function erreicht Storage über den öffentlichen Endpunkt, geschützt durch Entra ID ohne Shared Key |
+  | AZU-0013 | CRITICAL | `network_acls` am Key Vault: wie AZU-0012, Zugriff per RBAC |
+  | AZU-0009, AZU-0057 | MEDIUM | klassische Storage-Analytics-Protokolle, veraltet; Protokolle laufen über Diagnoseeinstellungen |
+  | AZU-0058 | LOW | Georedundanz: Kostenentscheidung; Seed schützt Daten mit Soft Delete, Versionierung und Löschsperre |
+  | AZU-0060 | MEDIUM | kundenseitig verwaltete Schlüssel: Compliance-Vorgabe, keine Grundsicherung |
+  | AZU-0061 | MEDIUM | doppelte Verschlüsselung: Compliance-Option |
+  | AZU-0003 | MEDIUM | App Service Authentication: Seed prüft Tokens in der API (`Bfs.Seed.Auth`) |
+  | AZU-0001 | LOW | Client-Zertifikate: Seed authentifiziert mit Entra-Tokens |
+  | AZU-0015 | LOW | `content_type` an Secrets: Beschreibung ohne Schutzwirkung |
+  | AZU-0017 | LOW | Ablaufdatum an Secrets: Seed erzwingt keines, Werte setzt ein Mensch außerhalb von Terraform |
+
+- **Ausnahmen** stehen inline im `.tf`, als Kommentar direkt über dem Block oder der Zeile mit dem Befund (oder am Ende dieser Zeile), mit Regel-ID und Begründung in derselben Zeile. So erscheinen sie im Diff des PRs, und der Scan listet sie im Log:
+
+  ```hcl
+  # trivy:ignore:AZU-0011 Lesegerät im Lager kann nur TLS 1.0, Austausch bis Ende 2027
+  resource "azurerm_storage_account" "scanner" {
+    min_tls_version = "TLS1_0"
+    # ...
+  }
+
+  # Mit Ablaufdatum: ab 2028 wieder ein Befund
+  # trivy:ignore:AZU-0011:exp:2027-12-31 Lesegerät im Lager kann nur TLS 1.0
+  ```
+
+  Die Regel-ID steht im Befund (`AZU-0011`); die lange Form (`azure-storage-use-secure-tls-policy`) geht auch, ebenso mehrere Regeln in einer Zeile; die Begründung steht hinter der letzten. Ein Befund kann mehrere Regeln auslösen, etwa TLS 1.0 an Storage AZU-0011 und AZU-0059; jede braucht ihre Ausnahme.
+
+  Trivy liest Ausnahmen freier, als das Beispiel zeigt: in jeder Zeile einer `.tf`-, `.tofu`-, `.tf.json`- oder `.tofu.json`-Datei, auch ohne Kommentarzeichen, in Blockkommentaren und Strings, als `trivy:` oder `tfsec:`, mit den Abschnitten `ignore`, `exp` und `ws` in beliebiger Reihenfolge. Die Prüfung liest sie nach dem Parser von Trivy genauso und verlangt von jedem Wort, das mit `trivy:` oder `tfsec:` beginnt:
+
+  - eine Ausnahme mit Regel (`ignore:<Regel>`); ein Wort wie `trivy:exp:…` ohne Regel oder ein `trivy:` im Text ist ein Fehler;
+  - keinen Platzhalter: Trivy liest `*` in einer Regel oder einem Workspace (`ws`) als beliebiges Stück, `trivy:ignore:AZU-*` schaltete eine ganze Familie ab und `trivy:ignore:*` alles. Jedes `*` in `ignore` oder `ws` ist deshalb ein Fehler;
+  - eine Begründung mit mindestens zehn Zeichen dahinter, in derselben Zeile.
+- **Nur Einstellungen des Templates:** `.trivyignore`, `.trivyignore.yaml` und `trivy.yaml` im Projekt wirken nicht (der Scan warnt, wenn es sie gibt), Umgebungsvariablen `TRIVY_*` ebenso wenig. Die Regeln stecken im Programm (`--skip-check-update`) und ändern sich nur mit dessen Version; der Scan braucht außer dem Download kein Netz und sendet keine Telemetrie.
+- **Version:** Trivy kommt wie gitleaks in fester Version mit SHA-256 aus `trivy_<version>_checksums.txt` (Parameter `version` und `sha256` des Schritt-Templates). Beim Anheben eine Version nehmen, die mindestens zwei Wochen alt ist, die Prüfsumme mit dem Digest des Release-Assets auf GitHub abgleichen und den Scan gegen seed-template und die Module von seed-terraform laufen lassen: Neue Regeln können neue Fehler bringen. Dazu den Parser der Ausnahmen (`pkg/iac/ignore/parse.go`) mit dem Nachbau in `terraform-scan.yml` und der Gegenprobe in `tests/steps/test_terraform_scan.py` abgleichen.
+- **Abdeckung:** Trivy kennt die `azurerm`-Ressourcen. Ressourcen über `azapi` (etwa die Function mit Flex Consumption im Modul `core`) prüft es nicht.
+
+### Hinweis auf veraltetes Seed
+
+Ebenfalls im Build-Job, auch im PR-Lauf, vergleicht [`templates/steps/seed-versions.yml`](templates/steps/seed-versions.yml), was das Projekt nutzt, mit dem neuesten Release, und warnt je Quelle, wenn etwas zurückliegt:
+
+| Was | Woher im Projekt | Neueste Version |
+| --- | --- | --- |
+| seed-pipelines | `ref` der Repository-Ressource `seed` in `azure-pipelines.yml`, zur Laufzeit (`resources.repositories.seed.ref`) | Tags per `git ls-remote` |
+| Module aus seed-terraform | `?ref=vX.Y.Z` in den `.tf`-Dateien unter `infraPath` | Tags per `git ls-remote` |
+| `Bfs.Seed.*` | `PackageReference` und `PackageVersion` in `.csproj`, `.props`, `.targets` | `https://api.nuget.org/v3-flatcontainer/<id>/index.json` |
+| `@blackforestsentinel/seed-web-*` | `package.json`, aufgelöst aus `package-lock.json` | npm-Registry |
+
+Neueste Version ist die höchste ohne Vorabkennung (`-preview`, `-rc` …). Branches statt Tags (`refs/heads/…`, `?ref=main`) vergleicht der Schritt nicht, er nennt sie nur im Log. Eine Paketversion aus einer MSBuild-Property (`Version="$(SeedVersion)"`) löst er über die PropertyGroups der `.csproj`-, `.props`- und `.targets`-Dateien auf, etwa aus `Directory.Build.props`, wenn die Property genau einen festen Wert hat. Bleibt eine Paketversion offen (Property ohne eindeutigen Wert, Bereich wie `0.9.*`, `file:` bei npm), warnt er „Version nicht prüfbar“. Er bricht nie den Build: Ist GitHub, NuGet oder npm nicht erreichbar, steht das als Zeile im Log, ohne Warnung. Er dauert ein bis drei Sekunden. Die Repository-Ressource muss `seed` heißen, wie in den Beispielen; sonst entfällt der Vergleich für seed-pipelines.
 
 ### Schutz vor Datenverlust
 
@@ -113,7 +187,7 @@ extends:
           workingFile: frontend/.npmrc
 ```
 
-- **Reihenfolge:** nach Checkout, Abgleich mit `project.yaml`, `terraform validate` und dem .NET SDK laut `global.json`, vor `dotnet restore`. Node in der Version `nodeVersion` richtet das Template erst danach ein; bis dahin gilt die des Images.
+- **Reihenfolge:** nach Checkout, Abgleich mit `project.yaml`, Hinweis auf veraltetes Seed, `terraform validate`, Terraform-Sicherheitsscan und dem .NET SDK laut `global.json`, vor `dotnet restore`. Node in der Version `nodeVersion` richtet das Template erst danach ein; bis dahin gilt die des Images.
 - **PR-Lauf:** Die Schritte laufen auch im PR-Lauf und mit `validationOnly`, denn ohne Restore gibt es keinen Build.
 - **Rechte:** `NuGetAuthenticate@1` und `npmAuthenticate@0` melden sich ohne Secret mit dem Job-Token an, also als `<Projekt> Build Service (<org>)` oder, wenn das Projekt den Job-Scope nicht auf sich beschränkt, als `Project Collection Build Service (<org>)`. Diese Identität braucht am Feed mindestens die Rolle Feed Reader (Feed settings, Permissions). Liegt der Feed in einem anderen Projekt, braucht sie zusätzlich Lesezugriff auf dieses Projekt (Gruppe Readers). Für Feeds einer anderen Organisation oder außerhalb von Azure DevOps nennt der Schritt eine NuGet-Service-Connection des Projekts (`nuGetServiceConnections`). Eine Azure-Service-Connection bekommen die Schritte nicht.
 - Für die Anmeldung taugt `extraBuildSteps` nicht: Diese Schritte laufen erst nach Build und Tests.
@@ -169,6 +243,105 @@ extends:
 - **Arbeitsverzeichnis** ist der Checkout, je Schritt änderbar mit `workingDirectory`.
 - **Rechte:** Der Build-Job hat keine Azure-Service-Connection und keine Secrets. Schritte, die etwas in Azure brauchen, gehören nicht in den Build.
 
+### Prüfungen im Build
+
+Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ein Hinweis in der README wirkt kaum. Der Build-Job prüft deshalb die API, auch im PR-Lauf und mit `validationOnly`. Ausnahmen gibt es, aber nur im Projekt und mit Begründung, damit sie im PR zu sehen sind.
+
+| Prüfung | Ergebnis | Ausnahme |
+| --- | --- | --- |
+| Warnungen des Compilers, zu Nullable, der Analyzer und von MSBuild-Tasks in `dotnet build` und `dotnet publish` | Fehler | je Warnung im Projekt (unten); alle mit `treatWarningsAsErrors: false` |
+| Direkte NuGet-Referenz in einer Vorabversion (`-preview`, `-rc` …) | Fehler | `build.prereleasePackages` in `project.yaml` |
+| Bekannte Lücke High oder Critical, auch in transitiven Paketen | Fehler | `build.ignoreAdvisories` in `project.yaml` |
+| Bekannte Lücke Low oder Moderate | Warnung | – |
+| Veraltete direkte Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| `RS0030` (verbotene APIs) oder eine Regel aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) abgeschaltet | Fehler | Kommentar mit dem Grund in der Zeile davor |
+| Analyzer pauschal abgeschaltet (`RunAnalyzers`, `dotnet_analyzer_diagnostic.severity` …) | Warnung | – |
+| Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
+| `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
+
+Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte zusammen rund 15 Sekunden (Pakete 10, Formatierung 5); auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+
+**Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
+
+- `[SuppressMessage("Usage", "CA2200", Justification = "…")]` an der Stelle im Code. Eine Unterdrückung ohne `Justification` meldet ein Analyzer aus den `Bfs.Seed`-Paketen als Fehler.
+- `.editorconfig`, mit Kommentar zum Grund und möglichst auf Pfade beschränkt, etwa Unterstriche in Testnamen:
+
+  ```ini
+  # Testnamen wie Methode_Fall_Ergebnis
+  [**/*.Tests/**.cs]
+  dotnet_diagnostic.CA1707.severity = none
+  ```
+
+- `NoWarn` (Warnung fällt weg) oder `WarningsNotAsErrors` (bleibt als Warnung sichtbar) in der Projektdatei oder in `Directory.Build.props`, mit Kommentar zum Grund; gilt für das ganze Projekt. Für eine einzelne Paketreferenz geht auch `<PackageReference … NoWarn="NU1701" />`.
+
+Für `RS0030` und die Regeln aus Bfs.Seed ist der Kommentar Pflicht, siehe Abgeschaltete Regeln.
+
+Diese Warnungen bleiben auch mit `-warnaserror` Warnungen (`-warnNotAsError`):
+
+| Code | Warum keine Fehler |
+| --- | --- |
+| `NU1901` bis `NU1904` | Lücken; die prüft „NuGet-Pakete prüfen“ nach Schwere und mit den Ausnahmen aus `project.yaml`. Der Schritt `dotnet restore` läuft deshalb mit `-p:NuGetAudit=false`: Setzt ein Projekt selbst `TreatWarningsAsErrors`, brächen die Lücken sonst schon den Restore, ohne Rücksicht auf die Ausnahmen |
+| `NU1603`, `NU1801`, `NU1900`, `NU1905` | hängen vom Zustand der Feeds und des Netzes ab (Version fehlt im Feed, Quelle oder Daten zu Lücken nicht erreichbar) und würden Builds zufällig brechen |
+| `NU1608` | Paket außerhalb der Versionsgrenze einer Abhängigkeit; entsteht oft gerade dann, wenn ein Projekt ein transitives Paket wegen einer Lücke selbst anhebt |
+| `MSB3026` | Kopieren wird wiederholt, eine vorübergehende Sperre |
+
+Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration des Projekts und lassen sich dort beheben oder begründet abschalten, etwa `NU1507` (mehrere Paketquellen ohne `packageSourceMapping`, siehe Privater Paket-Feed), `NU1510` (überflüssige Paketreferenz) oder `NU1701` (Paket nur für .NET Framework). Das gilt auch für den inneren Build der Function (`WorkerExtensions`), den das Functions-SDK während des Builds wiederherstellt.
+
+**Pakete** („NuGet-Pakete prüfen“), drei Abfragen mit `--format json`:
+
+- `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
+- `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
+
+Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
+
+```yaml
+# project.yaml
+build:
+  # Vorabversionen direkter Referenzen (NuGet-Paket-ID, Groß- und Kleinschreibung egal)
+  prereleasePackages:
+    - name: Some.Package
+      reason: Nur die Vorabversion unterstützt X; die stabile Version ist angekündigt.
+  # Bekannte Lücken bewusst hinnehmen (GHSA-Kennung aus der Meldung oder die URL der Advisory)
+  ignoreAdvisories:
+    - id: GHSA-xxxx-xxxx-xxxx
+      reason: Betrifft nur Y, das die API nicht nutzt.
+```
+
+- Ein Eintrag ohne `reason` ist ein Fehler, ebenso einer mit weniger als 10 Zeichen (ohne Leerraum am Rand) und einer, dessen `reason` YAML nicht als Text liest (`no`, `2026-01-01`; dann in Anführungszeichen). Dieselbe Grenze gilt für die Begründungen der Analyzer aus Bfs.Seed und des Terraform-Scans.
+- Trifft ein Eintrag nichts mehr, warnt der Schritt; der Eintrag gehört dann entfernt. So veralten Ausnahmen nicht unbemerkt.
+- Eine Ausnahme, die greift, steht mit ihrem Grund im Log.
+- Eine Lücke in einem transitiven Paket behebt meist eine direkte Referenz auf eine Version ohne die Lücke.
+
+**Abgeschaltete Regeln** („Abgeschaltete Regeln prüfen“): `RS0030` (verbotene APIs, `BannedApiAnalyzers`) und die Regeln aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) darf ein Projekt nur mit Begründung abschalten. Der Schritt durchsucht alle `.editorconfig`, `.globalconfig`, Projektdateien, `.props`, `.targets` und `.rsp` im Repo, ohne `bin`, `obj` und `node_modules`, nach:
+
+- `dotnet_diagnostic.<Regel>.severity` mit `none`, `silent` oder `suggestion`;
+- der Regel in `NoWarn`, `WarningsNotAsErrors`, `MSBuildWarningsAsMessages` oder `MSBuildWarningsNotAsErrors`, auch über mehrere Zeilen;
+- der Regel in einer Antwortdatei wie `Directory.Build.rsp`.
+
+Die Begründung ist ein Kommentar in der Zeile direkt davor (`#` bzw. `<!-- -->`, auch mehrzeilig) mit mindestens 10 Zeichen. Fehlt er, ist es ein Fehler; sonst steht die Ausnahme mit ihrem Grund im Log. Steht die Regel an anderer Stelle, etwa in einer eigenen Eigenschaft, die später in `NoWarn` landet, gibt es eine Warnung. Pauschal-Abschaltungen gibt es immer als Warnung, auch mit Begründung: `RunAnalyzers` oder `RunAnalyzersDuringBuild` auf `false`, `dotnet_analyzer_diagnostic.severity` (auch je Kategorie) mit schwacher Schwere, `<Analyzer Remove=…>` und `ExcludeAssets` mit `analyzers`. `generated_code = true` warnt nur ohne Begründung: Für diese Dateien laufen keine Analyzer und keine Formatprüfung. `TreatWarningsAsErrors` im Projekt spielt keine Rolle, die Pipeline baut ohnehin mit `-warnaserror`. Andere pauschale Eingriffe, etwa `<WarningLevel>0</WarningLevel>`, prüft der Schritt nicht; sie stehen im PR und fallen nur im Review auf.
+
+```xml
+<!-- Hinweise zu Enums prüft ein eigener Test des OpenAPI-Exports -->
+<WarningsNotAsErrors>$(WarningsNotAsErrors);SEEDOPENAPI014</WarningsNotAsErrors>
+```
+
+**Formatierung** („Formatierung prüfen“): `dotnet format whitespace <solution> --verify-no-changes`, also Einrückung, Leerzeichen, Zeilenumbrüche, Zeilenende und letzte Zeile laut `.editorconfig`. Das prüft sonst niemand; der Teilbefehl braucht keinen Build und dauert wenige Sekunden. `style` und `analyzers` lässt der Schritt bewusst aus: Sie kompilieren die Solution ein zweites Mal und melden dieselben Regeln wie der Build, sobald das Projekt Code-Stil im Build prüft (`EnforceCodeStyleInBuild`, Schwere in `.editorconfig`). Dort zählen sie als Warnung und damit als Fehler; so gibt es je Regel eine Stelle. Vor dem Commit deshalb `dotnet format` ausführen; es behebt Leerraum und, soweit es geht, Stil. Die Pipeline prüft den Leerraum, den Rest der Build. Der Stop-Hook im Projekt (seed-template) prüft dasselbe wie die Pipeline. Die Meldung nennt je Datei die Zahl der Stellen und die erste abweichende Zeile, bis zu 20 Dateien. Dateien mit `generated_code = true` in `.editorconfig` oder dem Kopf `<auto-generated>` prüft `dotnet format` nicht.
+
+**Offene TODOs** („Offene TODOs in project.yaml“): eine Warnung je Zeile mit `TODO(onboarding)` in `project.yaml` (auch `TODO (onboarding)`), mit Zeilennummer. So markiert ein Projekt Angaben, die beim Onboarding noch fehlen. Den Punkt erledigen und die Markierung entfernen.
+
+**Lokal**, im Checkout des Projekts, mit einem Klon von seed-pipelines daneben und Python mit PyYAML:
+
+```bash
+dotnet restore api/Api.slnx
+dotnet format api/Api.slnx                               # vor dem Commit: Leerraum und Stil
+dotnet build api/Api.slnx -c Release --no-restore -warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026
+python3 ../seed-pipelines/scripts/dotnet/checks.py todos --project-yaml project.yaml
+python3 ../seed-pipelines/scripts/dotnet/checks.py suppressions
+python3 ../seed-pipelines/scripts/dotnet/checks.py format --solution api/Api.slnx
+python3 ../seed-pipelines/scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
+```
+
 ### Vorschau ohne Lauf
 
 Ob ein Projekt-YAML mit dem Template zusammenpasst, zeigt die Vorschau-API von Azure DevOps (`previewRun`): Sie löst Templates und Ausdrücke auf und gibt das fertige YAML zurück, ohne einen Lauf zu starten, ohne Freigaben und ohne Service Connection. [`tests/preview/Invoke-SeedPipelinePreview.ps1`](tests/preview/Invoke-SeedPipelinePreview.ps1) schickt eine YAML-Datei als `yamlOverride` an eine beliebige vorhandene Pipeline des Azure-DevOps-Projekts, legt das Ergebnis als `<datei>.final.yml` ab und prüft optional die Reihenfolge von Schritten im Build-Job:
@@ -193,10 +366,16 @@ $common = @{
   -ExpectBuildSteps 'npm run build', 'npm ci (Erweiterung)', 'npm test (Erweiterung)', `
     'npm run build (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Lint (Beispiel)', 'Artefakt web', `
     'Artefakt extension'
-# Prüflauf wie im PR: eigene Schritte ja, Artefakte nein
+# Prüflauf wie im PR: Scans, Prüfungen im Build und eigene Schritte ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'npm run build', 'Lint (Beispiel)' `
-  -AbsentBuildSteps 'Artefakt web', 'Artefakt api'
+  -ExpectBuildSteps 'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
+    'Terraform-Sicherheitsscan (Trivy 0.76.1)', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
+    'Offene TODOs in project.yaml', 'Abgeschaltete Regeln prüfen', 'Formatierung prüfen', 'NuGet-Pakete prüfen', `
+    'dotnet build', 'dotnet test', 'npm run build', 'Lint (Beispiel)' `
+  -AbsentBuildSteps 'Artefakt web', 'Artefakt api' -ExpectText 'warnaserror -warnNotAsError:NU1603'
+# Ohne Warnungen als Fehler (treatWarningsAsErrors: false), die übrigen Prüfungen bleiben
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/warnings-allowed.yml `
+  -ExpectBuildSteps 'dotnet restore', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test' -AbsentText 'warnaserror'
 # Erweiterung ohne signing: im Deploy nur Paket und Artefakt
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extension.yml `
   -ExpectDeploySteps 'Custom Connector', 'Browser-Erweiterung packen', "Artefakt extension_$($common.Replace.ENVIRONMENT)" `
@@ -207,10 +386,16 @@ $common = @{
   -ExpectDeploySteps 'Browser-Erweiterung packen', 'seed-pipelines auschecken (Skript der Erweiterung)', `
     'Signaturschlüssel der Erweiterung', 'Erweiterung signieren und veröffentlichen', `
     "Artefakt extension_$($common.Replace.ENVIRONMENT)", "Artefakt extension_release_$($common.Replace.ENVIRONMENT)"
+# Prüfung des Custom Connectors: nach terraform plan der Job connector_check, vor jeder Freigabe
+./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/custom-connector.yml `
+  -TemplateParameters @{ allowBreakingConnectorChanges = 'true' } `
+  -ExpectPlanSteps 'terraform plan', 'Custom Connector erkennen', 'Outputs als Artefakt', `
+    'seed-pipelines auschecken (Skript der Connector-Prüfung)', 'Artefakt openapi laden', 'Custom Connector prüfen' `
+  -ExpectDeploySteps 'Custom Connector'
 ```
 
 - `-SeedRef` ersetzt die `ref` der Repository-Ressource `seed`, damit sich ein Branch von seed-pipelines vor dem Release prüfen lässt; der Branch muss dafür auf GitHub liegen.
-- `-ExpectDeploySteps` und `-AbsentDeploySteps` prüfen die erste Stage `deploy_<umgebung>` wie die Build-Schritte. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
+- `-ExpectPlanSteps` und `-AbsentPlanSteps` prüfen die erste Stage `plan_<umgebung>` samt aller ihrer Jobs, `-ExpectDeploySteps` und `-AbsentDeploySteps` die erste Stage `deploy_<umgebung>`, jeweils wie die Build-Schritte. `-ExpectText` und `-AbsentText` prüfen beliebigen Text im fertigen YAML, etwa ein Argument in einem Skript. Mit `-FinalYamlPath <datei>.final.yml` statt Organisation, Projekt und YAML prüft das Skript ein gespeichertes Ergebnis erneut, ohne Azure DevOps.
 - Die Pipeline-ID dient nur als Rahmen (Projekt, GitHub-Service-Connection); ihre eigene YAML-Datei spielt keine Rolle. Service Connections und Environments, die das YAML nennt, müssen im Projekt existieren, sonst lehnt Azure DevOps schon die Vorschau ab. Deshalb nennt das Beispiel für den normalen Lauf ein vorhandenes Seed-Projekt und eine seiner Umgebungen; der Prüflauf braucht beides nicht.
 - Ebenso lässt sich das YAML eines Projekts vor dem Umstellen prüfen, etwa bei einer Migration, deren Projekt in Azure DevOps noch keine Seed-Service-Connection hat: `-Replace` bzw. eine angepasste Kopie mit einer Service Connection des Rahmenprojekts.
 
@@ -235,6 +420,66 @@ Mit `features.customConnector` in `project.yaml` liefert Terraform den Output `c
 4. Mit `customConnector.shareWith: everyone` (Standard) bekommt das Standardteam der Root-Business-Unit Lesezugriff, also alle Personen der Umgebung. Ohne Freigabe sähe nur die Pipeline den Connector, denn Basic User liest Connectors nur auf Benutzerebene. Was eine Person über den Connector darf, regeln wie im Browser App-Rollen und Capabilities der API.
 
 Voraussetzung: Die Service-Connection-Identität ist in der Power-Platform-Umgebung Anwendungsbenutzer mit der Rolle Environment Maker; das richtet das Onboarding mit `-PowerPlatformEnvironmentUrl` ein. Fehlt das, endet der Schritt mit einem Hinweis darauf. Ohne Output `custom_connector` (Feature aus oder keine Umgebung angegeben) tut er nichts; das Artefakt `openapi` gibt es trotzdem, im Zweifel mit einer Notiz statt des Dokuments.
+
+Ob die neue Definition Flows bricht, prüft die Pipeline schon vorher, in `plan_<env>` (nächster Abschnitt).
+
+### Prüfung des Custom Connectors
+
+Flows rufen Operationen des Connectors über ihre `operationId` auf. Entfällt eine Operation oder ändert sie sich, merkt das sonst erst der Flow, wenn er fehlschlägt. Deshalb vergleicht der Job `connector_check` in `plan_<env>` die Definition des bestehenden Connectors in Dataverse (Tabelle `connectors`, Spalte `openapidefinition`) mit `openapi.json` aus dem Build und sucht die Flows, die den Connector nutzen (Tabelle `workflows`, Spalte `clientdata`). Er läuft nach `terraform plan`, vor jeder Freigabe und vor dem Function-Deploy. Scheitert er, endet `plan_<env>`; Apply und Deploy entfallen, am Connector und an der API ändert sich nichts.
+
+Eine Operation abzulösen geht damit in drei Schritten: im Code als deprecated markieren (`deprecated: true` im OpenAPI-Dokument, siehe `Bfs.Seed.OpenApi`); die Pipeline nennt bei jedem Deploy die Flows, die sie noch nutzen, und deren Besitzer migrieren; dann die Operation entfernen. Nutzt sie dann noch ein aktiver Flow, bricht der Lauf ab.
+
+| Änderung, an einer Operation, die ein Flow nutzt | Ergebnis |
+| --- | --- |
+| Operation entfernt | Fehler |
+| neues Pflichtfeld oder neuer Pflichtparameter, den der Flow nicht setzt | Fehler |
+| Typ eines Feldes, das der Flow setzt, geändert (etwa `integer` zu `string`, auch `object` zu `string`, wenn der Flow Felder darin setzt; `integer` zu `number` zählt nicht) | Fehler |
+| Query- oder Pfadparameter wechselt von Zahl (oder Liste) ohne Werteliste zu Text mit Werteliste, wie beim Update auf `Bfs.Seed.OpenApi` 0.10.0 für Enums ohne `JsonStringEnumConverter` | Warnung: Seed-Functions lesen diese Parameter als Text mit `Enum.TryParse` und nehmen die Zahl weiter an; den Flow auf die Namen umstellen. Im Body bleibt es ein Fehler, wenn ein fest eingetragener Wert nicht in der Werteliste steht |
+| Enum-Wert entfernt, den der Flow fest einträgt | Fehler |
+| Operation deprecated | Warnung |
+| Eingabefeld entfernt, das der Flow setzt | Warnung: der Wert kommt still nicht mehr an |
+| Antwortfeld entfernt oder Typ geändert, das der Flow per Ausdruck liest | Warnung: die Suche in Ausdrücken ist unscharf |
+| der Flow setzt den ganzen Body oder das Feld per Ausdruck | Warnung „nicht prüfbar“ statt Fehler |
+| Operation entfernt oder deprecated, kein Flow nutzt sie | Hinweis im Log |
+
+- **Fehler nur für laufende Flows:** Fehler gelten Flows mit Status aktiv (Activated) oder angehalten (Suspended). Für ausgeschaltete Flows und Entwürfe wird daraus eine Warnung.
+- **Übersteuern:** Mit `allowBreakingConnectorChanges: true` werden alle Fehler der Prüfung zu Warnungen, etwa wenn der einzige betroffene Flow ohnehin abgeschaltet wird. Wie `confirmDataDeletion` reicht das Projekt den Parameter als Laufzeitparameter durch (Beispiel oben); zugelassen wird also nur in einem von Hand gestarteten Lauf. Ein Push bringt die Zulassung nicht mit.
+- **Ausgabe:** Jeder Fehler und jede Warnung erscheint als `##vso[task.logissue]` mit Flow, Status, Besitzer und dem Pfad der Action in der Definition (etwa `/Try/For_each/Check/else/Create_order`). Dazu kommt eine Zusammenfassung am Lauf (Reiter „Extensions“ bzw. Summary): Connector, Umgebung und bisheriges Backend, je Operation der Stand gegenüber dem letzten Deploy (neu, geändert, deprecated, entfernt, unverändert), die Befunde, die Flows mit Status, Besitzer und Link auf Power Automate und welche Prüfungen gelaufen sind. Namen aus Dataverse kommen ohne Steuerzeichen und `##vso[` ins Log und entschärft in die Zusammenfassung.
+- **Nutzung nicht prüfbar:** Liest die Pipeline-Identität Flows nicht auf Ebene Global (Rolle `Sentinel Seed Flow Reader` fehlt), sähe sie nur eigene Flows. Statt still 0 Treffer zu melden, warnt die Prüfung dann „Nutzung nicht prüfbar“; entfernte Operationen werden zu Warnungen, nicht zu Fehlern. Sie fragt die Tiefe mit `RetrieveUserPrivilegeByPrivilegeName` ab. Dieselbe Warnung gibt es für einen Flow, der den Connector einbindet, in dem die Prüfung aber keine Action mit `operationId` erkennt, etwa eine ältere `ApiConnection`-Action mit `method` und `path`; ihn prüft man von Hand.
+- **Drosselung:** Antwortet Dataverse (oder Graph) mit 429 oder 502 bis 504, wiederholt die Prüfung die Anfrage bis zu zweimal, nach `Retry-After`.
+- **Wann nichts geprüft wird:** ohne Output `custom_connector` im State (Feature aus, keine Umgebung angegeben oder noch nie angewendet); der Job entfällt dann samt Agent-Start. Gibt es den Connector in der Umgebung noch nicht, endet die Prüfung mit einem Hinweis. Ist der Präfix des Standard-Publishers nicht lesbar, ohne den sich der Connector nicht finden lässt, warnt sie „Connector nicht prüfbar“. Die Angaben zum Connector kommen aus dem State, also vom letzten Apply; ändert ein Lauf `customConnector.environmentUrl`, prüft er noch gegen die bisherige Umgebung.
+- **Fehlt das OpenAPI-Dokument** im Build, endet die Prüfung mit dem Fehler, mit dem sonst erst der Deploy endete.
+- **Skript:** [`scripts/custom-connector/Test-SeedConnectorChange.ps1`](scripts/custom-connector/Test-SeedConnectorChange.ps1) aus seed-pipelines, die Vergleichslogik in `SeedConnectorCheck.psm1`. Der Job checkt dafür seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); die Repository-Ressource muss `seed` heißen. Er ist ein eigener Job, damit der Checkout von `terraform plan` bleibt, wo er ist. Das Skript liest nur und läuft lokal mit einem `az`-Login ebenso: `./scripts/custom-connector/Test-SeedConnectorChange.ps1 -EnvironmentUrl <url> -Name <custom_connector.name> -OpenApiFile <openapi.json>`. Tests mit Testdaten: `pwsh -NoProfile -File scripts/custom-connector/SeedConnectorCheck.Tests.ps1` (läuft in der GitHub-CI dieses Repos).
+
+**Verbindungen prüfen (Opt-in):** Der Connector meldet sich im Namen des Kontos an, mit dem eine Verbindung angelegt wurde. Fehlt diesem Konto eine App-Rolle der API, scheitert erst der Flow: Mit `assignmentRequired` bekommt es kein Token, sonst antwortet die API mit 403. Mit `checkConnectorConnections: true` listet die Prüfung zusätzlich alle Verbindungen zum Connector mit Konto und Status, ermittelt die App-Rollen des Kontos an der Unternehmensanwendung der API, auch über Gruppen, und warnt je Verbindung ohne Rolle oder mit Fehlerstatus. Genutzt ist eine Verbindung, wenn eine Connection Reference auf sie zeigt (Flows in Solutions) oder ein Flow sie direkt einbindet (Flows außerhalb von Solutions, `connectionName` in `clientdata`); ungenutzte Verbindungen sind nur ein Hinweis. Das Konto ist das angemeldete Konto der Verbindung; nennt die Verbindung keins, was bei OAuth-Verbindungen zum Custom Connector die Regel ist, die Person, die sie angelegt hat. Meist ist das dieselbe, zwingend ist es nicht. Fehlen die Rechte unten, auch nur für Konten oder Gruppen, gibt es einmal die Warnung „Verbindungen nicht prüfbar“ und keinen Fehler.
+
+**Rechte der Pipeline-Identität:**
+
+| Wofür | Recht | Woher |
+| --- | --- | --- |
+| Connector lesen | Environment Maker (eigene Connectors) | Onboarding, Schritt 9 |
+| Flows aller Konten lesen | `prvReadWorkflow` auf Ebene Global, Rolle `Sentinel Seed Flow Reader` | Onboarding, Schritt 9 |
+| Connection References aller Konten lesen (nur mit `checkConnectorConnections`) | `prvReadconnectionreference` auf Ebene Global, dieselbe Rolle | Onboarding, Schritt 9 |
+| Verbindungen aller Konten lesen (nur mit `checkConnectorConnections`) | Admin-Scope der Power Apps API (`api.powerapps.com/.../scopes/admin/...`) | von Hand, siehe unten |
+| Unternehmensanwendung, Rollenzuweisungen, Konten, Gruppen (nur mit `checkConnectorConnections`) | Microsoft Graph, Anwendungsberechtigungen mit Admin-Consent | von Hand, siehe unten |
+
+Die Rolle `Sentinel Seed Flow Reader` hat nur diese zwei Leserechte; `prvReadflowrun` braucht die Prüfung nicht. Bestehende Umgebungen bekommen sie mit einem erneuten Lauf des Onboardings mit `-PowerPlatformEnvironmentUrl`. Mit ihr liest die Pipeline-Identität alle Flow-Definitionen der Umgebung, auch fest eingetragene Werte; in Log und Zusammenfassung erscheinen davon nur Namen, Besitzer, Status und Pfade der Actions (und ein beanstandeter Enum-Wert, gekürzt). Die Zusammenfassung sieht jede Person, die den Lauf lesen darf.
+
+Für die Verbindungsprüfung sind die Rechte eines Service Principals **nicht in einem Lauf geprüft**; gelaufen ist sie bisher nur unter einem Benutzerkonto mit Admin-Rechten. Nach heutigem Stand:
+
+- **Power Apps API, Admin-Scope:** Vermutlich muss die App-Registrierung der Deployment-Identität als Verwaltungsanwendung der Power Platform registriert sein (`pac admin application register --application-id <appId>` oder `New-PowerAppManagementApp`). Das gibt ihr Admin-Zugriff auf die Verwaltungs-APIs der Power Platform im ganzen Tenant, weit mehr als die Prüfung braucht. Deshalb ist die Verbindungsprüfung Opt-in.
+- **Microsoft Graph:** `Application.Read.All` (Unternehmensanwendung über `servicePrincipalNames`, `appRoleAssignedTo`), `User.ReadBasic.All` (Konto zur Verbindung) und `GroupMember.Read.All` (`transitiveMemberOf` für Rollen über Gruppen). Ob `Application.ReadWrite.OwnedBy` aus dem Onboarding für die eigene Unternehmensanwendung schon reicht, ist offen.
+
+Das Onboarding vergibt diese Rechte bewusst nicht; wer die Verbindungsprüfung will, vergibt sie von Hand und setzt `checkConnectorConnections: true` als festen Parameter im Projekt.
+
+**Grenzen:**
+
+- **Ausdruckssuche unscharf:** Antwortfelder erkennt die Prüfung in `body('Action')?['feld']`, `outputs('Action')?['body/feld']` und über `items('Schleife')` einer Schleife über eine Antwort, auch verschachtelt. Zugriffe über Variablen, `item()` in Select oder Filter oder Actions, die die ganze Antwort weiterreichen, sieht sie nicht; liest ein Flow ein übergeordnetes Objekt, meldet sie entfallene Unterfelder vorsichtshalber.
+- **Canvas Apps** prüft sie nicht: Dataverse zeigt nur, ob eine App den Connector nutzt, nicht welche Operation.
+- **Connector-Aktionen in Copilot Studio** prüft sie ebenfalls nicht, nur Cloud Flows.
+- **Nur der Connector, den Seed anlegt** (Name `<Präfix>_<custom_connector.name>`); manuell oder per APIM-Export angelegte Connectoren nicht.
+- Maßgeblich ist die Flow-Definition, nicht ob eine Action zur Laufzeit erreicht wird.
+- **Links auf Power Automate** nutzen die `resourceid` des Flows; Entwürfe, die nie aktiv waren, haben keine und erscheinen ohne Link.
 
 ### Browser-Erweiterung
 
@@ -317,8 +562,8 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 
 Mit `pool: <Name>` laufen alle Jobs im angegebenen Agent-Pool statt auf Microsoft-gehosteten Agents (`vmImage`). Das gilt ebenso für `templates/scaffold.yml` und `templates/intune-extensions.yml`. Gedacht ist das für Organisationen ohne gehostete Minuten oder für Agents im eigenen Netz.
 
-- **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 und der Azure CLI. Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7 (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
-- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform und gitleaks, jeweils ins Tool-Verzeichnis des Agents. Terraform und gitleaks prüft sie per SHA-256; Terraform lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider).
+- **Was die Agents brauchen:** Linux (x64) mit bash, curl, zip, unzip, tar, git, python3 mit PyYAML und der Azure CLI. PyYAML (Paket `python3-yaml`) haben Ubuntu-Server, gehostete Agents und Ubuntu unter WSL schon, als Abhängigkeit von netplan und cloud-init; sonst `apt install python3-yaml`. Die Paketprüfung im Build liest damit `project.yaml` (siehe Prüfungen im Build). Für `features.customConnector` und das zentrale Scaffold mit `migrate` oder `enableBranchPolicy` kommt PowerShell 7.2 oder neuer (`pwsh`) dazu, für `extension.signing` openssl. Den Deploy des Frontends (`AzureStaticWebApp@0`) führt der Task in einem Container aus; dafür braucht der Agent einen `docker`-Befehl. Am besten rootless, etwa Podman mit `podman-docker`: Ein Agent-Benutzer in der Gruppe `docker` hätte über den Daemon Root-Rechte auf der Maschine.
+- **Was die Pipeline selbst lädt:** das .NET SDK laut `global.json`, Node in `nodeVersion`, Terraform, gitleaks und Trivy. Terraform, gitleaks und Trivy prüft sie per SHA-256 und lädt sie in jedem Job neu, statt einem vorhandenen zu trauen (siehe Terraform und Provider). Der Hinweis auf veraltetes Seed fragt github.com, api.nuget.org und registry.npmjs.org ab; ohne diese Ziele entfällt er still.
 - **Anmeldung:** Die Azure CLI meldet sich in jedem Schritt mit einem eigenen Konfigurationsverzeichnis an (`AZURE_CONFIG_DIR`); eine Anmeldung des Agent-Benutzers bleibt unberührt.
 - **Reihenfolge:** Mit einem einzigen Agent laufen Stages und Läufe nacheinander, wie mit einem gehosteten parallelen Job.
 - **Berechtigung:** Der Pool muss im Projekt für die Pipeline berechtigt sein, sonst fragt der erste Lauf danach („Permit“).
@@ -365,7 +610,7 @@ cd seed-pipelines
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
 7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
 8. GitHub-Service-Connection für alle Pipelines
-9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen.
+9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Dazu je Umgebung die eigene Sicherheitsrolle `Sentinel Seed Flow Reader` in der Root-Business-Unit, nur mit `prvReadWorkflow` und `prvReadconnectionreference` auf Ebene Global, für die [Prüfung des Custom Connectors](#prüfung-des-custom-connectors): Environment Maker liest Flows nur auf Ebene Basic, also eigene. Fehlt der Rolle ein Recht oder hat es eine kleinere Tiefe, ergänzt das Skript es; weitere Rechte, die jemand ergänzt hat, bleiben. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen; bestehende Umgebungen bekommen die Rolle ebenso.
 
 **Weitere Subscription im selben Tenant:** Das Skript erneut ausführen, mit eigener Identität und Service Connection (`-IdentityName`, `-ServiceConnectionName`). Der State-Account bekommt nach Default je Subscription einen eigenen Namen. Die Rolle `Sentinel Seed Lock Contributor` gibt es im Tenant nur einmal: Das Skript sucht sie in allen Subscriptions, die das Konto sieht, und nimmt die neue Subscription in ihre `assignableScopes` auf (im DryRun `[alt]`). Dafür braucht das Konto auch in den Subscriptions, in denen die Rolle schon zuweisbar ist, Owner oder User Access Administrator. Bestehende Identitäten fasst das Skript nicht an.
 
@@ -373,7 +618,7 @@ cd seed-pipelines
 
 Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed-pipelines`, das Projekte über einen Tag einbinden. Deshalb erlaubt sie zusätzlich `-TemplateRefs` (Standard `refs/tags/v*`); ohne sie scheitert jeder Lauf auf `main`. Die Kehrseite: Ein Tag `v…` im Projekt-Repo und ein Lauf darauf kämen ebenfalls durch, ohne Review und ohne Freigabe. Deshalb dürfen dort nur Administratoren Tags anlegen: Das Onboarding setzt „Create tag“ auf Deny für Contributors, Build Administrators, `<Projekt> Build Service` und `Project Collection Build Service`, also auch für die Job-Tokens der Pipelines. `Initialize-SeedTenant.ps1` tut das für das ganze Azure-DevOps-Projekt (nicht mit `-SkipScaffold`), `Initialize-SeedProject.ps1` für das Repo des Projekts, `Grant-SeedScaffoldAccess.ps1` für ein Zielprojekt des zentralen Scaffolds. Brauchen andere Repos im selben Projekt Tags, lässt `-AllowTagCreation` das projektweite Verbot weg; das Skript warnt dann. Ein Deny gilt auch für Administratoren, die zugleich Contributors sind; Seed-Pipelines legen selbst keine Tags an. Wer Seed-Änderungen in einem Testprojekt vor dem Release prüft, nimmt die Branches von seed-pipelines in `-TemplateRefs` auf, etwa `refs/heads/feat/*`.
 
-Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1 -EnableBranchPolicy`. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` mit `-EnableBranchPolicy` bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
+Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1`, sobald das Projekt umgestellt ist. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` (nach dem Umschalten) bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
 `-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)); der PAT entfällt dann.
 
@@ -458,7 +703,7 @@ Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `te
 ### Ein Projekt anlegen oder einrichten
 
 - **`new`:** Im Zielprojekt unter Repos, New repository das Repo mit README anlegen. Dann `seed-scaffold` starten, mit Zielprojekt, Repo, Projektname, Features, Umgebungen und Modus `new`. Der erste Lauf des neuen Projekts startet und wartet auf die Freigabe der Infrastruktur.
-- **`migrate`:** vorhandenes Repo einrichten wie mit `Initialize-SeedProject.ps1`, ohne Dateien zu schreiben. Danach stellt das Projekt `azure-pipelines.yml` und `project.yaml` per Pull Request um; anschließend folgt **`enableBranchPolicy`** für die Branch-Policies.
+- **`migrate`:** vorhandenes Repo einrichten wie mit `Initialize-SeedProject.ps1`, ohne Dateien zu schreiben. Danach stellt das Projekt `azure-pipelines.yml` und `project.yaml` per Pull Request um; anschließend folgt **`enableBranchPolicy`** für die Branch-Policies. Ist `main` beim Lauf mit `migrate` schon umgestellt, setzt bereits `migrate` sie, wie das Skript es standardmäßig tut.
 - **`dryRun`:** nur prüfen, nichts ändern.
 
 ### Grenzen
@@ -474,7 +719,7 @@ Ein Projekt mit eigenem Repo und eigenen Pipelines zieht ohne neues Repo auf See
 - Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`
 - die Pipeline-Definition für die YAML-Datei (Default `azure-pipelines.yml`), ohne sie zu starten
 - die Berechtigungen der Pipeline für die Environments, die Azure- und die GitHub-Service-Connection; das „Permit“ beim ersten Lauf entfällt
-- mit `-EnableBranchPolicy` die Branch-Policy der PR-Validierung, einen Pflicht-Reviewer (`-MinReviewers`, Standard 1, die eigene Stimme zählt nicht) und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch)
+- nach dem Umschalten den Branch-Schutz: die Branch-Policy der PR-Validierung, einen Pflicht-Reviewer (`-MinReviewers`, Standard 1, die eigene Stimme zählt nicht) und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch); siehe unten, PR-Validierung als Standard
 - Tags im Repo nur für Administratoren (siehe [Branch-Prüfung](#tenant-onboarding)); `-AllowTagCreation` lässt das mit Warnung weg
 - mit `-Pool` Warnungen, wenn die Agent-Queue ohne Freigabe oder Branch-Prüfung ist, allen Pipelines offensteht oder der Pool in jedes neue Projekt kommt (siehe [Eigene Agents](#eigene-agents))
 
@@ -501,9 +746,18 @@ Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das
 4. **Pipeline auf dem Branch** von Hand starten (`az pipelines run --name <pipeline> --branch <branch>`) und Plan, Deploy und Smoke-Test prüfen. Ein Lauf auf einem Branch deployt wie einer auf `main`, mit denselben Freigaben; wer zuerst nur die erste Umgebung prüfen will, lehnt die Freigabe der nächsten ab.
 5. **Alte Pipelines deaktivieren**, bevor der Branch nach `main` geht (Pipeline-Einstellungen, „Disabled“). Sonst startet der Merge sie mit: eine alte Pipeline auf derselben YAML-Datei mit dem neuen Inhalt, andere mit ihren alten Dateien, solange es diese noch gibt.
 6. **Mergen.** Ab dann deployt die Seed-Pipeline bei jedem Push auf `main`.
-7. **Branch-Policy nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern und `-EnableBranchPolicy`. Das Skript prüft vorher, dass die YAML-Datei auf `main` `web-app.yml` ab v0.5.0 einbindet; mit der alten Datei würden PR-Läufe deployen. Danach gehen Änderungen an `main` nur noch per PR, und nur Läufe von `main` bekommen die Azure-Service-Connection.
+7. **Branch-Schutz nach dem Umschalten:** `Initialize-SeedProject.ps1` mit denselben Parametern erneut ausführen. Bindet die YAML-Datei auf `main` jetzt `web-app.yml` ab v0.5.0 ein, setzt das Skript Branch-Policy, Pflicht-Reviewer und Branch-Prüfung von selbst. Danach gehen Änderungen an `main` nur noch per PR, und nur Läufe von `main` bekommen die Azure-Service-Connection.
 
 Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben Pfad, startet ein Push auf `main` auch die neue Pipeline, mit dem alten Inhalt. Diese Pipeline ist für die alten Service Connections und Environments nicht berechtigt und fragt nach Zugriff: solche Läufe abbrechen, den Zugriff nicht erlauben. `Initialize-SeedProject.ps1` weist darauf hin und listet die übrigen aktiven Pipelines des Repos.
+
+### PR-Validierung als Standard
+
+Den Branch-Schutz (Branch-Policy mit Build-Validierung durch die Seed-Pipeline, Pflicht-Reviewer, Branch-Prüfung an der Service Connection) setzt `Initialize-SeedProject.ps1` ohne weiteren Schalter, sobald die YAML-Datei auf dem Default-Branch `web-app.yml` ab v0.5.0 einbindet. Neue Projekte aus `seed-scaffold` bekommen die Policy ohnehin (`seed-terraform//ado-project`, `pr_validation`, Standard `true`).
+
+- **Warum erst nach dem Umschalten:** Vorher sperrte die Pflicht-Policy direkte Pushes auf den Default-Branch, und die Branch-Prüfung hielte die Testläufe der Migration auf ihrem Branch auf; mit der alten YAML-Datei würden PR-Läufe sogar deployen. Bis dahin übergeht das Skript den Branch-Schutz mit einem Hinweis, ohne Fehler; ein erneuter Lauf nach dem Merge holt ihn nach.
+- **`-EnableBranchPolicy`** verlangt den Branch-Schutz: Ist der Default-Branch noch nicht umgestellt, fehlt die Policy, und das Skript endet mit Exit-Code 1 (außer im DryRun). So arbeitet der Modus `enableBranchPolicy` des zentralen Scaffolds.
+- **`-SkipBranchPolicy`** lässt ihn ausdrücklich weg, auch nach dem Umschalten, etwa solange ein Projekt noch direkt auf den Default-Branch pushen muss. Vorhandene Policies und Prüfungen bleiben, wie sie sind; entfernen geht nur von Hand. Beide Schalter zusammen sind ein Fehler.
+- **Erweiterte Branch-Prüfung bleibt:** Weicht eine vorhandene Branch-Prüfung von `-AllowedBranches` und `-TemplateRefs` ab, etwa weil ein Testprojekt zusätzlich `refs/heads/feat/*` erlaubt, lässt ein erneuter Lauf sie stehen und meldet das. Geändert wird sie nur, wenn der Aufruf `-AllowedBranches`, `-TemplateRefs` oder `-EnableBranchPolicy` nennt.
 
 ## Intune: Edge-Erweiterungen verteilen
 

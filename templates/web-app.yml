@@ -2,7 +2,9 @@
 #
 # Projekte binden das Template per extends ein (siehe README). Nach Build und Tests
 # je Umgebung:
-#   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert
+#   plan_<env>    terraform plan, merkt sich, ob sich die Infrastruktur ändert; mit
+#                 features.customConnector prüft der Job connector_check, ob die neue
+#                 OpenAPI-Definition Flows bricht (steps/custom-connector-check.yml)
 #   apply_<env>   nur bei Änderungen: Freigabe (Check am Environment <project>-<env>),
 #                 dann terraform apply des geprüften Plans
 #   deploy_<env>  Deploy von Function und Static Web App, Smoke-Test, mit
@@ -100,6 +102,15 @@ parameters:
     type: stepList
     default: []
 
+  # Warnungen brechen den Build der API (dotnet build und dotnet publish mit -warnaserror), auch im
+  # PR-Lauf: die des Compilers, zu Nullable, der Analyzer und von MSBuild-Tasks wie Bfs.Seed.OpenApi.
+  # Ausnahmen gehören sichtbar ins Projekt: NoWarn, WarningsNotAsErrors, .editorconfig oder
+  # [SuppressMessage(..., Justification = "...")]. Warnungen von NuGet, die vom Netz abhängen oder
+  # Lücken melden, bleiben Warnungen (README, Prüfungen im Build).
+  - name: treatWarningsAsErrors
+    type: boolean
+    default: true
+
   # Löschen von Daten bestätigen. Ein Plan, der Ressourcen aus protectedResourceTypes löscht
   # oder ersetzt, bricht sonst ab. Projekte reichen dafür einen Laufzeitparameter durch
   # (azure-pipelines.yml aus seed-template); bestätigt wird also nur in einem bewusst von Hand
@@ -124,13 +135,28 @@ parameters:
       - azurerm_log_analytics_workspace
       - azurerm_management_lock
 
+  # Breaking Changes am Custom Connector zulassen: Die Prüfung in plan_<env> (Job connector_check)
+  # meldet ihre Fehler dann als Warnungen, etwa für eine entfernte Operation, die nur ein Flow nutzt,
+  # der ohnehin abgeschaltet wird. Projekte reichen dafür wie bei confirmDataDeletion einen
+  # Laufzeitparameter durch; zugelassen wird also nur in einem bewusst von Hand gestarteten Lauf.
+  - name: allowBreakingConnectorChanges
+    type: boolean
+    default: false
+
+  # Zusätzlich die Verbindungen zum Custom Connector prüfen: je Verbindung, ob ihr Konto eine
+  # App-Rolle der API hat. Braucht weitere Rechte der Pipeline-Identität (Admin-Scope der Power Apps
+  # API, Graph); fehlen sie, gibt es nur eine Warnung (README, Prüfung des Custom Connectors).
+  - name: checkConnectorConnections
+    type: boolean
+    default: false
+
   # Microsoft-gehosteter Agent; gilt nur, solange pool leer ist.
   - name: vmImage
     type: string
     default: ubuntu-24.04
 
   # Eigener Agent-Pool statt Microsoft-gehosteter Agents, z. B. Default. Linux-Agents mit bash,
-  # curl, unzip, tar, git, python3 und Azure CLI (README, Eigene Agents).
+  # curl, unzip, tar, git, python3 mit PyYAML und Azure CLI (README, Eigene Agents).
   - name: pool
     type: string
     default: ''
@@ -172,14 +198,31 @@ stages:
             vmImage: ${{ parameters.vmImage }}
           ${{ else }}:
             name: ${{ parameters.pool }}
+        # Ref und Name der Repository-Ressource seed für steps/seed-versions.yml; in Schritten nur
+        # über einen Laufzeitausdruck lesbar.
+        variables:
+          seedPipelinesRef: $[ resources.repositories.seed.ref ]
+          seedPipelinesRepository: $[ resources.repositories.seed.name ]
         steps:
+          # Mit dem zweiten Checkout (seed-pipelines, Skripte der Prüfungen in steps/dotnet-checks.yml)
+          # käme das Projekt sonst nach s/<repo>; path: s hält es in $(Build.SourcesDirectory), dem
+          # Arbeitsverzeichnis aller Schritte. Die Repository-Ressource heißt in allen Seed-Projekten
+          # seed und hat die ref der Templates, also passt das Skript zum Template.
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
               - checkout: self
+                path: s
                 fetchDepth: 0
+              - checkout: seed
+                path: seed
+                fetchDepth: 1
               - template: steps/secret-scan.yml
           - ${{ else }}:
               - checkout: self
+                path: s
+              - checkout: seed
+                path: seed
+                fetchDepth: 1
 
           - bash: |
               set -euo pipefail
@@ -202,6 +245,10 @@ stages:
                 exit 1
               fi
             displayName: project.yaml abgleichen
+          # Warnung, wenn Template-Ref, Modul-Refs oder Seed-Pakete hinter dem neuesten Release liegen
+          - template: steps/seed-versions.yml
+            parameters:
+              infraPath: ${{ parameters.infraPath }}
           - template: steps/terraform-install.yml
             parameters:
               version: ${{ parameters.terraformVersion }}
@@ -218,6 +265,10 @@ stages:
               terraform validate
             displayName: terraform fmt und validate
             workingDirectory: ${{ parameters.infraPath }}
+          # Fehlkonfigurationen in den .tf-Dateien des Projekts, nach init (Module unter .terraform)
+          - template: steps/terraform-scan.yml
+            parameters:
+              workingDirectory: ${{ parameters.infraPath }}
 
           # Das .NET SDK des Images genügt, wenn es zu global.json passt (sonst scheitert
           # dotnet --version); dann entfällt der Download durch UseDotNet.
@@ -241,9 +292,12 @@ stages:
           # Fehlt die Anmeldung an einem privaten Feed, wiederholt dotnet restore die Anfrage mit
           # NU1301 (401) ohne Ende, und der Job stünde bis zu seinem Timeout. Sonst dauert der
           # Restore keine Minute.
+          # Ohne NuGetAudit: Über Lücken entscheidet allein „NuGet-Pakete prüfen“ (Schwere und
+          # build.ignoreAdvisories). Setzt ein Projekt selbst TreatWarningsAsErrors, machte NuGet die
+          # Audit-Warnungen NU1901–NU1904 sonst schon hier zu Fehlern, ohne Rücksicht auf die Ausnahmen.
           - bash: |
               set -uo pipefail
-              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }}
+              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }} -p:NuGetAudit=false
               code=$?
               # 124: timeout, 137: nach weiteren 30 s hart beendet
               if [ "$code" = 124 ] || [ "$code" = 137 ]; then
@@ -251,7 +305,19 @@ stages:
               fi
               exit "$code"
             displayName: dotnet restore
-          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-restore
+          # TODO(onboarding) in project.yaml, Formatierung, Pakete (Vorabversionen, Lücken, veraltete);
+          # vor dem Build, weil schnell und ohne Build möglich.
+          - template: steps/dotnet-checks.yml
+            parameters:
+              solution: ${{ parameters.apiSolution }}
+          # Eigener Build, weil dotnet test (Microsoft.Testing.Platform) -warnaserror an die Tests gäbe
+          # statt an MSBuild. Welche Warnungen trotzdem Warnungen bleiben und warum: README, Prüfungen
+          # im Build; dotnet publish nutzt dieselbe Liste.
+          - script: >-
+              dotnet build ${{ parameters.apiSolution }} --configuration Release --no-restore
+              ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
+            displayName: dotnet build
+          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-build
             displayName: dotnet test
           - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
               - script: >
@@ -261,6 +327,7 @@ stages:
                   --output $(Build.ArtifactStagingDirectory)/api
                   -p:InformationalVersion=$(Build.BuildNumber)
                   -p:SeedOpenApiPublishDir=$(Build.ArtifactStagingDirectory)/openapi
+                  ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
                 displayName: dotnet publish
               - task: ArchiveFiles@2
                 displayName: Paket packen
@@ -509,11 +576,41 @@ stages:
                         echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
                         mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                         cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
+                  # Für den Job connector_check
+                  - template: steps/custom-connector-check.yml
+                    parameters:
+                      part: detect
+                      outputsFile: $(Build.ArtifactStagingDirectory)/tfoutputs/outputs.json
                   # Ohne Änderungen gelten die Outputs aus dem State; sonst veröffentlicht apply sie.
                   - publish: $(Build.ArtifactStagingDirectory)/tfoutputs
                     artifact: tfoutputs_${{ env.name }}
                     displayName: Outputs als Artefakt
                     condition: and(succeeded(), eq(variables['tfplan.changes'], 'false'))
+
+              # Prüfung des Custom Connectors vor jeder Freigabe und vor dem Function-Deploy
+              # (steps/custom-connector-check.yml). Scheitert sie, endet plan_<env>, und Apply und
+              # Deploy entfallen. Ohne Connector entfällt der Job.
+              - job: connector_check
+                displayName: Custom Connector prüfen
+                dependsOn: plan
+                condition: and(succeeded(), eq(dependencies.plan.outputs['connector.enabled'], 'true'))
+                pool:
+                  ${{ if eq(parameters.pool, '') }}:
+                    vmImage: ${{ parameters.vmImage }}
+                  ${{ else }}:
+                    name: ${{ parameters.pool }}
+                variables:
+                  seedConnectorUrl: $[ dependencies.plan.outputs['connector.environmentUrl'] ]
+                  seedConnectorName: $[ dependencies.plan.outputs['connector.name'] ]
+                steps:
+                  - template: steps/custom-connector-check.yml
+                    parameters:
+                      part: check
+                      serviceConnection: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
+                      environmentUrl: $(seedConnectorUrl)
+                      name: $(seedConnectorName)
+                      allowBreakingChanges: ${{ parameters.allowBreakingConnectorChanges }}
+                      checkConnections: ${{ parameters.checkConnectorConnections }}
 
           - stage: apply_${{ env.name }}
             displayName: Apply ${{ env.name }}

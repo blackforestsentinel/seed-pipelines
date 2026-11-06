@@ -11,6 +11,9 @@
 # Redirect-URI und Federated Credential enthalten eine Endung der Power-Platform-Umgebung, die
 # erst der angelegte Connector kennt; deshalb trägt sie dieser Schritt ein und nicht Terraform.
 # Die Pipeline ist Besitzerin der Registrierung (Modul sso), Application.ReadWrite.OwnedBy genügt.
+#
+# Ob die neue Definition Flows bricht, die den Connector nutzen, prüft schon plan_<env> vor jeder
+# Freigabe (custom-connector-check.yml); dieser Schritt prüft das nicht noch einmal.
 parameters:
   - name: serviceConnection
     type: string

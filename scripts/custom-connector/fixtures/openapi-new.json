@@ -1,0 +1,129 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Bestellungen",
+    "description": "Testdaten: neue Definition mit Breaking Changes gegenüber openapi-old.json.",
+    "version": "2.0.0"
+  },
+  "basePath": "/api",
+  "schemes": ["https"],
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "ListOrders",
+        "parameters": [
+          { "name": "state", "in": "query", "required": false, "type": "string", "enum": ["Open", "Shipped", "Cancelled"] },
+          { "name": "top", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "since", "in": "query", "required": false, "type": "string", "format": "date-time" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/OrderPage" } }
+        }
+      },
+      "post": {
+        "operationId": "CreateOrder",
+        "parameters": [
+          { "name": "body", "in": "body", "required": true, "schema": { "$ref": "#/definitions/CreateOrderRequest" } }
+        ],
+        "responses": {
+          "201": { "description": "Created", "schema": { "$ref": "#/definitions/Order" } },
+          "400": { "description": "Eingabe ungültig" }
+        }
+      }
+    },
+    "/orders/{id}": {
+      "parameters": [
+        { "name": "id", "in": "path", "required": true, "type": "string" }
+      ],
+      "get": {
+        "operationId": "GetOrder",
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Order" } },
+          "404": { "description": "Not Found" }
+        }
+      }
+    },
+    "/orders/{id}/archive": {
+      "post": {
+        "operationId": "ArchiveOrder",
+        "description": "Veraltet: stattdessen den Status über CreateOrder setzen.",
+        "deprecated": true,
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "No Content" } }
+      }
+    },
+    "/reports/legacy": {
+      "get": {
+        "operationId": "GetLegacyReport",
+        "deprecated": true,
+        "responses": { "200": { "description": "OK", "schema": { "type": "string" } } }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "GetHealth",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "object", "properties": { "status": { "type": "string" }, "version": { "type": "string" } } }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "OrderPage": {
+      "type": "object",
+      "properties": {
+        "value": { "type": "array", "items": { "$ref": "#/definitions/Order" } },
+        "nextLink": { "type": "string" }
+      }
+    },
+    "OrderBase": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "state": { "type": "string", "enum": ["Open", "Shipped", "Cancelled"] }
+      },
+      "required": ["id", "state"]
+    },
+    "Order": {
+      "allOf": [
+        { "$ref": "#/definitions/OrderBase" },
+        {
+          "type": "object",
+          "properties": {
+            "customer": { "$ref": "#/definitions/Customer" },
+            "lines": { "type": "array", "items": { "$ref": "#/definitions/OrderLine" } }
+          }
+        }
+      ]
+    },
+    "Customer": {
+      "type": "object",
+      "properties": { "name": { "type": "string" } }
+    },
+    "OrderLine": {
+      "type": "object",
+      "properties": {
+        "sku": { "type": "string" },
+        "quantity": { "type": "integer", "format": "int32" },
+        "discount": { "type": "number", "format": "double" }
+      },
+      "required": ["sku", "quantity"]
+    },
+    "CreateOrderRequest": {
+      "type": "object",
+      "properties": {
+        "customer": { "type": "string" },
+        "channel": { "type": "string", "enum": ["Web", "Phone"] },
+        "priority": { "type": "string" },
+        "costCenter": { "type": "string" },
+        "lines": { "type": "array", "items": { "$ref": "#/definitions/OrderLine" } }
+      },
+      "required": ["customer", "costCenter"]
+    }
+  }
+}

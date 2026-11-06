@@ -1,0 +1,33 @@
+{
+  "properties": {
+    "connectionReferences": {
+      "shared_office365": {
+        "runtimeSource": "embedded",
+        "connection": { "connectionReferenceLogicalName": "new_sharedoffice365" },
+        "api": { "name": "shared_office365" }
+      }
+    },
+    "definition": {
+      "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+      "contentVersion": "1.0.0.0",
+      "triggers": {
+        "manual": { "type": "Request", "kind": "Button", "inputs": { "schema": { "type": "object", "properties": {} } } }
+      },
+      "actions": {
+        "Note": {
+          "type": "Compose",
+          "inputs": "Erwähnt nur den Connector shared_example-5fordersdev-5f0000000000000000, ruft ihn aber nicht auf."
+        },
+        "Send_mail": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_office365", "operationId": "SendEmailV2" },
+            "parameters": { "emailMessage/To": "team@example.org", "emailMessage/Subject": "@{outputs('Note')}" }
+          },
+          "runAfter": { "Note": ["Succeeded"] }
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0.0"
+}

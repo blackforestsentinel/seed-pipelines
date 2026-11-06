@@ -1,0 +1,55 @@
+# Prüfungen der API im Build-Job, nach dotnet restore und vor dotnet build, auch im PR-Lauf und mit
+# validationOnly (README, Prüfungen im Build):
+#   - eine Warnung je TODO(onboarding) in project.yaml;
+#   - RS0030 (verbotene APIs) und die Regeln aus Bfs.Seed (SEEDAUTH, SEEDSUPPRESS, SEEDOPENAPI) nur
+#     mit Begründung abgeschaltet, im ganzen Repo; Analyzer pauschal aus gibt eine Warnung;
+#   - NuGet-Pakete: Vorabversionen direkter Referenzen und Lücken High/Critical sind Fehler, außer sie
+#     stehen mit Begründung in project.yaml (build.prereleasePackages, build.ignoreAdvisories);
+#     Lücken Low/Moderate und veraltete direkte Referenzen sind Warnungen;
+#   - Formatierung: dotnet format whitespace --verify-no-changes.
+# Warnungen des Compilers, der Analyzer und von MSBuild prüft nicht dieser Schritt, sondern der Build
+# selbst (Parameter treatWarningsAsErrors in web-app.yml).
+#
+# Die Logik steht in scripts/dotnet/checks.py (mit Tests); web-app.yml checkt seed-pipelines dafür
+# nach $(Pipeline.Workspace)/seed aus, dieselbe ref wie die Templates. Werte aus dem Repo und
+# Ausgaben von dotnet gibt das Skript nur bereinigt aus.
+parameters:
+  # Solution der API, relativ zum Checkout
+  - name: solution
+    type: string
+  - name: projectYaml
+    type: string
+    default: project.yaml
+
+steps:
+  - bash: python3 "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" todos --project-yaml "$SEED_PROJECT_YAML"
+    displayName: Offene TODOs in project.yaml
+    env:
+      SEED_PROJECT_YAML: ${{ parameters.projectYaml }}
+
+  # Im ganzen Checkout: .editorconfig, .globalconfig, Projektdateien, .props, .targets, .rsp.
+  - bash: python3 "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" suppressions
+    displayName: Abgeschaltete Regeln prüfen
+
+  # Läuft vor der Paketprüfung: braucht kein Netz und ist schneller als die drei Abfragen dort.
+  - bash: >-
+      python3 "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" format --solution "$SEED_SOLUTION"
+    displayName: Formatierung prüfen
+    env:
+      SEED_SOLUTION: ${{ parameters.solution }}
+
+  - bash: |
+      set -euo pipefail
+      # project.yaml liest das Skript mit PyYAML (python3-yaml), das Ubuntu mitbringt. Hat ein eigener
+      # Schritt ein anderes python3 vorangestellt (etwa UsePythonVersion in preBuildSteps), fehlt
+      # PyYAML dort meist; dann nimmt der Schritt das python3 des Systems.
+      python=python3
+      if ! python3 -c 'import yaml' 2> /dev/null && [ -x /usr/bin/python3 ]; then
+        python=/usr/bin/python3
+      fi
+      "$python" "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" packages \
+        --solution "$SEED_SOLUTION" --project-yaml "$SEED_PROJECT_YAML"
+    displayName: NuGet-Pakete prüfen
+    env:
+      SEED_SOLUTION: ${{ parameters.solution }}
+      SEED_PROJECT_YAML: ${{ parameters.projectYaml }}
