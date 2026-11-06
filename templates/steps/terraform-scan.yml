@@ -10,7 +10,11 @@
 # TRIVY_*-Variablen wirken nicht. Ausnahmen stehen inline im .tf, mit Begründung in derselben Zeile:
 #   # trivy:ignore:AZU-0011 Altes Lesegerät kann nur TLS 1.0, Ablösung bis Ende 2027
 #   # trivy:ignore:AZU-0011:exp:2027-12-31 dasselbe, ab dem Datum wieder ein Befund
-# Eine Ausnahme ohne Begründung (mindestens zehn Zeichen) oder mit * statt einer Regel ist ein Fehler.
+# Trivy liest Ausnahmen aus jeder Zeile, auch ohne Kommentarzeichen und in beliebiger Reihenfolge der
+# Abschnitte. Die Prüfung liest sie genauso (Nachbau des Parsers von Trivy) und verlangt für jedes
+# Wort, das mit trivy: oder tfsec: beginnt: eine Ausnahme mit Regel, kein * in ignore oder ws (Trivy
+# liest es als Platzhalter, AZU-* schaltete eine ganze Familie ab) und dahinter eine Begründung mit
+# mindestens zehn Zeichen. Sonst ist es ein Fehler.
 #
 # Schwere: CRITICAL und HIGH sowie die Regeln aus errorChecks sind Fehler, der Rest Warnungen. Die
 # Regeln aus skipChecks sind aus (Seed-Regelsatz, README: Terraform-Sicherheitsscan).
@@ -111,16 +115,17 @@ steps:
         --skip-check-update --skip-version-check --disable-telemetry \
         --config '' --ignorefile '' --cache-dir "$dir/cache"
       # Auswertung: Ausnahmen im Code prüfen, Befunde nach Seed-Regelsatz und Schwere melden.
-      python3 - "$dir/report.json" . "${{ parameters.workingDirectory }}" <<'PY'
+      python3 - "$dir/report.json" . "$SEED_INFRA_PATH" <<'PY'
       # seed-terraform-scan
       import json, os, re, sys
       from pathlib import Path
 
       MIN_REASON = 10
       ERROR_SEVERITIES = {"CRITICAL", "HIGH"}
-      # Kommentar mit Ausnahme: # trivy:ignore:<regel>[:exp:<datum>] <Begründung>; Trivy liest auch tfsec:ignore.
-      IGNORE = re.compile(r"(?:trivy|tfsec):ignore:(\S*)")
-      COMMENT = re.compile(r"(#|//|/\*)")
+      # Dateien, aus denen Trivy Terraform und damit Ausnahmen liest (terraform/parser/parser.go)
+      SOURCES = (".tf", ".tofu", ".tf.json", ".tofu.json")
+      PREFIXES = ("trivy:", "tfsec:")
+      WORD = re.compile(r"\S+")
 
       def clean(text):
           # Text aus dem Repo und aus Trivy nur ohne Steuerzeichen und ##vso[ ins Log (Logging-Befehle).
@@ -139,33 +144,58 @@ steps:
           value = str(value or "").strip()
           return value[4:] if value.upper().startswith("AVD-") else value
 
+      def ignore_tokens(line):
+          """Wörter einer Zeile, die Trivy als Ausnahme lesen kann.
+
+          Nachbau von Trivy 0.76.1 (pkg/iac/ignore/parse.go, parseLine): Trivy liest jede Zeile der
+          Datei, nicht nur Kommentare, teilt sie in Wörter, entfernt führende #, / und * und nimmt jedes
+          Wort, das mit trivy: oder tfsec: beginnt. Trivy teilt nur an Leerzeichen, hier an jedem
+          Leerraum; so findet die Prüfung mindestens alles, was Trivy findet."""
+          for match in WORD.finditer(line):
+              word = match.group().lstrip("#/*")
+              for prefix in PREFIXES:
+                  if word.startswith(prefix):
+                      yield match.end(), word[len(prefix):]
+
+      def sections(rest):
+          """Wie parseRuleSections: Abschnitte als Schlüssel-Wert-Paare, Reihenfolge beliebig
+          (ignore, exp, ws, …). Die Regel steht unter ignore bis zu einem [ mit Attributfiltern."""
+          parts = rest.split(":")
+          return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+
       def find_ignores(root):
-          """Ausnahmen in den .tf-Dateien des Projekts: (Datei, Zeile, Regeln, Begründung, Problem)."""
+          """Ausnahmen in den Terraform-Dateien des Projekts: (Datei, Zeile, Regeln, Begründung, Problem).
+
+          Jedes Wort, das Trivy als Ausnahme liest, und jedes, das nur so aussieht, muss die dokumentierte
+          Form haben: eine Regel ohne Platzhalter, die Begründung dahinter in derselben Zeile."""
           found = []
-          for path in sorted(root.rglob("*.tf")):
+          for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name.endswith(SOURCES)):
               relative = path.relative_to(root)
               if ".terraform" in relative.parts:
                   continue
               text = path.read_text(encoding="utf-8", errors="replace")
-              for number, line in enumerate(text.splitlines(), 1):
-                  token = IGNORE.search(line)
-                  if not token:
+              for number, line in enumerate(text.split("\n"), 1):
+                  tokens = list(ignore_tokens(line))
+                  if not tokens:
                       continue
-                  marker = None
-                  for candidate in COMMENT.finditer(line, 0, token.start()):
-                      marker = candidate
-                  if marker is None:
-                      continue
-                  comment = line[marker.end():]
-                  rules = [match.group(1).split(":")[0] for match in IGNORE.finditer(comment)]
-                  reason = IGNORE.sub(" ", comment).replace("*/", " ")
-                  reason = re.sub(r"\s+", " ", reason).strip(" -–—:;,.")
-                  problem = None
-                  if any(rule in ("", "*") for rule in rules):
-                      problem = "nennt keine einzelne Regel (* oder leer)"
-                  elif len(reason) < MIN_REASON:
-                      problem = "ohne Begründung"
-                  found.append((relative.as_posix(), number, rules, reason, problem))
+                  rules, problems = [], []
+                  for _, rest in tokens:
+                      pairs = sections(rest)
+                      ids = [value.split("[", 1)[0] for key, value in pairs if key == "ignore"]
+                      if not any(ids):
+                          problems.append(f"„{rest[:40]}“ ist keine Ausnahme der Form trivy:ignore:<Regel>")
+                          continue
+                      rules += [i for i in ids if i]
+                      # Trivy macht aus * ein beliebiges Stück (MatchPattern): AZU-* schaltet eine ganze
+                      # Familie ab, * alles. Ebenso gelten ws-Werte als Muster.
+                      if any("*" in value for key, value in pairs if key in ("ignore", "ws")):
+                          problems.append("mit Platzhalter * (gilt dann für mehr als eine Regel)")
+                  # Begründung: der Text hinter dem letzten Ausnahme-Wort derselben Zeile
+                  reason = re.sub(r"\s+", " ", line[tokens[-1][0]:]).replace("*/", " ")
+                  reason = reason.strip(" -–—:;,.*/#\"'")
+                  if len(reason) < MIN_REASON:
+                      problems.append("ohne Begründung")
+                  found.append((relative.as_posix(), number, rules, reason, "; ".join(dict.fromkeys(problems)) or None))
           return found
 
       def evaluate(report, skip, raise_):
@@ -228,7 +258,9 @@ steps:
           for path, line, rules, reason, problem in ignores:
               if problem:
                   errors += 1
-                  issue("error", f"Ausnahme {', '.join(r or '?' for r in rules)} {problem}. Regel-ID und Begründung in dieselbe Zeile, z. B. # trivy:ignore:AZU-0011 Altes Lesegerät kann nur TLS 1.0", source(path), line)
+                  issue("error", f"Ausnahme {', '.join(rules) or '(ohne Regel)'}: {problem}. Form: eine Regel ohne *, "
+                                 "die Begründung dahinter in derselben Zeile, z. B. # trivy:ignore:AZU-0011 Altes Lesegerät kann nur TLS 1.0",
+                        source(path), line)
           for name in (".trivyignore", ".trivyignore.yaml", "trivy.yaml"):
               if (root / name).exists():
                   issue("warning", f"{source(name)} wirkt nicht: Der Seed-Scan nimmt Ausnahmen nur inline im .tf an (# trivy:ignore:<Regel> <Begründung>).", source(name))
@@ -254,5 +286,7 @@ steps:
     displayName: Terraform-Sicherheitsscan (Trivy ${{ parameters.version }})
     workingDirectory: ${{ parameters.workingDirectory }}
     env:
+      # Wert aus dem Projekt nur über die Umgebung, nie als Text im Skript
+      SEED_INFRA_PATH: ${{ parameters.workingDirectory }}
       SEED_TRIVY_SKIP: ${{ convertToJson(parameters.skipChecks) }}
       SEED_TRIVY_ERRORS: ${{ convertToJson(parameters.errorChecks) }}

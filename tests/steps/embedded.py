@@ -1,8 +1,11 @@
 """Python aus einem Schritt-Template (Heredoc <<'PY' … PY im bash-Skript) für Tests.
 
-Die Schritte im Build-Job bringen ihr Python inline mit: Ein Checkout von seed-pipelines im
-Build-Job verschöbe den Checkout des Projekts nach s/<repo>. So testet die CI genau den Code, den
-die Pipeline ausführt, ohne zweite Kopie. Nur Standardbibliothek.
+Terraform-Scan (steps/terraform-scan.yml) und Hinweis auf veraltetes Seed (steps/seed-versions.yml)
+bringen ihr Python inline mit. Entstanden ist das, als der Build-Job seed-pipelines noch nicht
+auscheckte. Inzwischen checkt er es für steps/dotnet-checks.yml nach $(Pipeline.Workspace)/seed aus;
+beide Schritte könnten ihr Python also auch als Datei unter scripts/ aufrufen. Umgestellt ist das
+nicht. Bis dahin testet die CI hiermit genau den Code, den die Pipeline ausführt, ohne zweite Kopie.
+Nur Standardbibliothek.
 """
 
 import types

@@ -121,6 +121,38 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("@blackforestsentinel/seed-web-core 0.8.0 (neu: 0.9.0)", issues[3])
         self.assertIn("aktuell: Bfs.Seed.Mcp 0.9.0", text)
 
+    def test_msbuild_property_is_resolved(self):
+        self.write("Directory.Build.props", "<Project><PropertyGroup><SeedVersion>0.8.0</SeedVersion></PropertyGroup></Project>")
+        self.write("api/Api/Api.csproj", CSPROJ.replace('Version="0.8.0"', 'Version="$(SeedVersion)"'))
+        self.assertEqual(versions.nuget_refs(self.root), {"Bfs.Seed.Auth": {"0.8.0"}, "Bfs.Seed.Mcp": {"0.9.0"}})
+        issues, _ = self.run_main(env={})
+        self.assertEqual(len(issues), 1)
+        self.assertIn("Bfs.Seed.Auth 0.8.0 (neu: 0.9.0)", issues[0])
+
+    def test_unclear_package_versions_warn(self):
+        # Property ohne eindeutigen Wert, unbekannte Property, Bereich: nicht still übergehen
+        self.write("Directory.Build.props", "<Project><PropertyGroup><SeedVersion>0.8.0</SeedVersion></PropertyGroup>"
+                                            "<PropertyGroup Condition=\"'$(X)' == 'y'\"><SeedVersion>0.9.0</SeedVersion></PropertyGroup></Project>")
+        self.write("api/Api/Api.csproj", CSPROJ.replace('Version="0.8.0"', 'Version="$(SeedVersion)"').replace(
+            "<Version>0.9.0</Version>", "<Version>$(Unbekannt)</Version>"))
+        self.write("api/Other/Other.csproj", '<Project><ItemGroup><PackageReference Include="Bfs.Seed.Storage" Version="0.9.*" /></ItemGroup></Project>')
+        self.write("frontend/package.json", json.dumps({"dependencies": {"@blackforestsentinel/seed-web-core": "file:../seed-web-core"}}))
+
+        def offline(*args, **kwargs):
+            raise OSError("Netz weg")
+
+        issues, _ = self.run_main(env={}, tags=offline, fetch=offline)
+        self.assertEqual(len(issues), 2)
+        self.assertIn("NuGet-Pakete Bfs.Seed.*: Version nicht prüfbar: Bfs.Seed.Auth $(SeedVersion), "
+                      "Bfs.Seed.Mcp $(Unbekannt), Bfs.Seed.Storage 0.9.*", issues[0])
+        self.assertIn("npm-Pakete seed-web-*: Version nicht prüfbar: @blackforestsentinel/seed-web-core file:../seed-web-core", issues[1])
+
+    def test_branch_refs_are_only_logged(self):
+        self.write("infra/main.tf", MAIN_TF.replace("?ref=v0.15.0", "?ref=main"))
+        issues, text = self.run_main(env={})
+        self.assertEqual(issues, [])
+        self.assertIn("keine feste Release-Version, kein Vergleich: org/seed-terraform main", text)
+
     def test_up_to_date_is_quiet(self):
         self.write("infra/main.tf", MAIN_TF.replace("v0.15.0", "v0.16.0"))
         issues, _ = self.run_main(env={"SEED_PIPELINES_REF": "refs/tags/v0.16.0", "SEED_PIPELINES_REPOSITORY": "org/seed-pipelines"})

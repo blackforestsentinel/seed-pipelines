@@ -26,7 +26,7 @@ parameters:
 steps:
   - bash: |
       set -uo pipefail
-      python3 - . "${{ parameters.infraPath }}" <<'PY' || echo "Seed-Versionen: Prüfung übersprungen (Fehler im Skript)."
+      python3 - . "$SEED_INFRA_PATH" <<'PY' || echo "Seed-Versionen: Prüfung übersprungen (Fehler im Skript)."
       # seed-versions
       import json, os, re, subprocess, sys, urllib.parse, urllib.request
       import xml.etree.ElementTree as ElementTree
@@ -40,6 +40,8 @@ steps:
       RELEASE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
       MODULE = re.compile(r'source\s*=\s*"git::https://github\.com/([A-Za-z0-9-]+)/seed-terraform(?:\.git)?//[^"?]*\?(?:[^"]*&)?ref=([^"&]+)"')
       GITHUB_REPO = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+      # MSBuild-Property in einer Paketversion, etwa Version="$(SeedVersion)"
+      PROPERTY = re.compile(r"\$\(([A-Za-z_][\w.-]*)\)")
 
       def clean(text):
           # Text aus dem Repo und aus dem Netz nur ohne Steuerzeichen und ##vso[ ins Log (Logging-Befehle).
@@ -75,28 +77,50 @@ steps:
                       found.setdefault(owner, {}).setdefault(ref, []).append(f"{path.as_posix()}:{number}")
           return found
 
+      def tag(element):
+          return str(element.tag).rsplit("}", 1)[-1]
+
       def nuget_refs(root):
-          """{paket-id: {version}} der Bfs.Seed.*-Pakete aus Projekt- und props-Dateien."""
-          found = {}
+          """{paket-id: {version}} der Bfs.Seed.*-Pakete aus Projekt- und props-Dateien.
+
+          Eine Version aus einer MSBuild-Property (Version="$(SeedVersion)") löst die Prüfung über die
+          PropertyGroups aller dieser Dateien auf, etwa aus Directory.Build.props, aber nur, wenn die
+          Property im Repo genau einen festen Wert hat. Sonst bleibt der Text stehen, und die Version
+          gilt als nicht prüfbar."""
+          trees = []
           for path in walk(root, suffixes=(".csproj", ".fsproj", ".vbproj", ".props", ".targets")):
               try:
-                  tree = ElementTree.parse(path)
+                  trees.append(ElementTree.parse(path))
               except ElementTree.ParseError:
                   continue
+          properties = {}
+          for tree in trees:
+              for group in tree.iter():
+                  if tag(group) == "PropertyGroup":
+                      for child in group:
+                          if child.text and child.text.strip():
+                              properties.setdefault(tag(child), set()).add(child.text.strip())
+
+          def resolve(match):
+              values = properties.get(match.group(1)) or set()
+              value = next(iter(values)) if len(values) == 1 else ""
+              return value if value and "$" not in value else match.group(0)
+
+          found = {}
+          for tree in trees:
               for element in tree.iter():
-                  tag = str(element.tag).rsplit("}", 1)[-1]
-                  if tag not in ("PackageReference", "PackageVersion"):
+                  if tag(element) not in ("PackageReference", "PackageVersion"):
                       continue
                   package = element.get("Include") or element.get("Update") or ""
                   if not package.lower().startswith(NUGET_PREFIX):
                       continue
                   version = element.get("VersionOverride") or element.get("Version")
                   if version is None:
-                      child = next((c for c in element if str(c.tag).rsplit("}", 1)[-1] in ("VersionOverride", "Version")), None)
+                      child = next((c for c in element if tag(c) in ("VersionOverride", "Version")), None)
                       version = child.text if child is not None else None
                   if version:
                       # [1.2.3] ist eine exakte Version in Bereichsschreibweise.
-                      found.setdefault(package, set()).add(version.strip().strip("[]"))
+                      found.setdefault(package, set()).add(PROPERTY.sub(resolve, version.strip()).strip("[]"))
           return found
 
       def npm_refs(root):
@@ -142,9 +166,18 @@ steps:
 
       # --- Vergleich -----------------------------------------------------------------------
 
-      def compare(title, used, lookup, hint):
-          """used: {name: {version}}, lookup: name -> Versionen. Liefert die Warnung oder None."""
-          behind, current, failed = [], [], []
+      def compare(title, used, lookup, hint, unclear=None):
+          """used: {name: {version}}, lookup: name -> Versionen. Liefert die Warnungen.
+
+          Mit unclear ist eine Version ohne festes Release (Property, Bereich, file:) eine Warnung
+          „nicht prüfbar“, ohne nur eine Zeile im Log (Branches als ref)."""
+          warnings, behind, current, failed, unknown = [], [], [], [], []
+          for name in sorted(used):
+              unknown += [f"{name} {version}" for version in sorted(used[name]) if not release(version)]
+          if unknown and unclear:
+              warnings.append(clean(f"{title}: Version nicht prüfbar: {', '.join(unknown)}. {unclear}"))
+          elif unknown:
+              print(clean(f"  keine feste Release-Version, kein Vergleich: {', '.join(unknown)}"))
           names = sorted(used)
           with ThreadPoolExecutor(max_workers=8) as pool:
               answers = list(pool.map(lambda name: _safe(lookup, name), names))
@@ -159,8 +192,8 @@ steps:
               for version in sorted(used[name]):
                   parsed = release(version)
                   if not parsed:
-                      print(clean(f"  {name} {version}: keine feste Release-Version, kein Vergleich."))
-                  elif parsed < latest:
+                      continue
+                  if parsed < latest:
                       behind.append(f"{name} {version} (neu: {show(latest, 'v' if version.startswith('v') else '')})")
                   else:
                       current.append(f"{name} {version}")
@@ -171,8 +204,8 @@ steps:
               print(clean(f"  aktuell: {', '.join(current)}"))
           if behind:
               print(clean(f"  nicht aktuell: {', '.join(behind)}"))
-              return clean(f"{title} nicht aktuell: {', '.join(behind)}. {hint}")
-          return None
+              warnings.insert(0, clean(f"{title} nicht aktuell: {', '.join(behind)}. {hint}"))
+          return warnings
 
       def _safe(lookup, name):
           try:
@@ -194,36 +227,39 @@ steps:
           elif not release(tag):
               print(clean(f"  {ref} ist kein Release-Tag, kein Vergleich."))
           else:
-              warnings.append(compare("seed-pipelines", {repository: {tag}},
-                                      lambda name: tags(f"https://github.com/{name}.git"),
-                                      "ref der Repository-Ressource seed in azure-pipelines.yml anheben."))
+              warnings += compare("seed-pipelines", {repository: {tag}},
+                                  lambda name: tags(f"https://github.com/{name}.git"),
+                                  "ref der Repository-Ressource seed in azure-pipelines.yml anheben.")
 
           print("seed-terraform:")
           modules = module_refs(infra)
           if not modules:
               print("  keine Module aus seed-terraform mit ?ref=.")
           for owner, refs in sorted(modules.items()):
-              warnings.append(compare("Module aus seed-terraform", {f"{owner}/seed-terraform": set(refs)},
-                                      lambda name: tags(f"https://github.com/{name}.git"),
-                                      "?ref= der Module in " + ", ".join(sorted({p.rsplit(':', 1)[0] for r in refs.values() for p in r})) + " anheben."))
+              warnings += compare("Module aus seed-terraform", {f"{owner}/seed-terraform": set(refs)},
+                                  lambda name: tags(f"https://github.com/{name}.git"),
+                                  "?ref= der Module in " + ", ".join(sorted({p.rsplit(':', 1)[0] for r in refs.values() for p in r})) + " anheben.")
 
           print("Bfs.Seed.*:")
           packages = nuget_refs(root)
           if packages:
-              warnings.append(compare("NuGet-Pakete Bfs.Seed.*", packages, lambda name: nuget_versions(name, fetch),
-                                      "Versionen in den Projektdateien anheben (Bfs.Seed.* gemeinsam)."))
+              warnings += compare("NuGet-Pakete Bfs.Seed.*", packages, lambda name: nuget_versions(name, fetch),
+                                  "Versionen in den Projektdateien anheben (Bfs.Seed.* gemeinsam).",
+                                  "Feste Version eintragen oder die MSBuild-Property mit genau einem festen Wert, "
+                                  "etwa in Directory.Build.props.")
           else:
               print("  keine Pakete Bfs.Seed.*.")
 
           print(f"{NPM_SCOPE}*:")
           packages = npm_refs(root)
           if packages:
-              warnings.append(compare("npm-Pakete seed-web-*", packages, lambda name: npm_versions(name, fetch),
-                                      "Versionen in package.json anheben und npm install ausführen."))
+              warnings += compare("npm-Pakete seed-web-*", packages, lambda name: npm_versions(name, fetch),
+                                  "Versionen in package.json anheben und npm install ausführen.",
+                                  "Feste Version in package.json eintragen und package-lock.json einchecken.")
           else:
               print("  keine Pakete seed-web-*.")
 
-          for warning in filter(None, warnings):
+          for warning in warnings:
               print(f"##vso[task.logissue type=warning]{warning}")
           return 0
 
@@ -235,5 +271,7 @@ steps:
       PY
     displayName: Seed-Versionen prüfen
     env:
+      # Werte aus dem Projekt nur über die Umgebung, nie als Text im Skript
+      SEED_INFRA_PATH: ${{ parameters.infraPath }}
       SEED_PIPELINES_REF: ${{ parameters.pipelinesRef }}
       SEED_PIPELINES_REPOSITORY: ${{ parameters.pipelinesRepository }}
