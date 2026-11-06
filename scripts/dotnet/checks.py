@@ -7,7 +7,9 @@
               build.prereleasePackages
             - bekannte Lücken, auch in transitiven Paketen: High und Critical sind Fehler, außer die
               Advisory steht mit reason in build.ignoreAdvisories; Low und Moderate sind Warnungen
-            - veraltete direkte Referenzen: Warnung; Bfs.Seed.* meldet steps/seed-versions.yml
+            - veraltete direkte Referenzen: Warnung, wenn es in der genutzten Hauptversion etwas Neueres
+              gibt; eine neue Hauptversion nur als Zeile im Log; Bfs.Seed.* meldet
+              steps/seed-versions.yml
   npm       npm-Projekte im Repo, je package-lock.json (ohne node_modules), ohne npm ci:
             - bekannte Lücken der Laufzeit-Abhängigkeiten (npm audit --omit=dev
               --package-lock-only), auch transitiv: wie bei NuGet, dieselbe Liste build.ignoreAdvisories
@@ -524,9 +526,29 @@ def check_vulnerabilities(data: dict, config: BuildConfig, log: Log) -> None:
         log.info("Keine bekannten Lücken in den Paketen (direkt und transitiv).")
 
 
-def check_outdated(data: dict, log: Log) -> None:
-    found: dict[str, dict] = {}
-    seed: set[str] = set()
+def version_key(version: str) -> tuple | None:
+    """Zahlen der Version zum Vergleichen; eine Vorabversion liegt vor der fertigen. None ohne Zahl vorn."""
+    core, _, prerelease = version.split("+", 1)[0].partition("-")
+    numbers = re.findall(r"[0-9]+", core)
+    if not numbers or not re.match(r"[0-9]", core):
+        return None
+    return tuple(int(n) for n in numbers) + (0,) * (4 - len(numbers)), 0 if prerelease else 1
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    new, old = version_key(candidate), version_key(current)
+    return new is not None and old is not None and new > old
+
+
+def new_major(package: Package) -> bool:
+    """Liegt die neueste Version in einer höheren Hauptversion als die genutzte?"""
+    new, old = version_key(package.latest), version_key(package.resolved)
+    return new is not None and old is not None and new[0][0] > old[0][0]
+
+
+def outdated_candidates(data: dict) -> tuple[list[Package], set[str]]:
+    """Direkte Referenzen mit neuerer Version; Bfs.Seed.* mit aufgelöster Version extra."""
+    packages, seed = [], set()
     for package in iter_packages(data):
         if package.transitive or package.auto_referenced or not package.latest or package.latest == package.resolved:
             continue
@@ -536,21 +558,51 @@ def check_outdated(data: dict, log: Log) -> None:
             # Schritt nichts; dann meldet diese Prüfung das Paket wie jedes andere.
             seed.add(package.id)
             continue
-        group = found.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": package.latest,
-                                                      "projects": set()})
-        group["versions"].add(package.resolved or package.requested or "?")
-        group["projects"].add(package.project)
-    for _, group in sorted(found.items()):
-        if not re.match(r"[0-9]", group["latest"]):
+        packages.append(package)
+    return packages, seed
+
+
+def check_outdated(data: dict, minor: dict | None, log: Log) -> None:
+    """Warnung nur, wenn es in der genutzten Hauptversion etwas Neueres gibt. Eine neue Hauptversion
+    nennt das Log ohne Annotation: Sie lässt sich oft nicht nehmen (etwa weil ein anderes Paket nur die
+    alte unterstützt), und eine Warnung in jedem Lauf, die man nicht beheben kann, lehrt nur, Warnungen
+    zu übersehen. data stammt aus --outdated (neueste Version überhaupt), minor aus --outdated
+    --highest-minor (neueste derselben Hauptversion); minor fehlt, wenn keine Hauptversion neu ist."""
+    packages, seed = outdated_candidates(data)
+    within = {}
+    for package in iter_packages(minor or {}):
+        within[(package.id.lower(), package.project, package.framework)] = package.latest
+    updates: dict[str, dict] = {}
+    majors: dict[str, dict] = {}
+    for package in packages:
+        version = package.resolved or package.requested or "?"
+        if not re.match(r"[0-9]", package.latest):
             # Etwa „Not found at the sources“: kein Feed kennt das Paket (mehr).
-            log.info(f"{group['id']}: keine Version in den Paketquellen gefunden ({short(group['latest'], 80)}).")
+            log.info(f"{package.id}: keine Version in den Paketquellen gefunden ({short(package.latest, 80)}).")
             continue
-        log.warning(f"Veraltet: {group['id']} {joined(group['versions'])}, neueste Version {group['latest']} "
-                    f"({projects(group['projects'])}).")
+        if new_major(package):
+            group = majors.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": package.latest,
+                                                           "projects": set()})
+            group["versions"].add(version)
+            group["projects"].add(package.project)
+            same_major = within.get((package.id.lower(), package.project, package.framework), "")
+        else:
+            same_major = package.latest
+        if same_major and (is_newer(same_major, package.resolved) or not package.resolved):
+            group = updates.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": same_major,
+                                                            "projects": set()})
+            group["versions"].add(version)
+            group["projects"].add(package.project)
+    for _, group in sorted(updates.items()):
+        log.warning(f"Veraltet: {group['id']} {joined(group['versions'])}, neueste Version derselben Hauptversion "
+                    f"{group['latest']} ({projects(group['projects'])}).")
+    for _, group in sorted(majors.items()):
+        log.info(f"Neue Hauptversion verfügbar: {group['id']} {joined(group['versions'])} → {group['latest']} "
+                 f"({projects(group['projects'])}).")
     if seed:
         log.info(f"Nicht als veraltet gemeldet, das übernimmt „Seed-Versionen prüfen“: {joined(seed)}.")
-    if not found and not seed:
-        log.info("Alle direkten Paketreferenzen sind aktuell.")
+    if not updates:
+        log.info("Alle direkten Paketreferenzen sind in ihrer Hauptversion aktuell.")
 
 
 def check_packages(dotnet: str, solution: str, project_yaml: str, runner: Runner, log: Log,
@@ -574,7 +626,14 @@ def check_packages(dotnet: str, solution: str, project_yaml: str, runner: Runner
 
     outdated = list_packages(dotnet, solution, ["--outdated"], "Prüfung auf veraltete Pakete", runner, log)
     if outdated is not None:
-        check_outdated(outdated, log)
+        # Die zweite Abfrage nur, wenn ein Paket eine neue Hauptversion hat: Dann sagt --outdated nicht, ob
+        # es in der genutzten Hauptversion etwas Neueres gibt. Sonst ist die neueste Version schon eine
+        # derselben Hauptversion, und es bleibt bei einer Abfrage.
+        minor = None
+        if any(new_major(package) for package in outdated_candidates(outdated)[0]):
+            minor = list_packages(dotnet, solution, ["--outdated", "--highest-minor"],
+                                  "Prüfung auf neuere Versionen derselben Hauptversion", runner, log)
+        check_outdated(outdated, minor, log)
 
     # Nur wenn eine Abfrage lief, zählt ein Eintrag ihrer Liste als „unbenutzt“.
     usage = {"prerelease": Usage(plain is not None, used_keys(config.prerelease)),

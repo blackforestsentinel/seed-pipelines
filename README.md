@@ -255,7 +255,8 @@ Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ei
 | Bekannte Lücke High oder Critical, auch in transitiven Paketen (bei npm nur in Laufzeit-Abhängigkeiten) | Fehler | `build.ignoreAdvisories` in `project.yaml` |
 | Bekannte Lücke Low oder Moderate | Warnung | – |
 | `package.json` mit Laufzeit-Abhängigkeiten, aber ohne `package-lock.json` | Warnung | – |
-| Veraltete direkte NuGet-Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| Veraltete direkte NuGet-Referenz, neuere Version derselben Hauptversion (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| Neue Hauptversion einer direkten NuGet-Referenz | Zeile im Log | – |
 | `RS0030` (verbotene APIs) oder eine Regel aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) abgeschaltet | Fehler | Kommentar mit dem Grund in der Zeile davor |
 | Analyzer pauschal abgeschaltet (`RunAnalyzers`, `dotnet_analyzer_diagnostic.severity` …) | Warnung | – |
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
@@ -293,7 +294,7 @@ Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration d
 
 - `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
 - `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
-- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. Eine Warnung gibt es nur, wenn es in der genutzten Hauptversion etwas Neueres gibt („Veraltet: … neueste Version derselben Hauptversion …“). Eine neue Hauptversion steht nur als Zeile im Log („Neue Hauptversion verfügbar: X 9.0.0 → 10.0.14“), ohne Annotation: Oft lässt sie sich nicht nehmen, etwa weil ein anderes Paket nur die alte Hauptversion unterstützt, und eine Warnung in jedem Lauf, die niemand beheben kann, lehrt nur, Warnungen zu übersehen. Gibt es beides, kommen Warnung und Logzeile. Hat ein Paket eine neue Hauptversion, fragt eine zweite Abfrage mit `--outdated --highest-minor` die neueste Version derselben Hauptversion ab; sonst bleibt es bei einer. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
 
 Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
 
