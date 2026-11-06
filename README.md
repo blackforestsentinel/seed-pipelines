@@ -255,13 +255,14 @@ Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ei
 | Bekannte Lücke High oder Critical, auch in transitiven Paketen (bei npm nur in Laufzeit-Abhängigkeiten) | Fehler | `build.ignoreAdvisories` in `project.yaml` |
 | Bekannte Lücke Low oder Moderate | Warnung | – |
 | `package.json` mit Laufzeit-Abhängigkeiten, aber ohne `package-lock.json` | Warnung | – |
-| Veraltete direkte NuGet-Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| Veraltete direkte NuGet-Referenz, neuere Version derselben Hauptversion (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| Neue Hauptversion einer direkten NuGet-Referenz | Zeile im Log | – |
 | `RS0030` (verbotene APIs) oder eine Regel aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) abgeschaltet | Fehler | Kommentar mit dem Grund in der Zeile davor |
 | Analyzer pauschal abgeschaltet (`RunAnalyzers`, `dotnet_analyzer_diagnostic.severity` …) | Warnung | – |
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
 | `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
 
-Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Danach richtet das Template Node in `nodeVersion` ein (mit Frontend oder `extension`), und „npm-Pakete prüfen“ ([`templates/steps/npm-checks.yml`](templates/steps/npm-checks.yml)) folgt, ebenfalls vor `dotnet build` und vor jedem `npm ci`. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` und `npm` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte der API zusammen rund 15 Sekunden (Pakete 10, Formatierung 5), die npm-Prüfung 2 bis 4 Sekunden je npm-Projekt; auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Danach richtet das Template Node in `nodeVersion` ein (mit Frontend oder `extension`), und „npm-Pakete prüfen“ ([`templates/steps/npm-checks.yml`](templates/steps/npm-checks.yml)) folgt, ebenfalls vor `dotnet build` und vor jedem `npm ci`. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. seed-pipelines kommt zuerst („seed-pipelines auschecken (Skripte der Prüfungen)“, dann „Projekt auschecken“): Der Agent legt beim Jobstart `s/<repo>` je Repo an, und der Checkout nach `s` löscht `s` vorher ganz. In der umgekehrten Reihenfolge fand der zweite Checkout sein Verzeichnis nicht mehr und warnte „Unable move and reuse existing repository to required location“. Werte aus dem Repo und die Ausgaben von `dotnet` und `npm` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte der API zusammen rund 15 Sekunden (Pakete 10, Formatierung 5), die npm-Prüfung 2 bis 4 Sekunden je npm-Projekt; auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
 
 **Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
 
@@ -293,7 +294,7 @@ Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration d
 
 - `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
 - `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
-- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. Eine Warnung gibt es nur, wenn es in der genutzten Hauptversion etwas Neueres gibt („Veraltet: … neueste Version derselben Hauptversion …“). Eine neue Hauptversion steht nur als Zeile im Log („Neue Hauptversion verfügbar: X 9.0.0 → 10.0.14“), ohne Annotation: Oft lässt sie sich nicht nehmen, etwa weil ein anderes Paket nur die alte Hauptversion unterstützt, und eine Warnung in jedem Lauf, die niemand beheben kann, lehrt nur, Warnungen zu übersehen. Gibt es beides, kommen Warnung und Logzeile. Hat ein Paket eine neue Hauptversion, fragt eine zweite Abfrage mit `--outdated --highest-minor` die neueste Version derselben Hauptversion ab; sonst bleibt es bei einer. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
 
 Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
 
@@ -379,7 +380,8 @@ $common = @{
 # Normaler Lauf: Anmeldung am Feed vor dem Restore, eigene Schritte nach dem Frontend-Build und
 # vor dem Artefakt web
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extra-build-steps.yml `
-  -ExpectBuildSteps '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
+  -ExpectBuildSteps 'seed-pipelines auschecken (Skripte der Prüfungen)', 'Projekt auschecken', `
+    '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
     'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web' `
   -AbsentBuildSteps 'npm ci (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Artefakt extension'
 # Mit Browser-Erweiterung: ihr Build nach dem Frontend und vor den eigenen Schritten
@@ -389,7 +391,8 @@ $common = @{
     'Lint (Beispiel)', 'Artefakt web', 'Artefakt extension'
 # Prüflauf wie im PR: Scans, Prüfungen im Build und eigene Schritte ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
+  -ExpectBuildSteps 'seed-pipelines auschecken (Skripte der Prüfungen)', 'Projekt auschecken', `
+    'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
     'Terraform-Sicherheitsscan (Trivy 0.76.1)', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
     'Offene TODOs in project.yaml', 'Abgeschaltete Regeln prüfen', 'Formatierung prüfen', 'NuGet-Pakete prüfen', `
     'Node 24.x', 'npm-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm ci', 'npm run build', 'Lint (Beispiel)' `

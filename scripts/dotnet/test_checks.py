@@ -66,8 +66,8 @@ def package(name, version, requested=None, latest=None, vulnerabilities=(), auto
 class FakeDotnet:
     """Antwortet je nach Optionen wie dotnet list package bzw. dotnet format."""
 
-    def __init__(self, plain="", vulnerable="", outdated="", fmt=None):
-        self.outputs = {"plain": plain, "vulnerable": vulnerable, "outdated": outdated}
+    def __init__(self, plain="", vulnerable="", outdated="", fmt=None, minor=""):
+        self.outputs = {"plain": plain, "vulnerable": vulnerable, "outdated": outdated, "minor": minor}
         self.fmt = fmt
         self.calls = []
 
@@ -79,7 +79,8 @@ class FakeDotnet:
                 directory = args[args.index("--report") + 1]
                 Path(directory, "format-report.json").write_text(json.dumps(report), encoding="utf-8")
             return checks.Result(code, "", "")
-        kind = "vulnerable" if "--vulnerable" in args else "outdated" if "--outdated" in args else "plain"
+        kind = ("vulnerable" if "--vulnerable" in args else "minor" if "--highest-minor" in args
+                else "outdated" if "--outdated" in args else "plain")
         output = self.outputs[kind]
         if isinstance(output, checks.Result):
             return output
@@ -341,8 +342,54 @@ class OutdatedTests(Work):
                                            ("/a/api/Api.Tests/Api.Tests.csproj", [package("Worker", "2.50.0", latest="2.52.0")], [])))
         log, out = self.packages(fake, "project: x\n")
         self.assertEqual((log.errors, log.warnings), (0, 1))
-        self.assertIn("Veraltet: Worker 2.50.0 und 2.51.0, neueste Version 2.52.0 (Projekte Api und Api.Tests)", out)
+        self.assertIn("Veraltet: Worker 2.50.0 und 2.51.0, neueste Version derselben Hauptversion 2.52.0 "
+                      "(Projekte Api und Api.Tests)", out)
         self.assertIn("Missing.Internal: keine Version in den Paketquellen gefunden", out)
+        # Ohne neue Hauptversion genügt eine Abfrage.
+        self.assertFalse(any("--highest-minor" in call for call in fake.calls))
+
+    def test_new_major_only_in_log(self):
+        # Die neue Hauptversion lässt sich oft nicht nehmen; in jedem Lauf eine Warnung lehrte nur, Warnungen
+        # zu übersehen. Innerhalb der Hauptversion ist hier nichts neuer.
+        top = [package("Example.Data.Sqlite", "9.0.22", latest="10.0.14")]
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])),
+                          minor=listing(("/a/api/Api/Api.csproj", [], [])))
+        log, out = self.packages(fake, "project: x\n")
+        self.assertEqual((log.errors, log.warnings), (0, 0))
+        self.assertIn("Neue Hauptversion verfügbar: Example.Data.Sqlite 9.0.22 → 10.0.14 (Projekt Api).", out)
+        self.assertNotIn("##vso", out)
+        minor = next(call for call in fake.calls if "--highest-minor" in call)
+        self.assertEqual(minor[minor.index("package") + 1:minor.index("package") + 3], ["--outdated", "--highest-minor"])
+
+    def test_minor_update_and_new_major(self):
+        top = [package("Example.Data.Sqlite", "9.0.0", latest="10.0.14"), package("Example.Native", "2.1.10", latest="3.0.5"),
+               package("Example.Worker", "2.51.0", latest="2.52.0")]
+        minor = [package("Example.Data.Sqlite", "9.0.0", latest="9.0.22")]
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])),
+                          minor=listing(("/a/api/Api/Api.csproj", minor, [])))
+        log, out = self.packages(fake, "project: x\n")
+        self.assertEqual((log.errors, log.warnings), (0, 2))
+        self.assertIn("Veraltet: Example.Data.Sqlite 9.0.0, neueste Version derselben Hauptversion 9.0.22", out)
+        self.assertIn("Veraltet: Example.Worker 2.51.0, neueste Version derselben Hauptversion 2.52.0", out)
+        self.assertNotIn("Veraltet: Example.Native", out)
+        self.assertIn("Neue Hauptversion verfügbar: Example.Data.Sqlite 9.0.0 → 10.0.14", out)
+        self.assertIn("Neue Hauptversion verfügbar: Example.Native 2.1.10 → 3.0.5", out)
+
+    def test_minor_query_fails(self):
+        top = [package("Example.Data.Sqlite", "9.0.0", latest="10.0.14")]
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])),
+                          minor=checks.Result(1, "error: Unable to load the service index", ""))
+        log, out = self.packages(fake, "project: x\n")
+        self.assertEqual((log.errors, log.warnings), (0, 1))
+        self.assertIn("Prüfung auf neuere Versionen derselben Hauptversion nicht möglich", out)
+        self.assertIn("Neue Hauptversion verfügbar: Example.Data.Sqlite 9.0.0 → 10.0.14", out)
+
+    def test_versions_compare_numerically(self):
+        self.assertTrue(checks.is_newer("2.10.0", "2.9.1"))
+        self.assertTrue(checks.is_newer("1.0.0", "1.0.0-rc.1"))
+        self.assertTrue(checks.is_newer("4.0.0.1", "4.0.0"))
+        self.assertFalse(checks.is_newer("10.0.0", "11.0.0-preview.1"))
+        self.assertFalse(checks.is_newer("Not found at the sources", "1.0.0"))
 
     def test_seed_package_without_resolved_version_is_reported(self):
         # Ohne aufgelöste Version sieht sie auch „Seed-Versionen prüfen“ nicht; dann warnt diese Prüfung.
@@ -350,13 +397,13 @@ class OutdatedTests(Work):
         fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])))
         log, out = self.packages(fake, "project: x\n")
         self.assertEqual(log.warnings, 1)
-        self.assertIn("Veraltet: Bfs.Seed.Auth 0.9.0, neueste Version 0.10.0", out)
+        self.assertIn("Veraltet: Bfs.Seed.Auth 0.9.0, neueste Version derselben Hauptversion 0.10.0", out)
         self.assertNotIn("übernimmt", out)
 
     def test_seed_packages_are_left_to_seed_versions(self):
         # Zurückliegende Bfs.Seed.*-Pakete meldet „Seed-Versionen prüfen“; hier kämen sie doppelt.
         top = [package("Bfs.Seed.Auth", "0.9.0", latest="0.10.0"), package("bfs.seed.openapi", "0.9.0", latest="0.10.0"),
-               package("Bfs.SeedLike", "1.0.0", latest="2.0.0")]
+               package("Bfs.SeedLike", "1.0.0", latest="1.1.0")]
         fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])))
         log, out = self.packages(fake, "project: x\n")
         self.assertEqual((log.errors, log.warnings), (0, 1))
