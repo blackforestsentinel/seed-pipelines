@@ -70,6 +70,62 @@ class RulesetTests(unittest.TestCase):
             self.assertIn(rule, ERRORS)
 
 
+# Leerraum im Sinne von Go (unicode.IsSpace) für den Bereich, den Terraform-Dateien praktisch enthalten
+GO_SPACE = " \t\n\v\f\r\x85\xa0"
+
+
+def trivy_rules(line):
+    """Gegenprobe: Ausnahmen einer Zeile so, wie Trivy 0.76.1 sie liest.
+
+    Abschrift von pkg/iac/ignore/parse.go (parseLine, hasIgnoreRulePrefix, parseRuleSections, mit dem
+    Abschnitt ws aus terraform/parser/parser.go): Zeile an Leerzeichen teilen, jedes Stück trimmen und
+    führende #, / und * entfernen; Stücke mit trivy: oder tfsec: sind Ausnahmen, wenn ein Abschnitt
+    ignore eine Regel nennt. Abschnitte sind Schlüssel-Wert-Paare in beliebiger Reihenfolge."""
+    rules = []
+    for part in line.strip(GO_SPACE).split(" "):
+        part = part.strip(GO_SPACE).lstrip("#/*")
+        for prefix in ("tfsec:", "trivy:"):
+            if part.startswith(prefix):
+                segments = part[len(prefix):].split(":")
+                sections = {}
+                for i in range(0, len(segments) - 1, 2):
+                    key, value = segments[i], segments[i + 1]
+                    if key == "ignore" and value.split("[", 1)[0]:
+                        sections["id"] = value.split("[", 1)[0]
+                        sections["ignore"] = value
+                    if key == "ws" and value:
+                        sections["ws"] = value
+                if "id" in sections:
+                    rules.append(sections)
+    return rules
+
+
+# Zeilen, die Trivy als Ausnahme liest oder die so aussehen; jede muss die Prüfung finden.
+TRICKY = [
+    "trivy:ignore:AZU-0011",                                   # ohne Kommentarzeichen
+    "trivy:exp:2099-12-31:ignore:AZU-0011",                    # Abschnitte vertauscht
+    "# trivy:ws:*:ignore:AZU-0011 Begründung mit genug Text",  # Platzhalter im Workspace
+    "  trivy:ignore:AZU-0011",                                 # Zeile in einem Blockkommentar
+    "/* trivy:ignore:AZU-0011 */",
+    "***trivy:ignore:AZU-0011",
+    "///tfsec:ignore:AZU-0011",
+    'description = "foo trivy:ignore:AZU-0011 bar"',          # mitten in einem String
+    '  "description": "a trivy:ignore:AZU-0011 b",',           # .tf.json
+    "# trivy:ignore:AZU-* ganze Familie, Text lang genug",
+    "# trivy:ignore:* alles aus, Text lang genug",
+    "# trivy:ignore:azu-0011 Kleinschreibung reicht Trivy",
+    "# trivy:ignore:use-secure-tls-policy Kurzname der Regel",
+    "# trivy:ignore:AZU-0011[name=x] Filter auf ein Attribut",
+    "# trivy:ignore:AZU-0011[name=*] Stern nur im Filter",
+    "# trivy:ignore:AZU-0011:ignore:* der letzte Schlüssel zählt",
+    "# x trivy:ignore:AZU-0011:exp:2099-12-31 hinter einem Wort",
+    "\t# trivy:ignore:AZU-0011",
+    "#\ttrivy:ignore:AZU-0011",                                 # liest Trivy nicht, die Prüfung schon
+    "# trivy:ignore:AZU-0011\tTabulator statt Leerzeichen",
+    "# trivy:exp:2099-12-31 ohne ignore, aber mit Text",       # keine Ausnahme, sieht aber so aus
+]
+
+
 class IgnoreTests(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.TemporaryDirectory()
@@ -90,16 +146,46 @@ class IgnoreTests(unittest.TestCase):
 
     def test_without_reason_is_a_problem(self):
         for line in ("#trivy:ignore:AZU-0011", "# trivy:ignore:AZU-0011 kurz", "# trivy:ignore:AZU-0011 -- ok.",
-                     "#tfsec:ignore:azure-storage-use-secure-tls-policy"):
+                     "#tfsec:ignore:azure-storage-use-secure-tls-policy", "/* trivy:ignore:AZU-0011 */",
+                     'description = "foo trivy:ignore:AZU-0011 bar"',
+                     "# Begründung vorn reicht nicht: trivy:ignore:AZU-0011"):
             with self.subTest(line=line):
                 [(_, _, _, _, problem)] = self.ignores(line + "\n")
                 self.assertEqual(problem, "ohne Begründung")
 
-    def test_wildcard_and_empty_rule(self):
-        for line in ("#trivy:ignore:* Alles aus, weil es eilt", "# trivy:ignore: ohne Regel, aber mit Text"):
+    def test_wildcards_are_errors(self):
+        # Trivy liest * als beliebiges Stück (MatchPattern), in der Regel wie im Workspace.
+        for line in ("#trivy:ignore:* Alles aus, weil es eilt", "# trivy:ignore:AZU-* ganze Familie, Text lang genug",
+                     "# trivy:ignore:azu-00* ganze Familie, Text lang genug",
+                     "# trivy:ws:*:ignore:AZU-0011 Begründung mit genug Text",
+                     "# trivy:ignore:AZU-0011:ignore:* der letzte Schlüssel zählt",
+                     "# trivy:ignore:AZU-0011[name=*] Stern nur im Filter"):
             with self.subTest(line=line):
                 [(_, _, _, _, problem)] = self.ignores(line + "\n")
-                self.assertIn("keine einzelne Regel", problem)
+                self.assertIn("Platzhalter", problem)
+
+    def test_lookalikes_without_rule_are_errors(self):
+        for line in ("# trivy:ignore: ohne Regel, aber mit Text", "# trivy:exp:2099-12-31 ohne ignore, aber mit Text",
+                     "# trivy: Hinweis in Prosa, aber kleingeschrieben"):
+            with self.subTest(line=line):
+                [(_, _, rules, _, problem)] = self.ignores(line + "\n")
+                self.assertEqual(rules, [])
+                self.assertIn("keine Ausnahme der Form trivy:ignore:<Regel>", problem)
+
+    def test_formats_trivy_accepts_are_found(self):
+        text = "\n".join([
+            "trivy:exp:2099-12-31:ignore:AZU-0011 Abschnitte vertauscht, Grund lang genug",
+            "/*",
+            "  trivy:ignore:AZU-0059 im Blockkommentar mit Grund",
+            "*/",
+            "/* trivy:ignore:AZU-0008 Grund im einzeiligen Blockkommentar */",
+            "***tfsec:ignore:azure-storage-enforce-https alte Form mit Grund",
+        ])
+        found = self.ignores(text + "\n")
+        self.assertEqual([(f[1], f[2], f[4]) for f in found], [
+            (1, ["AZU-0011"], None), (3, ["AZU-0059"], None), (5, ["AZU-0008"], None),
+            (6, ["azure-storage-enforce-https"], None)])
+        self.assertEqual(found[2][3], "Grund im einzeiligen Blockkommentar")
 
     def test_expiry_several_rules_and_comment_styles(self):
         text = "\n".join([
@@ -113,10 +199,30 @@ class IgnoreTests(unittest.TestCase):
             (["AZU-0011"], None), (["AZU-0011", "AZU-0059"], None), (["AZU-0011"], None), (["AZU-0008"], None)])
         self.assertEqual(found[0][3], "Ablösung des Geräts bis Ende 2027")
 
-    def test_terraform_dir_and_strings_are_ignored(self):
-        self.ignores("#trivy:ignore:AZU-0011\n", ".terraform/modules/core/main.tf")
-        found = self.ignores('description = "trivy:ignore:AZU-0011"\n')
-        self.assertEqual(found, [])
+    def test_all_terraform_file_types_but_not_downloaded_modules(self):
+        for name in ("a.tofu", "b.tf.json", "c.tofu.json", "modules/own/main.tf"):
+            self.ignores("trivy:ignore:AZU-0011\n", name)
+        self.ignores("trivy:ignore:AZU-0011\n", ".terraform/modules/core/main.tf")
+        self.ignores("trivy:ignore:AZU-0011\n", "terraform.tfvars")
+        found = self.ignores('description = "trivy:ignore:AZU-0011"\n# Trivy: Großschreibung ist kein Präfix\n')
+        self.assertEqual(sorted(f[0] for f in found), ["a.tofu", "b.tf.json", "c.tofu.json", "modules/own/main.tf"])
+
+    def test_finds_everything_trivy_reads(self):
+        """Gegenprobe mit der Abschrift des Parsers von Trivy: Jede Zeile, die Trivy als Ausnahme
+        liest, findet die Prüfung; ein Platzhalter, den Trivy anwendet, ist ein Fehler."""
+        self.ignores("\n".join(TRICKY) + "\n")
+        found = {f[1]: f for f in scan.find_ignores(self.root)}
+        for number, line in enumerate(TRICKY, 1):
+            with self.subTest(line=line):
+                rules = trivy_rules(line)
+                if rules:
+                    self.assertIn(number, found)
+                if any("*" in r["ignore"] or "*" in r.get("ws", "") for r in rules):
+                    self.assertIn("Platzhalter", found[number][4])
+        # Die Liste deckt beide Seiten ab: Zeilen, die Trivy liest, und eine, die nur die Prüfung liest.
+        self.assertGreater(sum(1 for line in TRICKY if trivy_rules(line)), 15)
+        self.assertEqual(trivy_rules("#\ttrivy:ignore:AZU-0011"), [])
+        self.assertIn(TRICKY.index("#\ttrivy:ignore:AZU-0011") + 1, found)
 
 
 class EvaluateTests(unittest.TestCase):
@@ -210,7 +316,7 @@ class MainTests(unittest.TestCase):
             "b.tf": "# trivy:ignore:AZU-0008 Gerät im Lager spricht nur HTTP\n",
         })
         self.assertEqual(code, 1)
-        self.assertIn("##vso[task.logissue type=error;sourcepath=infra/a.tf;linenumber=1]Ausnahme AZU-0011 ohne Begründung", out)
+        self.assertIn("##vso[task.logissue type=error;sourcepath=infra/a.tf;linenumber=1]Ausnahme AZU-0011: ohne Begründung", out)
         self.assertIn("infra/b.tf:1 AZU-0008: Gerät im Lager spricht nur HTTP", out)
 
     def test_project_ignore_files_only_warn(self):
@@ -219,10 +325,14 @@ class MainTests(unittest.TestCase):
         self.assertIn("##vso[task.logissue type=warning;sourcepath=infra/.trivyignore]", out)
 
     def test_logging_commands_from_repo_are_defused(self):
-        code, out = self.run_scan(report(), {"a.tf": "# trivy:ignore:AZU-0011 ##vso[task.setvariable variable=x]1\n"})
-        self.assertEqual(code, 0)
+        code, out = self.run_scan(report(), {
+            "a.tf": "# trivy:ignore:AZU-0011 Grund ##vso[task.setvariable variable=x]1\n",
+            "b.tf": "trivy:exp:##vso[task.setvariable variable=y]2\n",
+        })
+        self.assertEqual(code, 1)  # b.tf: keine Ausnahme der Form trivy:ignore:<Regel>
         self.assertNotIn("##vso[task.setvariable", out)
-        self.assertIn("##vso_[task.setvariable", out)
+        self.assertIn("Grund ##vso_[task.setvariable variable=x]1", out)
+        self.assertIn("„exp:##vso_[task.setvariable“", out)
 
 
 if __name__ == "__main__":

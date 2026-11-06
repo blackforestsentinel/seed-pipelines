@@ -130,9 +130,17 @@ Im Build-Job, auch im PR-Lauf, prüft [Trivy](https://github.com/aquasecurity/tr
   # trivy:ignore:AZU-0011:exp:2027-12-31 Lesegerät im Lager kann nur TLS 1.0
   ```
 
-  Die Regel-ID steht im Befund (`AZU-0011`); die lange Form (`azure-storage-use-secure-tls-policy`) geht auch, ebenso mehrere Regeln in einer Zeile. Ein Fehler sind: eine Ausnahme ohne Begründung (weniger als zehn Zeichen Text nach der Regel) und `trivy:ignore:*`. Das gilt auch für die ältere Form `tfsec:ignore:`, die Trivy ebenfalls liest. Ein Befund kann mehrere Regeln auslösen, etwa TLS 1.0 an Storage AZU-0011 und AZU-0059; jede braucht ihre Ausnahme.
+  Die Regel-ID steht im Befund (`AZU-0011`); die lange Form (`azure-storage-use-secure-tls-policy`) geht auch, ebenso mehrere Regeln in einer Zeile; die Begründung steht hinter der letzten. Ein Befund kann mehrere Regeln auslösen, etwa TLS 1.0 an Storage AZU-0011 und AZU-0059; jede braucht ihre Ausnahme.
+
+  Trivy liest Ausnahmen freier, als das Beispiel zeigt: in jeder Zeile einer `.tf`-, `.tofu`-, `.tf.json`- oder `.tofu.json`-Datei, auch ohne Kommentarzeichen, in Blockkommentaren und Strings, als `trivy:` oder `tfsec:`, mit den Abschnitten `ignore`, `exp` und `ws` in beliebiger Reihenfolge. Die Prüfung liest sie nach dem Parser von Trivy genauso und verlangt von jedem Wort, das mit `trivy:` oder `tfsec:` beginnt:
+
+  - eine Ausnahme mit Regel (`ignore:<Regel>`); ein Wort wie `trivy:exp:…` ohne Regel oder ein `trivy:` im Text ist ein Fehler;
+  - keinen Platzhalter: Trivy liest `*` in einer Regel oder einem Workspace (`ws`) als beliebiges Stück, `trivy:ignore:AZU-*` schaltete eine ganze Familie ab und `trivy:ignore:*` alles. Jedes `*` in `ignore` oder `ws` ist deshalb ein Fehler;
+  - eine Begründung mit mindestens zehn Zeichen dahinter, in derselben Zeile.
+
+  Pauschale Abschaltungen im Code der API, etwa `<WarningLevel>0</WarningLevel>` oder `<RunAnalyzers>false</RunAnalyzers>` in der Projektdatei oder `dotnet_analyzer_diagnostic.severity = none` in `.editorconfig`, stehen ebenso im PR, prüft der Build aber nicht; sie fallen nur im Review auf.
 - **Nur Einstellungen des Templates:** `.trivyignore`, `.trivyignore.yaml` und `trivy.yaml` im Projekt wirken nicht (der Scan warnt, wenn es sie gibt), Umgebungsvariablen `TRIVY_*` ebenso wenig. Die Regeln stecken im Programm (`--skip-check-update`) und ändern sich nur mit dessen Version; der Scan braucht außer dem Download kein Netz und sendet keine Telemetrie.
-- **Version:** Trivy kommt wie gitleaks in fester Version mit SHA-256 aus `trivy_<version>_checksums.txt` (Parameter `version` und `sha256` des Schritt-Templates). Beim Anheben eine Version nehmen, die mindestens zwei Wochen alt ist, die Prüfsumme mit dem Digest des Release-Assets auf GitHub abgleichen und den Scan gegen seed-template und die Module von seed-terraform laufen lassen: Neue Regeln können neue Fehler bringen.
+- **Version:** Trivy kommt wie gitleaks in fester Version mit SHA-256 aus `trivy_<version>_checksums.txt` (Parameter `version` und `sha256` des Schritt-Templates). Beim Anheben eine Version nehmen, die mindestens zwei Wochen alt ist, die Prüfsumme mit dem Digest des Release-Assets auf GitHub abgleichen und den Scan gegen seed-template und die Module von seed-terraform laufen lassen: Neue Regeln können neue Fehler bringen. Dazu den Parser der Ausnahmen (`pkg/iac/ignore/parse.go`) mit dem Nachbau in `terraform-scan.yml` und der Gegenprobe in `tests/steps/test_terraform_scan.py` abgleichen.
 - **Abdeckung:** Trivy kennt die `azurerm`-Ressourcen. Ressourcen über `azapi` (etwa die Function mit Flex Consumption im Modul `core`) prüft es nicht.
 
 ### Hinweis auf veraltetes Seed
