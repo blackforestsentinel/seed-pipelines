@@ -154,7 +154,7 @@ Ebenfalls im Build-Job, auch im PR-Lauf, vergleicht [`templates/steps/seed-versi
 | `Bfs.Seed.*` | `PackageReference` und `PackageVersion` in `.csproj`, `.props`, `.targets` | `https://api.nuget.org/v3-flatcontainer/<id>/index.json` |
 | `@blackforestsentinel/seed-web-*` | `package.json`, aufgelöst aus `package-lock.json` | npm-Registry |
 
-Neueste Version ist die höchste ohne Vorabkennung (`-preview`, `-rc` …). Branches statt Tags (`refs/heads/…`, `?ref=main`) und Versionen aus MSBuild-Variablen vergleicht der Schritt nicht, er nennt sie nur im Log. Er bricht nie den Build: Ist GitHub, NuGet oder npm nicht erreichbar, steht das als Zeile im Log, ohne Warnung. Er dauert ein bis drei Sekunden. Die Repository-Ressource muss `seed` heißen, wie in den Beispielen; sonst entfällt der Vergleich für seed-pipelines.
+Neueste Version ist die höchste ohne Vorabkennung (`-preview`, `-rc` …). Branches statt Tags (`refs/heads/…`, `?ref=main`) vergleicht der Schritt nicht, er nennt sie nur im Log. Eine Paketversion aus einer MSBuild-Property (`Version="$(SeedVersion)"`) löst er über die PropertyGroups der `.csproj`-, `.props`- und `.targets`-Dateien auf, etwa aus `Directory.Build.props`, wenn die Property genau einen festen Wert hat. Bleibt eine Paketversion offen (Property ohne eindeutigen Wert, Bereich wie `0.9.*`, `file:` bei npm), warnt er „Version nicht prüfbar“. Er bricht nie den Build: Ist GitHub, NuGet oder npm nicht erreichbar, steht das als Zeile im Log, ohne Warnung. Er dauert ein bis drei Sekunden. Die Repository-Ressource muss `seed` heißen, wie in den Beispielen; sonst entfällt der Vergleich für seed-pipelines.
 
 ### Schutz vor Datenverlust
 
