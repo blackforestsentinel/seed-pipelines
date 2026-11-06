@@ -1,0 +1,75 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Tickets",
+    "description": "Testdaten: dieselbe API mit Bfs.Seed.OpenApi ab 0.10.0. Query und Pfad: Text mit den Namen als enum (eine Liste bleibt Liste oder wird Text); Body: Zahlen als enum mit x-ms-enum-values.",
+    "version": "1.0.0"
+  },
+  "basePath": "/api",
+  "schemes": ["https"],
+  "paths": {
+    "/tickets": {
+      "get": {
+        "operationId": "ListTickets",
+        "parameters": [
+          { "name": "status", "in": "query", "required": false, "type": "string", "enum": ["Open", "Closed"] },
+          { "name": "levels", "in": "query", "required": false, "type": "array", "items": { "type": "string", "enum": ["Low", "Normal", "High"] }, "collectionFormat": "multi" },
+          { "name": "kinds", "in": "query", "required": false, "type": "string", "enum": ["Bug", "Question"] },
+          { "name": "named", "in": "query", "required": false, "type": "string", "enum": ["Open", "Closed"] }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "type": "array", "items": { "$ref": "#/definitions/Ticket" } } }
+        }
+      },
+      "post": {
+        "operationId": "CreateTicket",
+        "parameters": [
+          { "name": "body", "in": "body", "required": true, "schema": { "$ref": "#/definitions/TicketRequest" } }
+        ],
+        "responses": {
+          "201": { "description": "Created", "schema": { "$ref": "#/definitions/Ticket" } }
+        }
+      }
+    },
+    "/tickets/{state}/count": {
+      "get": {
+        "operationId": "CountTickets",
+        "parameters": [
+          { "name": "state", "in": "path", "required": true, "type": "string", "enum": ["Open", "Closed"], "x-ms-url-encoding": "single" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "type": "integer", "format": "int32" } }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Ticket": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "status": {
+          "type": "integer",
+          "format": "int32",
+          "enum": [0, 1],
+          "x-ms-enum-values": [ { "value": 0, "displayName": "Open" }, { "value": 1, "displayName": "Closed" } ]
+        },
+        "title": { "type": "string" }
+      },
+      "required": ["id", "status", "title"]
+    },
+    "TicketRequest": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "priority": {
+          "type": "integer",
+          "format": "int32",
+          "enum": [0, 1, 2],
+          "x-ms-enum-values": [ { "value": 0, "displayName": "Low" }, { "value": 1, "displayName": "Normal" }, { "value": 2, "displayName": "High" } ]
+        }
+      },
+      "required": ["title"]
+    }
+  }
+}

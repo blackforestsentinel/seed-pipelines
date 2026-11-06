@@ -110,9 +110,15 @@ function Get-SeedTypeName($Schema) {
     [string] $type
 }
 
+# Wörterbuch mit Reihenfolge, das Schlüssel genau vergleicht: operationIds unterscheiden Groß- und
+# Kleinschreibung (getOrder zu GetOrder ist für Flows eine entfernte und eine neue Operation).
+function New-SeedOrdinalMap {
+    [Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+}
+
 # Required gilt innerhalb des übergeordneten Objekts (Parent); ob das Objekt selbst mitkommt,
-# entscheidet Test-SeedPresent.
-function Add-SeedField($Into, $Schema, $Document, [string] $Path, [string] $Parent, [bool] $Required, [int] $Depth) {
+# entscheidet Test-SeedPresent. In ist der Ort des Parameters: body, query, path, header.
+function Add-SeedField($Into, $Schema, $Document, [string] $Path, [string] $Parent, [bool] $Required, [int] $Depth, [string] $In = 'body') {
     $Schema = Merge-SeedAllOf (Resolve-SeedRef $Schema $Document) $Document
     if ($Schema -isnot [Collections.IDictionary] -or $Depth -gt 8) { return }
     $type = Get-SeedTypeName $Schema
@@ -124,22 +130,23 @@ function Add-SeedField($Into, $Schema, $Document, [string] $Path, [string] $Pare
             Required   = $Required
             Parent     = $Parent
             HasDefault = $Schema.Contains('default')
+            In         = $In
         }
     }
     if ($Schema['properties'] -is [Collections.IDictionary]) {
         $requiredNames = @($Schema['required'])
         foreach ($name in Get-SeedKeys $Schema['properties']) {
             $child = if ($Path) { "$Path/$name" } else { $name }
-            Add-SeedField $Into $Schema['properties'][$name] $Document $child $Path ($requiredNames -contains $name) ($Depth + 1)
+            Add-SeedField $Into $Schema['properties'][$name] $Document $child $Path ($requiredNames -contains $name) ($Depth + 1) $In
         }
     }
     elseif ($type -eq 'array') {
-        Add-SeedField $Into $Schema['items'] $Document "$($Path)[]" $Path $false ($Depth + 1)
+        Add-SeedField $Into $Schema['items'] $Document "$($Path)[]" $Path $false ($Depth + 1) $In
     }
 }
 
 function Get-SeedConnectorOperations($Document) {
-    $operations = [ordered]@{}
+    $operations = New-SeedOrdinalMap
     if ($Document -isnot [Collections.IDictionary]) { return $operations }
     foreach ($path in Get-SeedKeys $Document['paths']) {
         $item = $Document['paths'][$path]
@@ -160,7 +167,7 @@ function Get-SeedConnectorOperations($Document) {
                 }
                 elseif ($p['name']) {
                     # Query-, Pfad- und Header-Parameter tragen type, enum und items wie ein Schema.
-                    Add-SeedField $inputs $p $Document ([string] $p['name']) '' ([bool] $p['required']) 0
+                    Add-SeedField $inputs $p $Document ([string] $p['name']) '' ([bool] $p['required']) 0 ([string] $p['in'])
                 }
             }
 
@@ -349,18 +356,61 @@ function Test-SeedPresent($Fields, $Spec, [string] $Path, [int] $Depth = 0) {
     [bool] ($node -and $node.Required -and (Test-SeedPresent $Fields $Spec $node.Parent ($Depth + 1)))
 }
 
-function Get-SeedFlowUsages($Flow, [string] $InternalId) {
+# Connector eines Eintrags in properties.connectionReferences: api.name ist die connectorinternalid,
+# Flows außerhalb von Solutions nennen ihn auch nur in id (/providers/.../apis/<connectorinternalid>).
+function Get-SeedReferenceApi($Reference) {
+    if ($Reference -isnot [Collections.IDictionary]) { return '' }
+    $api = if ($Reference['api'] -is [Collections.IDictionary]) { $Reference['api']['name'] }
+    if (-not $api -and $Reference['id']) { $api = ([string] $Reference['id'] -split '/')[-1] }
+    [string] $api
+}
+
+function Get-SeedClientData($Flow) {
     $data = $Flow.ClientData | ConvertFrom-Json -AsHashtable
+    if ($data -isnot [Collections.IDictionary] -or $data['properties'] -isnot [Collections.IDictionary]) { throw 'clientdata ohne properties.' }
+    $data
+}
+
+# Verweise eines Flows auf den Connector: Schlüssel in connectionReferences und die Verbindungen, die
+# er direkt einbindet. Flows in Solutions gehen über eine Connection Reference
+# (connection.connectionReferenceLogicalName); Flows außerhalb nennen die Verbindung selbst
+# (connectionName oder connection.name) und legen keine Connection Reference an.
+function Get-SeedFlowReferences($Data, [string] $InternalId) {
+    $keys = [Collections.Generic.List[string]]::new()
+    $connections = [Collections.Generic.List[string]]::new()
+    $references = $Data['properties']['connectionReferences']
+    foreach ($key in Get-SeedKeys $references) {
+        $reference = $references[$key]
+        if ((Get-SeedReferenceApi $reference) -ne $InternalId) { continue }
+        $keys.Add([string] $key)
+        $connection = $reference['connectionName']
+        if (-not $connection -and $reference['connection'] -is [Collections.IDictionary]) { $connection = $reference['connection']['name'] }
+        if ($connection -is [string] -and $connection) { $connections.Add($connection) }
+    }
+    [pscustomobject]@{ Keys = @($keys); Connections = @($connections) }
+}
+
+# Alles, was die Prüfung aus einem Flow braucht: Actions mit Operationen des Connectors, direkt
+# eingebundene Verbindungen und, falls der Flow den Connector nennt, aber keine Action erkannt wird
+# (etwa eine ältere ApiConnection mit method und path), eine Warnung statt still 0 Treffer.
+function Read-SeedFlow($Flow, [string] $InternalId) {
+    $data = Get-SeedClientData $Flow
+    $usages = @(Get-SeedFlowUsages $Flow $InternalId $data)
+    $references = Get-SeedFlowReferences $data $InternalId
+    $findings = @(if ($references.Keys.Count -and -not $usages.Count) {
+            $flowInfo = [pscustomobject]@{ Flow = $Flow.Name; FlowId = $Flow.Id; ResourceId = $Flow.ResourceId; State = Get-SeedFlowState $Flow.StateCode; Owner = $Flow.Owner }
+            New-SeedFinding warning '' 'Nutzung nicht prüfbar: Der Flow bindet den Connector ein, aber keine Action mit operationId ist erkannt (etwa eine ältere ApiConnection-Action). Bitte von Hand prüfen.' $flowInfo
+        })
+    [pscustomobject]@{ Usages = $usages; Connections = $references.Connections; Findings = $findings }
+}
+
+function Get-SeedFlowUsages($Flow, [string] $InternalId, $Data = $null) {
+    $data = if ($null -ne $Data) { $Data } else { Get-SeedClientData $Flow }
     $properties = $data['properties']
-    if ($properties -isnot [Collections.IDictionary]) { throw 'clientdata ohne properties.' }
-    # connectionName einer Action -> Connector (api.name ist die connectorinternalid)
+    # connectionName einer Action -> Connector
     $references = @{}
     foreach ($key in Get-SeedKeys $properties['connectionReferences']) {
-        $reference = $properties['connectionReferences'][$key]
-        if ($reference -isnot [Collections.IDictionary]) { continue }
-        $api = if ($reference['api'] -is [Collections.IDictionary]) { $reference['api']['name'] }
-        if (-not $api -and $reference['id']) { $api = ([string] $reference['id'] -split '/')[-1] }
-        $references[[string] $key] = [string] $api
+        $references[[string] $key] = Get-SeedReferenceApi $properties['connectionReferences'][$key]
     }
     $definition = $properties['definition']
     $outputPaths = Get-SeedOutputPaths $definition
@@ -399,6 +449,20 @@ function Format-SeedValue($Value) {
     $text
 }
 
+# Setzt der Flow Felder innerhalb von Field (body/address/street für body/address)?
+function Test-SeedSetsWithin($Fields, [string] $Field) {
+    [bool] (Get-SeedKeys $Fields | Where-Object { $_.StartsWith("$Field/") -or $_.StartsWith("$($Field)[]") })
+}
+
+# Bfs.Seed.OpenApi ab 0.10.0 gibt Query- und Pfadparameter mit Enum-Typ als Text mit den Namen als
+# enum aus, vorher als Zahl ohne Werteliste (bei Listen womöglich als Liste). Seed-Functions lesen
+# diese Parameter als Text mit Enum.TryParse, das auch Zahlen annimmt: Flows mit Zahlen laufen weiter.
+# Im Body gilt das nicht, dort entscheidet die JSON-Deserialisierung.
+function Test-SeedEnumTransition($Old, $New) {
+    [bool] ($Old -and $New -and $Old.In -ne 'body' -and $New.In -ne 'body' -and $Old.Enum.Count -eq 0 -and
+        $Old.Type -in 'integer', 'number', 'array' -and $New.Type -eq 'string' -and $New.Enum.Count -gt 0)
+}
+
 # Vergleicht die bisherige Definition ($Old) mit der neuen ($New) und bewertet jede Änderung an den
 # Stellen, die Flows nutzen. Ohne Leserecht auf alle Flows ($UsageKnown $false) gibt es keine
 # Entwarnung „kein Flow nutzt sie“, sondern Warnungen.
@@ -406,13 +470,13 @@ function Compare-SeedConnectorOperations {
     param($Old, $New, [object[]] $Usages = @(), [bool] $UsageKnown = $true)
     $findings = [Collections.Generic.List[object]]::new()
     $add = { param($Severity, $Operation, $Message, $Usage) $findings.Add((New-SeedFinding $Severity $Operation $Message $Usage)) }
-    $byOperation = @{}
+    $byOperation = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($u in $Usages) {
         if (-not $u) { continue }
         if (-not $byOperation.ContainsKey($u.OperationId)) { $byOperation[$u.OperationId] = [Collections.Generic.List[object]]::new() }
         $byOperation[$u.OperationId].Add($u)
     }
-    $states = [ordered]@{}
+    $states = New-SeedOrdinalMap
 
     foreach ($id in Get-SeedKeys $Old) {
         if ($New.Contains($id)) { continue }
@@ -435,9 +499,21 @@ function Compare-SeedConnectorOperations {
             else { & $add info $id "Operation $id ist deprecated; kein Flow nutzt sie mehr." }
         }
 
+        # Felder mit gemeldetem Typwechsel: Ihre Unterfelder melden nicht noch einmal „entfällt“.
+        $reportedInputs = [Collections.Generic.List[string]]::new()
         foreach ($field in Get-SeedKeys $n.Inputs) {
             $nf = $n.Inputs[$field]
             $of = $o.Inputs[$field]
+            if (Test-SeedEnumTransition $of $nf) {
+                $reportedInputs.Add($field)
+                foreach ($u in $uses) {
+                    if ((Get-SeedFieldState $u.Parameters $field) -ne 'set') { continue }
+                    $numbers = @(@($u.Parameters[$field]) | Where-Object { -not (Test-SeedExpression $_) -and [string] $_ -cnotin $nf.Enum })
+                    $sets = if ($numbers.Count) { "der Flow setzt $(@($numbers | ForEach-Object { "'$(Format-SeedValue $_)'" }) -join ', ')" } else { 'der Flow setzt das Feld' }
+                    & $add warning $id "Typ von $field ändert sich von $($of.Type) zu string mit den Werten $($nf.Enum -join ', '); $sets. Seed-Functions lesen Query- und Pfadparameter als Text und nehmen die Zahl weiter an; den Flow auf die Namen umstellen." $u
+                }
+                continue
+            }
             if ($nf.Required -and -not $nf.HasDefault -and -not ($of -and $of.Required)) {
                 foreach ($u in $uses) {
                     if (-not (Test-SeedPresent $u.Parameters $n.Inputs $nf.Parent)) { continue }
@@ -449,9 +525,15 @@ function Compare-SeedConnectorOperations {
             }
             # integer zu number erweitert nur, was erlaubt ist.
             if ($of -and $of.Type -and $nf.Type -and $of.Type -ne $nf.Type -and -not ($of.Type -eq 'integer' -and $nf.Type -eq 'number')) {
+                $reportedInputs.Add($field)
                 foreach ($u in $uses) {
-                    switch (Get-SeedFieldState $u.Parameters $field) {
+                    $state = Get-SeedFieldState $u.Parameters $field
+                    # Aus einem Objekt wird etwa ein String: Setzt der Flow Felder darin, bricht das wie
+                    # ein anderer Typ des Feldes selbst.
+                    if ($state -eq 'unset' -and (Test-SeedSetsWithin $u.Parameters $field)) { $state = 'within' }
+                    switch ($state) {
                         'set' { & $add (Get-SeedBreakingSeverity $u) $id "Typ von $field ändert sich von $($of.Type) zu $($nf.Type); der Flow setzt das Feld." $u }
+                        'within' { & $add (Get-SeedBreakingSeverity $u) $id "Typ von $field ändert sich von $($of.Type) zu $($nf.Type); der Flow setzt Felder darin." $u }
                         'unknown' { & $add warning $id "Typ von $field ändert sich von $($of.Type) zu $($nf.Type); der Flow setzt es per Ausdruck, nicht prüfbar." $u }
                     }
                 }
@@ -476,8 +558,8 @@ function Compare-SeedConnectorOperations {
             }
         }
 
-        # Nur das oberste entfallene Feld melden: entfällt body/address, nicht noch body/address/street.
-        $reportedInputs = [Collections.Generic.List[string]]::new()
+        # Nur das oberste entfallene Feld melden: entfällt body/address, nicht noch body/address/street;
+        # ebenso nichts unterhalb eines Feldes mit gemeldetem Typwechsel.
         foreach ($field in Get-SeedKeys $o.Inputs) {
             if ($n.Inputs.Contains($field)) { continue }
             if ($reportedInputs | Where-Object { $field.StartsWith("$_/") -or $field.StartsWith("$($_)[]") }) { continue }
@@ -512,22 +594,38 @@ function Compare-SeedConnectorOperations {
 
 # --- Verbindungen ------------------------------------------------------------------------------------
 
-# Je Verbindung zum Connector: Status und App-Rollen des Kontos. Verbindungen, die keine Connection
-# Reference nutzt (Used $false), sind nur ein Hinweis; ist die Nutzung unbekannt ($null), eine Warnung.
+# Wird eine Verbindung genutzt? Ja, wenn ein Flow sie direkt einbindet (Flows außerhalb von
+# Solutions) oder eine Connection Reference auf sie zeigt. $ReferencedIds ist $null, wenn die
+# Connection References nicht lesbar sind; dann bleibt „nein“ unbekannt ($null).
+function Get-SeedConnectionUse([string] $Connection, $ReferencedIds, [string[]] $FlowConnections = @()) {
+    if ($FlowConnections -contains $Connection) { return $true }
+    if ($null -eq $ReferencedIds) { return $null }
+    @($ReferencedIds) -contains $Connection
+}
+
+# Je Verbindung zum Connector: Status und App-Rollen des Kontos. Ungenutzte Verbindungen (Used $false)
+# sind nur ein Hinweis; ist die Nutzung unbekannt ($null), eine Warnung. Sind die Rollen eines Kontos
+# nicht ermittelbar (Roles '?', meist fehlende Graph-Rechte), gibt es einmal die Warnung
+# „Verbindungen nicht prüfbar“ statt eines Hinweises je Verbindung.
 function Get-SeedConnectionFindings($Connections, [string] $AppName) {
+    $unknown = [Collections.Generic.List[object]]::new()
     foreach ($c in $Connections) {
         $label = "Verbindung $($c.Connection) ($(if ($c.Account) { $c.Account } else { 'Konto unbekannt' }))"
         $severity = if ($c.Used -eq $false) { 'info' } else { 'warning' }
-        $unused = if ($c.Used -eq $false) { ' Keine Connection Reference nutzt sie.' } else { '' }
+        $unused = if ($c.Used -eq $false) { ' Weder ein Flow noch eine Connection Reference nutzt sie.' } else { '' }
         if ($c.Status -and $c.Status -ne 'Connected') {
             New-SeedFinding $severity '' "$label hat den Status $($c.Status).$unused"
         }
         elseif ($c.Roles -contains '?') {
-            New-SeedFinding info '' "${label}: Die App-Rollen des Kontos sind nicht ermittelbar."
+            $unknown.Add($c)
         }
         elseif (-not ($c.Roles | Where-Object { $_ -and $_ -ne 'Standardzugriff' })) {
             New-SeedFinding $severity '' "${label}: Das Konto hat keine App-Rolle an $AppName; Aufrufe über diese Verbindung scheitern.$unused"
         }
+    }
+    if ($unknown.Count) {
+        $reason = @($unknown | ForEach-Object RoleError | Where-Object { $_ }) | Select-Object -First 1
+        New-SeedFinding warning '' "Verbindungen nicht prüfbar: Für $($unknown.Count) Verbindungen sind die App-Rollen der Konten nicht ermittelbar$(if ($reason) { " ($reason)" }). Die Pipeline-Identität braucht dafür Graph-Rechte (README, Prüfung des Custom Connectors)."
     }
 }
 
@@ -576,7 +674,7 @@ function New-SeedConnectorSummary {
         $md.Add('| --- | --- | --- | --- |')
         foreach ($id in Get-SeedKeys $States) {
             $op = $NewOperations[$id] ?? $OldOperations[$id]
-            $count = @($Usages | Where-Object OperationId -eq $id).Count
+            $count = @($Usages | Where-Object { $_.OperationId -ceq $id }).Count
             $md.Add("| $(Format-SeedMarkdown $id) | $($States[$id]) | $count | $($op.Method) $(Format-SeedMarkdown $op.Path) |")
         }
     }
@@ -621,6 +719,31 @@ function New-SeedConnectorSummary {
         $md.Add('Konto: das angemeldete Konto der Verbindung; nennt sie keins (bei OAuth die Regel), die Person, die sie angelegt hat.')
     }
     , $md.ToArray()
+}
+
+# --- Wiederholen bei vorübergehenden Fehlern ---------------------------------------------------------
+
+# Wartezeit vor einem neuen Versuch: nur bei 429 (Dataverse drosselt) und 502, 503, 504, nach
+# Retry-After, sonst 5 Sekunden, höchstens 30; bei anderen Fehlern $null.
+function Get-SeedRetryDelay($ErrorRecord) {
+    $response = $ErrorRecord.Exception.Response
+    if ($response -isnot [Net.Http.HttpResponseMessage] -or [int] $response.StatusCode -notin 429, 502, 503, 504) { return $null }
+    $after = $response.Headers.RetryAfter
+    # PowerShell packt Nullable<T> selbst aus: Delta ist ein TimeSpan oder $null.
+    $seconds = if ($null -ne $after.Delta) { $after.Delta.TotalSeconds } elseif ($null -ne $after.Date) { ($after.Date - [DateTimeOffset]::UtcNow).TotalSeconds } else { 5 }
+    [int] [Math]::Min(30, [Math]::Max(1, [Math]::Ceiling($seconds)))
+}
+
+# Führt $Request aus und wiederholt ihn bei vorübergehenden Fehlern höchstens $Retries-mal.
+function Invoke-SeedRetry([scriptblock] $Request, [int] $Retries = 2, [scriptblock] $Wait = { param($Seconds) Start-Sleep -Seconds $Seconds }) {
+    for ($attempt = 0; ; $attempt++) {
+        try { return & $Request }
+        catch {
+            $delay = Get-SeedRetryDelay $_
+            if ($null -eq $delay -or $attempt -ge $Retries) { throw }
+            & $Wait $delay
+        }
+    }
 }
 
 Export-ModuleMember -Function *-Seed*

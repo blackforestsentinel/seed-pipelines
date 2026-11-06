@@ -101,6 +101,28 @@ Test-Case 'Do-until und Action nur mit apiId' {
 }
 Test-Case 'Flow, der den Connector nur erwähnt' {
     Assert-Equal 0 @(Get-SeedFlowUsages (New-Flow 'flow-other.json' 'Andere' 1) $internalId).Count 'Treffer'
+    $read = Read-SeedFlow (New-Flow 'flow-other.json' 'Andere' 1) $internalId
+    Assert-Equal 0 @($read.Findings).Count 'keine Warnung, der Flow bindet den Connector nicht ein'
+}
+Test-Case 'Flow in einer Solution: Connection Reference, keine direkte Verbindung' {
+    $read = Read-SeedFlow $ordersFlow $internalId
+    Assert-Equal 6 @($read.Usages).Count 'Actions'
+    Assert-Equal @() @($read.Connections) 'Verbindungen'
+    Assert-Equal 0 @($read.Findings).Count 'Befunde'
+}
+Test-Case 'Flow außerhalb einer Solution: Verbindung direkt eingebunden' {
+    $read = Read-SeedFlow (New-Flow 'flow-personal.json' 'Eigener Flow' 1) $internalId
+    Assert-Equal @('GetOrder /Get_order') @($read.Usages | ForEach-Object { "$($_.OperationId) $($_.ActionPath)" }) 'Actions'
+    Assert-Equal @('shared-example-5forders-00000000-1111-2222-3333-444444444444') @($read.Connections) 'Verbindungen'
+    Assert-Equal 0 @($read.Findings).Count 'Befunde'
+}
+Test-Case 'Ältere ApiConnection ohne operationId: Warnung statt still 0 Treffer' {
+    $read = Read-SeedFlow (New-Flow 'flow-legacy.json' 'Alter Flow' 1) $internalId
+    Assert-Equal 0 @($read.Usages).Count 'Actions'
+    Assert-Equal @('shared-example-5forders-55555555-6666-7777-8888-999999999999') @($read.Connections) 'Verbindungen'
+    Assert-Equal @('warning||Nutzung nicht prüfbar: Der Flow bindet den Connector ein, aber keine Action mit operationId ist erkannt (etwa eine ältere ApiConnection-Action). Bitte von Hand prüfen.') `
+    @($read.Findings | ForEach-Object { "$($_.Severity)|$($_.Operation)|$($_.Message)" }) 'Befunde'
+    Assert-Equal @('Alter Flow', 'aktiv') @($read.Findings[0].Flow, $read.Findings[0].State) 'Flow im Befund'
 }
 Test-Case 'Gelesene Antwortfelder: body(), outputs(), items() einer Schleife, Compose mit String-inputs' {
     $byAction = @{}
@@ -185,6 +207,37 @@ Test-Case 'Nutzung nicht prüfbar: Warnung statt Entwarnung' {
         'warning|ListCustomers||Operation ListCustomers entfällt; ob Flows sie nutzen, ist nicht prüfbar.'
     ) (Get-Lines $result.Findings) 'Befunde'
 }
+Test-Case 'Übergang Bfs.Seed.OpenApi 0.9.0 zu 0.10.0: Query und Pfad nur Warnungen, Body unverändert streng' {
+    $o = Get-SeedConnectorOperations (Read-Document 'openapi-enum-090.json')
+    $n = Get-SeedConnectorOperations (Read-Document 'openapi-enum-010.json')
+    $flow = New-Flow 'flow-enum.json' 'Tickets abgleichen' 1
+    $result = Compare-SeedConnectorOperations $o $n @(Get-SeedFlowUsages $flow 'shared_example-5fticketsdev-5f0000000000000000')
+    $hint = 'Seed-Functions lesen Query- und Pfadparameter als Text und nehmen die Zahl weiter an; den Flow auf die Namen umstellen.'
+    Assert-Equal (@(
+            "error|CreateTicket|Create_urgent_ticket|Wert '7' von body/priority ist nicht mehr erlaubt (erlaubt: 0, 1, 2)."
+            "warning|CountTickets|Count_open|Typ von state ändert sich von integer zu string mit den Werten Open, Closed; der Flow setzt '0'. $hint"
+            "warning|CountTickets|Count_tickets|Typ von state ändert sich von integer zu string mit den Werten Open, Closed; der Flow setzt das Feld. $hint"
+            "warning|ListTickets|List_tickets|Typ von kinds ändert sich von array zu string mit den Werten Bug, Question; der Flow setzt '1'. $hint"
+            "warning|ListTickets|List_tickets|Typ von levels[] ändert sich von integer zu string mit den Werten Low, Normal, High; der Flow setzt '0', '2'. $hint"
+            "warning|ListTickets|List_tickets|Typ von status ändert sich von integer zu string mit den Werten Open, Closed; der Flow setzt '1'. $hint"
+        ) | Sort-Object) (Get-Lines $result.Findings) 'Befunde'
+    Assert-Equal ([ordered]@{ ListTickets = 'geändert'; CreateTicket = 'geändert'; CountTickets = 'geändert' }) $result.States 'Stand'
+}
+Test-Case 'Typwechsel object zu string, der Flow setzt Felder darin: Fehler, kein „entfällt“' {
+    $address = @{ type = 'object'; properties = @{ street = @{ type = 'string' }; city = @{ type = 'string' } } }
+    $o = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ post = @{ operationId = 'PostX'; parameters = @(@{ name = 'body'; in = 'body'; schema = @{ type = 'object'; properties = @{ address = $address } } }) } } } }
+    $n = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ post = @{ operationId = 'PostX'; parameters = @(@{ name = 'body'; in = 'body'; schema = @{ type = 'object'; properties = @{ address = @{ type = 'string' } } } }) } } } }
+    $usage = [pscustomobject]@{ OperationId = 'PostX'; StateCode = 1; Parameters = Get-SeedSetFields @{ 'body/address/street' = 'Weg 1' }; OutputPaths = @(); ActionPath = '/X' }
+    Assert-Equal @('error|PostX|X|Typ von body/address ändert sich von object zu string; der Flow setzt Felder darin.') (Get-Lines (Compare-SeedConnectorOperations $o $n @($usage)).Findings) 'Befunde'
+}
+Test-Case 'operationIds unterscheiden Groß- und Kleinschreibung' {
+    $o = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ get = @{ operationId = 'getOrder' } } } }
+    $n = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ get = @{ operationId = 'GetOrder' } } } }
+    $usage = [pscustomobject]@{ OperationId = 'getOrder'; StateCode = 1; Parameters = Get-SeedSetFields @{}; OutputPaths = @(); ActionPath = '/X' }
+    $result = Compare-SeedConnectorOperations $o $n @($usage)
+    Assert-Equal @('error|getOrder|X|Operation getOrder entfällt, wird aber noch genutzt.') (Get-Lines $result.Findings) 'Befunde'
+    Assert-Equal @('getOrder=entfernt', 'GetOrder=neu') @($result.States.PSBase.Keys | ForEach-Object { "$_=$($result.States[$_])" }) 'Stand'
+}
 Test-Case 'Neue Werteliste an einem Feld, das bisher frei war' {
     $o = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ get = @{ operationId = 'GetX'; parameters = @(@{ name = 'mode'; in = 'query'; type = 'string' }) } } } }
     $n = Get-SeedConnectorOperations @{ paths = @{ '/x' = @{ get = @{ operationId = 'GetX'; parameters = @(@{ name = 'mode'; in = 'query'; type = 'string'; enum = @('fast', 'slow') }) } } } }
@@ -198,15 +251,45 @@ Test-Case 'Verbindungen ohne App-Rolle, mit Fehlerstatus, ungenutzt und unbekann
         [pscustomobject]@{ Connection = 'c1'; Account = 'a@example.org'; Status = 'Connected'; Used = $true; Roles = @('Bestellung') }
         [pscustomobject]@{ Connection = 'c2'; Account = 'b@example.org'; Status = 'Connected'; Used = $true; Roles = @('Standardzugriff') }
         [pscustomobject]@{ Connection = 'c3'; Account = 'c@example.org'; Status = 'Error'; Used = $false; Roles = @() }
-        [pscustomobject]@{ Connection = 'c4'; Account = 'd@example.org'; Status = 'Connected'; Used = $null; Roles = @('?') }
+        [pscustomobject]@{ Connection = 'c4'; Account = 'd@example.org'; Status = 'Connected'; Used = $null; Roles = @('?'); RoleError = '403 (Forbidden) Insufficient privileges.' }
         [pscustomobject]@{ Connection = 'c5'; Account = $null; Status = 'Connected'; Used = $null; Roles = @() }
+        [pscustomobject]@{ Connection = 'c6'; Account = 'e@example.org'; Status = 'Connected'; Used = $true; Roles = @('?'); RoleError = '403 (Forbidden) Insufficient privileges.' }
     )
     Assert-Equal @(
-        'info|||Verbindung c3 (c@example.org) hat den Status Error. Keine Connection Reference nutzt sie.'
-        'info|||Verbindung c4 (d@example.org): Die App-Rollen des Kontos sind nicht ermittelbar.'
+        'info|||Verbindung c3 (c@example.org) hat den Status Error. Weder ein Flow noch eine Connection Reference nutzt sie.'
         'warning|||Verbindung c2 (b@example.org): Das Konto hat keine App-Rolle an Bestellungen API; Aufrufe über diese Verbindung scheitern.'
         'warning|||Verbindung c5 (Konto unbekannt): Das Konto hat keine App-Rolle an Bestellungen API; Aufrufe über diese Verbindung scheitern.'
+        'warning|||Verbindungen nicht prüfbar: Für 2 Verbindungen sind die App-Rollen der Konten nicht ermittelbar (403 (Forbidden) Insufficient privileges.). Die Pipeline-Identität braucht dafür Graph-Rechte (README, Prüfung des Custom Connectors).'
     ) (Get-Lines @(Get-SeedConnectionFindings $rows 'Bestellungen API')) 'Befunde'
+}
+Test-Case 'Genutzt: direkt im Flow eingebunden oder über eine Connection Reference' {
+    Assert-Equal $true (Get-SeedConnectionUse 'c1' $null @('c1')) 'Flow außerhalb einer Solution, Connection References nicht lesbar'
+    Assert-Equal $true (Get-SeedConnectionUse 'c2' @('c2') @()) 'Connection Reference'
+    Assert-Equal $false (Get-SeedConnectionUse 'c3' @('c2') @('c1')) 'ungenutzt'
+    Assert-Equal $null (Get-SeedConnectionUse 'c3' $null @('c1')) 'unbekannt'
+}
+
+Write-Host 'Wiederholen'
+function New-HttpError([int] $Status, [int] $RetryAfter = 0) {
+    $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode] $Status)
+    if ($RetryAfter) { $response.Headers.RetryAfter = [Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds($RetryAfter)) }
+    [Microsoft.PowerShell.Commands.HttpResponseException]::new("Status $Status", $response)
+}
+Test-Case '429 mit Retry-After, 503 ohne, andere Fehler sofort' {
+    $calls = @{ n = 0 }
+    $waits = [Collections.Generic.List[int]]::new()
+    $errors = @((New-HttpError 429 2), (New-HttpError 503))
+    $result = Invoke-SeedRetry { if ($calls.n -lt 2) { $e = $errors[$calls.n]; $calls.n++; throw $e }; 'ok' } -Wait { param($s) $waits.Add($s) }
+    Assert-Equal 'ok' $result 'Ergebnis'
+    Assert-Equal @(2, 5) @($waits) 'Wartezeiten'
+    $calls.n = 0
+    try { Invoke-SeedRetry { $calls.n++; throw (New-HttpError 404) } -Wait { param($s) $waits.Add($s) }; throw 'kein Fehler' }
+    catch { if ($_.Exception.Message -ne 'Status 404') { throw } }
+    Assert-Equal 1 $calls.n '404 ohne Wiederholung'
+    $calls.n = 0
+    try { Invoke-SeedRetry { $calls.n++; throw (New-HttpError 503) } -Wait { param($s) } ; throw 'kein Fehler' }
+    catch { if ($_.Exception.Message -ne 'Status 503') { throw } }
+    Assert-Equal 3 $calls.n 'höchstens zwei Wiederholungen'
 }
 
 Write-Host 'Ausgabe'
