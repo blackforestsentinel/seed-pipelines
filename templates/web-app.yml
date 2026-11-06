@@ -161,6 +161,8 @@ parameters:
     type: string
     default: ''
 
+  # Node (und damit npm) für Frontend, Browser-Erweiterung und die Prüfung der npm-Pakete; ohne
+  # Frontend und Erweiterung richtet das Template kein Node ein.
   - name: nodeVersion
     type: string
     default: '24.x'
@@ -204,9 +206,9 @@ stages:
           seedPipelinesRef: $[ resources.repositories.seed.ref ]
           seedPipelinesRepository: $[ resources.repositories.seed.name ]
         steps:
-          # Mit dem zweiten Checkout (seed-pipelines, Skripte der Prüfungen in steps/dotnet-checks.yml)
-          # käme das Projekt sonst nach s/<repo>; path: s hält es in $(Build.SourcesDirectory), dem
-          # Arbeitsverzeichnis aller Schritte. Die Repository-Ressource heißt in allen Seed-Projekten
+          # Mit dem zweiten Checkout (seed-pipelines, Skripte der Prüfungen in steps/dotnet-checks.yml
+          # und steps/npm-checks.yml) käme das Projekt sonst nach s/<repo>; path: s hält es in
+          # $(Build.SourcesDirectory), dem Arbeitsverzeichnis aller Schritte. Die Repository-Ressource heißt in allen Seed-Projekten
           # seed und hat die ref der Templates, also passt das Skript zum Template.
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
@@ -310,6 +312,19 @@ stages:
           - template: steps/dotnet-checks.yml
             parameters:
               solution: ${{ parameters.apiSolution }}
+              stateFile: $(Agent.TempDirectory)/seed-package-checks.json
+          # Node für Frontend und Browser-Erweiterung, schon hier für die Prüfung der npm-Pakete
+          - ${{ if or(parameters.frontend, parameters.extension.path) }}:
+              - task: UseNode@1
+                displayName: Node ${{ parameters.nodeVersion }}
+                inputs:
+                  version: ${{ parameters.nodeVersion }}
+          # Lücken und Vorabversionen aller package-lock.json im Repo, vor jedem npm ci; ohne Frontend
+          # und Erweiterung mit dem npm des Agents. Urteilt mit stateFile auch für die NuGet-Prüfung,
+          # ob Ausnahmen in project.yaml nichts mehr treffen.
+          - template: steps/npm-checks.yml
+            parameters:
+              stateFile: $(Agent.TempDirectory)/seed-package-checks.json
           # Eigener Build, weil dotnet test (Microsoft.Testing.Platform) -warnaserror an die Tests gäbe
           # statt an MSBuild. Welche Warnungen trotzdem Warnungen bleiben und warum: README, Prüfungen
           # im Build; dotnet publish nutzt dieselbe Liste.
@@ -356,10 +371,6 @@ stages:
                 displayName: Artefakt openapi
 
           - ${{ if parameters.frontend }}:
-              - task: UseNode@1
-                displayName: Node ${{ parameters.nodeVersion }}
-                inputs:
-                  version: ${{ parameters.nodeVersion }}
               - script: npm ci
                 displayName: npm ci
                 workingDirectory: ${{ parameters.frontendPath }}
@@ -370,14 +381,8 @@ stages:
                 displayName: npm run build
                 workingDirectory: ${{ parameters.frontendPath }}
 
-          # Browser-Erweiterung (Parameter extension), ein eigenes npm-Projekt. Node richtet sonst
-          # der Frontend-Build ein.
+          # Browser-Erweiterung (Parameter extension), ein eigenes npm-Projekt; Node kommt von oben.
           - ${{ if parameters.extension.path }}:
-              - ${{ if not(parameters.frontend) }}:
-                  - task: UseNode@1
-                    displayName: Node ${{ parameters.nodeVersion }}
-                    inputs:
-                      version: ${{ parameters.nodeVersion }}
               - script: npm ci
                 displayName: npm ci (Erweiterung)
                 workingDirectory: ${{ parameters.extension.path }}

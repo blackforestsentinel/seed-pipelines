@@ -2,7 +2,7 @@
 
 Ersetzt nicht die Vorschau (tests/preview), hält aber die Reihenfolge fest, die die Schritte
 brauchen: Der Terraform-Scan wertet die Module aus terraform init aus, der Versionshinweis liest
-die Variablen des Build-Jobs.
+die Variablen des Build-Jobs, die npm-Prüfung braucht Node und das Ergebnis der NuGet-Prüfung.
 """
 
 import unittest
@@ -35,6 +35,31 @@ class WiringTests(unittest.TestCase):
         steps = (embedded.ROOT / "templates/steps/seed-versions.yml").read_text(encoding="utf-8")
         self.assertIn("default: $(seedPipelinesRef)", steps)
         self.assertIn("default: $(seedPipelinesRepository)", steps)
+
+    def test_npm_check_after_node_and_before_npm_ci(self):
+        # Nach der NuGet-Prüfung, deren Ergebnis sie liest, mit Node, vor dotnet build und jedem npm ci.
+        checks = position("- template: steps/npm-checks.yml")
+        self.assertLess(position("- template: steps/dotnet-checks.yml"), checks)
+        self.assertLess(position("- task: UseNode@1"), checks)
+        self.assertLess(checks, position("displayName: dotnet build"))
+        self.assertLess(checks, position("- script: npm ci"))
+        # Node richtet das Template genau einmal ein, für Frontend und Erweiterung.
+        self.assertEqual(WEB_APP.count("- task: UseNode@1"), 1)
+        self.assertIn("- ${{ if or(parameters.frontend, parameters.extension.path) }}:\n              - task: UseNode@1",
+                      WEB_APP)
+
+    def test_package_checks_share_state_file(self):
+        # Über die Datei urteilt die npm-Prüfung auch für NuGet, ob Ausnahmen nichts mehr treffen.
+        state = "stateFile: $(Agent.TempDirectory)/seed-package-checks.json"
+        self.assertEqual(WEB_APP.count(state), 2)
+        for template in ("dotnet-checks.yml", "npm-checks.yml"):
+            # Der Schritt bis zum nächsten Schritt des Build-Jobs (gleiche Einrückung)
+            start = position(f"- template: steps/{template}")
+            self.assertIn(state, WEB_APP[start:WEB_APP.find("\n          - ", start)])
+        for template in ("dotnet-checks.yml", "npm-checks.yml"):
+            steps = (embedded.ROOT / "templates/steps" / template).read_text(encoding="utf-8")
+            self.assertIn('--state-file "$SEED_STATE_FILE"', steps)
+            self.assertIn("SEED_STATE_FILE: ${{ parameters.stateFile }}", steps)
 
     def test_scans_not_only_in_pr_runs(self):
         # Beide Schritte stehen außerhalb der Bedingung für PR-Läufe, laufen also immer.
