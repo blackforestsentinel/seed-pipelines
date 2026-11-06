@@ -1,0 +1,65 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Tickets",
+    "description": "Testdaten: Enums ohne JsonStringEnumConverter, wie Bfs.Seed.OpenApi bis 0.9.0 sie ausgibt (Zahl ohne Werteliste).",
+    "version": "1.0.0"
+  },
+  "basePath": "/api",
+  "schemes": ["https"],
+  "paths": {
+    "/tickets": {
+      "get": {
+        "operationId": "ListTickets",
+        "parameters": [
+          { "name": "status", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "levels", "in": "query", "required": false, "type": "array", "items": { "type": "integer", "format": "int32" }, "collectionFormat": "multi" },
+          { "name": "kinds", "in": "query", "required": false, "type": "array", "items": { "type": "integer", "format": "int32" }, "collectionFormat": "multi" },
+          { "name": "named", "in": "query", "required": false, "type": "string", "enum": ["Open", "Closed"] }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "type": "array", "items": { "$ref": "#/definitions/Ticket" } } }
+        }
+      },
+      "post": {
+        "operationId": "CreateTicket",
+        "parameters": [
+          { "name": "body", "in": "body", "required": true, "schema": { "$ref": "#/definitions/TicketRequest" } }
+        ],
+        "responses": {
+          "201": { "description": "Created", "schema": { "$ref": "#/definitions/Ticket" } }
+        }
+      }
+    },
+    "/tickets/{state}/count": {
+      "get": {
+        "operationId": "CountTickets",
+        "parameters": [
+          { "name": "state", "in": "path", "required": true, "type": "integer", "format": "int32", "x-ms-url-encoding": "single" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "type": "integer", "format": "int32" } }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Ticket": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "status": { "type": "integer", "format": "int32" },
+        "title": { "type": "string" }
+      },
+      "required": ["id", "status", "title"]
+    },
+    "TicketRequest": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "priority": { "type": "integer", "format": "int32" }
+      },
+      "required": ["title"]
+    }
+  }
+}

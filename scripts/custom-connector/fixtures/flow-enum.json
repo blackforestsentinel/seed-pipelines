@@ -1,0 +1,60 @@
+{
+  "properties": {
+    "connectionReferences": {
+      "shared_example-5ftickets": {
+        "runtimeSource": "embedded",
+        "connection": { "connectionReferenceLogicalName": "new_sharedexampletickets" },
+        "api": { "name": "shared_example-5fticketsdev-5f0000000000000000" }
+      }
+    },
+    "definition": {
+      "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+      "contentVersion": "1.0.0.0",
+      "triggers": {
+        "Recurrence": { "type": "Recurrence", "recurrence": { "frequency": "Hour", "interval": 1 } }
+      },
+      "actions": {
+        "List_tickets": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5ftickets", "operationId": "ListTickets" },
+            "parameters": { "status": 1, "levels": [0, 2], "kinds": [1], "named": "Open" }
+          }
+        },
+        "Count_tickets": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5ftickets", "operationId": "CountTickets" },
+            "parameters": { "state": "@variables('state')" }
+          },
+          "runAfter": { "List_tickets": ["Succeeded"] }
+        },
+        "Count_open": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5ftickets", "operationId": "CountTickets" },
+            "parameters": { "state": 0 }
+          },
+          "runAfter": { "Count_tickets": ["Succeeded"] }
+        },
+        "Create_ticket": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5ftickets", "operationId": "CreateTicket" },
+            "parameters": { "body/title": "Drucker", "body/priority": 1 }
+          },
+          "runAfter": { "Count_open": ["Succeeded"] }
+        },
+        "Create_urgent_ticket": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": { "connectionName": "shared_example-5ftickets", "operationId": "CreateTicket" },
+            "parameters": { "body/title": "Netz", "body/priority": 7 }
+          },
+          "runAfter": { "Create_ticket": ["Succeeded"] }
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0.0"
+}

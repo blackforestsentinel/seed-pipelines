@@ -16,8 +16,12 @@
         ausgeschaltete Flows und Entwürfe eine Warnung
       - Warnung je Flow für deprecated Operationen, entfallene Eingabefelder und Antwortfelder, die
         der Flow per Ausdruck liest
-      - Warnung „Nutzung nicht prüfbar“, wenn die Identität Flows nicht auf Ebene Global liest
-      - mit -CheckConnections je Verbindung ohne App-Rolle eine Warnung
+      - Warnung „Nutzung nicht prüfbar“, wenn die Identität Flows nicht auf Ebene Global liest oder in
+        einem Flow, der den Connector einbindet, keine Action erkennt
+      - Warnung statt Fehler, wenn Query- oder Pfadparameter von Zahl zu Text mit Werteliste wechseln
+        (Bfs.Seed.OpenApi ab 0.10.0): Seed-Functions nehmen die Zahl weiter an
+      - mit -CheckConnections je genutzter Verbindung ohne App-Rolle eine Warnung; sind die Rollen
+        nicht ermittelbar, einmal die Warnung „Verbindungen nicht prüfbar“
     Ausgabe als ##vso[task.logissue] und als Markdown-Zusammenfassung (##vso[task.uploadsummary]).
     Exit 1 bei Fehlern; -AllowBreakingChanges macht alle Fehler zu Warnungen.
 
@@ -63,6 +67,12 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Import-Module (Join-Path $PSScriptRoot 'SeedConnectorCheck.psm1') -Force
 
+# Die Prüfung kann nicht laufen, ohne dass etwas kaputt ist (etwa ohne Präfix des Publishers): eine
+# Warnung „Connector nicht prüfbar“ statt eines Fehlers oder eines stillen Exit 0.
+class SeedUncheckable : Exception {
+    SeedUncheckable([string] $Message) : base($Message) {}
+}
+
 $findings = [Collections.Generic.List[object]]::new()
 $usages = @()
 $connections = @()
@@ -77,9 +87,14 @@ $connectionCheck = if ($CheckConnections) { 'nicht gelaufen' } else { 'aus (Para
 
 function Get-Token([string] $Resource) { az account get-access-token --resource $Resource --query accessToken -o tsv }
 
+# GET mit bis zu zwei Wiederholungen bei 429 und 502 bis 504 (Retry-After), etwa wenn Dataverse drosselt
+function Invoke-Api($Request, [string] $Url) {
+    Invoke-SeedRetry ({ Invoke-RestMethod @Request -Uri $Url }.GetNewClosure())
+}
+
 function Invoke-PagedGet($Request, [string] $Url, [string] $NextLink = '@odata.nextLink') {
     while ($Url) {
-        $page = Invoke-RestMethod @Request -Uri $Url
+        $page = Invoke-Api $Request $Url
         $page.value
         $Url = $page.$NextLink
     }
@@ -96,7 +111,9 @@ function Get-Message($ErrorRecord) {
 # Tiefe eines Leserechts der angemeldeten Identität; nur Global sieht die Datensätze aller Konten.
 function Get-PrivilegeDepth($Dataverse, [string] $Api, [string] $UserId, [string] $Privilege) {
     try {
-        $depth = @((Invoke-RestMethod @Dataverse "$Api/systemusers($UserId)/Microsoft.Dynamics.CRM.RetrieveUserPrivilegeByPrivilegeName(PrivilegeName='$Privilege')").RolePrivileges.Depth)
+        # Mehrere Rollen nennen dasselbe Recht oft mit derselben Tiefe.
+        $depth = @((Invoke-Api $Dataverse "$Api/systemusers($UserId)/Microsoft.Dynamics.CRM.RetrieveUserPrivilegeByPrivilegeName(PrivilegeName='$Privilege')").RolePrivileges.Depth |
+                Select-Object -Unique)
         [pscustomobject]@{ Global = $depth -contains 'Global'; Depth = if ($depth.Count) { $depth -join ', ' } else { 'keine' } }
     }
     catch {
@@ -107,22 +124,23 @@ function Get-PrivilegeDepth($Dataverse, [string] $Api, [string] $UserId, [string
 # Verbindungen zum Connector (Power Apps API, Admin-Scope) mit Konto, Status und App-Rollen (Graph).
 # Das Konto ist authenticatedUser, sonst accountName, sonst die Person, die die Verbindung angelegt hat;
 # Letztere muss nicht das angemeldete Konto sein.
-function Get-ConnectionRows($Dataverse, [string] $Api, [string] $UserId, [string] $EnvironmentId, [string] $InternalId, [string] $ResourceUri) {
+function Get-ConnectionRows($Dataverse, [string] $Api, [string] $UserId, [string] $EnvironmentId, [string] $InternalId, [string] $ResourceUri, [string[]] $FlowConnections) {
     $powerApps = @{ Headers = @{ Authorization = "Bearer $(Get-Token 'https://service.powerapps.com/')" } }
     $url = "https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/$EnvironmentId/connections?api-version=2016-11-01"
     $rows = @(Invoke-PagedGet $powerApps $url 'nextLink' | Where-Object { [string] $_.properties.apiId -like "*/$InternalId" })
 
-    # Genutzt heißt: eine Connection Reference zeigt auf die Verbindung. Ohne Leserecht auf Ebene
-    # Global bleibt das unbekannt, statt still „nein“ zu sagen.
-    $used = $null
+    # Genutzt heißt: Ein Flow bindet die Verbindung direkt ein ($FlowConnections, Flows außerhalb von
+    # Solutions) oder eine Connection Reference zeigt auf sie. Ohne Leserecht auf Ebene Global bleibt
+    # „nein“ unbekannt, statt still „nein“ zu sagen.
+    $referenced = $null
     if ((Get-PrivilegeDepth $Dataverse $Api $UserId 'prvReadconnectionreference').Global) {
-        $used = @(Invoke-PagedGet $Dataverse "$Api/connectionreferences?`$select=connectionid&`$filter=contains(connectorid,'$InternalId')" | ForEach-Object connectionid)
+        $referenced = @(Invoke-PagedGet $Dataverse "$Api/connectionreferences?`$select=connectionid&`$filter=contains(connectorid,'$InternalId')" | ForEach-Object connectionid)
     }
 
     $graph = 'https://graph.microsoft.com/v1.0'
     $graphRequest = @{ Headers = @{ Authorization = "Bearer $(Get-Token 'https://graph.microsoft.com')" } }
     $filter = [uri]::EscapeDataString("servicePrincipalNames/any(x:x eq '$($ResourceUri.Replace("'", "''"))')")
-    $sp = @(Invoke-RestMethod @graphRequest "$graph/servicePrincipals?`$filter=$filter&`$select=id,displayName,appRoles").value | Select-Object -First 1
+    $sp = @((Invoke-Api $graphRequest "$graph/servicePrincipals?`$filter=$filter&`$select=id,displayName,appRoles").value) | Select-Object -First 1
     if (-not $sp) { throw "Keine Unternehmensanwendung zu $ResourceUri gefunden." }
     $roleNames = @{}
     foreach ($r in $sp.appRoles) { $roleNames[[string] $r.id] = $r.value }
@@ -133,9 +151,10 @@ function Get-ConnectionRows($Dataverse, [string] $Api, [string] $UserId, [string
         $p = $c.properties
         $account = $p.authenticatedUser.name ?? $p.accountName ?? $p.createdBy.userPrincipalName
         $roles = @()
+        $roleError = $null
         if ($account) {
             try {
-                $userId = (Invoke-RestMethod @graphRequest "$graph/users/$([uri]::EscapeDataString($account))?`$select=id").id
+                $userId = (Invoke-Api $graphRequest "$graph/users/$([uri]::EscapeDataString($account))?`$select=id").id
                 $memberOf = @()
                 if ($groupIds.Count) {
                     $memberOf = @(Invoke-PagedGet $graphRequest "$graph/users/$userId/transitiveMemberOf/microsoft.graph.group?`$select=id&`$top=999" | ForEach-Object id)
@@ -143,14 +162,18 @@ function Get-ConnectionRows($Dataverse, [string] $Api, [string] $UserId, [string
                 $roles = @($assignments | Where-Object { $_.principalId -eq $userId -or $_.principalId -in $memberOf } |
                         ForEach-Object { $roleNames[[string] $_.appRoleId] ?? 'Standardzugriff' } | Select-Object -Unique)
             }
-            catch { $roles = @('?') }
+            catch {
+                $roles = @('?')
+                $roleError = Get-Message $_
+            }
         }
         [pscustomobject]@{
             Connection = $c.name
             Account    = $account
             Status     = ($p.statuses | Select-Object -First 1).status
-            Used       = if ($null -eq $used) { $null } else { $used -contains $c.name }
+            Used       = Get-SeedConnectionUse $c.name $referenced $FlowConnections
             Roles      = $roles
+            RoleError  = $roleError
             App        = $sp.displayName
         }
     }
@@ -173,16 +196,19 @@ try {
         }
     }
     try {
-        $userId = (Invoke-RestMethod @dv "$api/WhoAmI").UserId
+        $userId = (Invoke-Api $dv "$api/WhoAmI").UserId
     }
     catch {
         throw "Kein Zugriff auf $environmentUrl ($(Get-Message $_)). Die Pipeline-Identität braucht dort einen Anwendungsbenutzer mit Environment Maker: onboarding/Initialize-SeedTenant.ps1 mit -PowerPlatformEnvironmentUrl $environmentUrl ausführen."
     }
 
     # Name wie in custom-connector.yml: Präfix des Standard-Publishers und Name aus dem Output
-    $prefix = (Invoke-RestMethod @dv "$api/solutions?`$select=uniquename&`$filter=uniquename eq 'Default'&`$expand=publisherid(`$select=customizationprefix)").value[0].publisherid.customizationprefix
+    $prefix = @((Invoke-Api $dv "$api/solutions?`$select=uniquename&`$filter=uniquename eq 'Default'&`$expand=publisherid(`$select=customizationprefix)").value)[0].publisherid.customizationprefix
+    if ($prefix -notmatch '^[A-Za-z0-9]+$') {
+        throw [SeedUncheckable]::new("Der Präfix des Standard-Publishers in $environmentUrl ist nicht lesbar, ohne ihn ist der Connector nicht zu finden.")
+    }
     $connectorName = "$($prefix)_$Name"
-    $row = (Invoke-RestMethod @dv "$api/connectors?`$select=connectorid,connectorinternalid,displayname,openapidefinition,connectionparameters&`$filter=name eq '$connectorName'").value |
+    $row = (Invoke-Api $dv "$api/connectors?`$select=connectorid,connectorinternalid,displayname,openapidefinition,connectionparameters&`$filter=name eq '$connectorName'").value |
         Select-Object -First 1
     if (-not $row) {
         Write-Host "Connector $connectorName gibt es in $environmentUrl noch nicht; nichts zu vergleichen."
@@ -190,7 +216,7 @@ try {
     }
     $internalId = [string] $row.connectorinternalid
     if ($internalId -notmatch '^[A-Za-z0-9_-]+$') { throw "Unerwartete connectorinternalid: $internalId" }
-    $environmentId = [string] (Invoke-RestMethod @dv "$api/RetrieveCurrentOrganization(AccessType=@p)?@p=Microsoft.Dynamics.CRM.EndpointAccessType'Default'").Detail.EnvironmentId
+    $environmentId = [string] (Invoke-Api $dv "$api/RetrieveCurrentOrganization(AccessType=@p)?@p=Microsoft.Dynamics.CRM.EndpointAccessType'Default'").Detail.EnvironmentId
     $oldDocument = $row.openapidefinition | ConvertFrom-Json -AsHashtable
     $oldOperations = Get-SeedConnectorOperations $oldDocument
     if ($oldDocument['host']) { $backend = "https://$($oldDocument['host'])$($oldDocument['basePath'])" }
@@ -199,6 +225,7 @@ try {
     # still 0 Treffer.
     $read = Get-PrivilegeDepth $dv $api $userId 'prvReadWorkflow'
     $usageKnown = $read.Global
+    $flowConnections = [Collections.Generic.List[string]]::new()
     if ($usageKnown) {
         $flows = @(Invoke-PagedGet $dv "$api/workflows?`$select=name,workflowid,resourceid,statecode,clientdata,_ownerid_value&`$filter=category eq 5 and contains(clientdata,'$internalId')")
         $usages = @(foreach ($f in $flows) {
@@ -206,7 +233,12 @@ try {
                     Name = $f.name; Id = $f.workflowid; ResourceId = $f.resourceid; StateCode = [int] $f.statecode
                     Owner = $f.'_ownerid_value@OData.Community.Display.V1.FormattedValue'; ClientData = $f.clientdata
                 }
-                try { Get-SeedFlowUsages $flow $internalId }
+                try {
+                    $flowResult = Read-SeedFlow $flow $internalId
+                    foreach ($c in $flowResult.Connections) { $flowConnections.Add($c) }
+                    foreach ($finding in $flowResult.Findings) { $findings.Add($finding) }
+                    $flowResult.Usages
+                }
                 catch {
                     $findings.Add((New-SeedFinding warning '' "Flow nicht auswertbar, Nutzung unbekannt: $(Get-Message $_)" ([pscustomobject]@{
                                     Flow = $flow.Name; FlowId = $flow.Id; ResourceId = $flow.ResourceId; State = Get-SeedFlowState $flow.StateCode; Owner = $flow.Owner
@@ -228,15 +260,20 @@ try {
             $resourceUri = ($row.connectionparameters | ConvertFrom-Json).token.oAuthSettings.properties.AzureActiveDirectoryResourceId
             if (-not $resourceUri) { throw 'Der Connector nennt keine Ressource der Anmeldung (AzureActiveDirectoryResourceId).' }
             if ($environmentId -notmatch '^[A-Za-z0-9-]+$') { throw "Unerwartete Umgebungs-ID: $environmentId" }
-            $connections = @(Get-ConnectionRows $dv $api $userId $environmentId $internalId $resourceUri)
+            $connections = @(Get-ConnectionRows $dv $api $userId $environmentId $internalId $resourceUri @($flowConnections))
             foreach ($f in Get-SeedConnectionFindings $connections ($connections | Select-Object -First 1).App) { $findings.Add($f) }
             $connectionCheck = "$($connections.Count) Verbindungen"
+            if ($connections | Where-Object { $_.Roles -contains '?' }) { $connectionCheck += ', App-Rollen teils nicht prüfbar' }
         }
         catch {
             $findings.Add((New-SeedFinding warning '' "Verbindungen nicht prüfbar: $(Get-Message $_)"))
             $connectionCheck = 'nicht prüfbar, Rechte fehlen (README, Prüfung des Custom Connectors)'
         }
     }
+}
+catch [SeedUncheckable] {
+    $findings.Add((New-SeedFinding warning '' "Connector nicht prüfbar: $($_.Exception.Message)"))
+    $flowCheck = 'nicht prüfbar'
 }
 catch {
     $findings.Add((New-SeedFinding error '' "Prüfung des Custom Connectors gescheitert: $(Get-Message $_)"))
