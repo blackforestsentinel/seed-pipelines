@@ -68,6 +68,27 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("terraform-scan", WEB_APP[start:end])
         self.assertNotIn("seed-versions", WEB_APP[start:end])
 
+    def test_build_checkouts_seed_before_self(self):
+        # Der Checkout nach s löscht s vorher ganz, samt s/seed-pipelines, das der Agent beim Jobstart
+        # anlegt. Kommt seed-pipelines erst danach, warnt der Agent „Unable move and reuse existing
+        # repository“. Beide Zweige gleich: PR-Lauf (ganze Historie, Secret-Scan) und normaler Lauf.
+        start = position("        steps:\n          # Mit dem zweiten Checkout")
+        end = position("displayName: project.yaml abgleichen")
+        block = WEB_APP[start:end]
+        pr, _, normal = block.partition("          - ${{ else }}:\n")
+        self.assertIn("parameters.validationOnly) }}:", pr)
+        seed = ("- checkout: seed\n{0}path: seed\n{0}fetchDepth: 1\n"
+                "{0}displayName: seed-pipelines auschecken (Skripte der Prüfungen)\n")
+        indent = " " * 16
+        for branch in (pr, normal):
+            self.assertEqual(branch.count("- checkout: "), 2)
+            self.assertIn(seed.format(indent), branch)
+            self.assertLess(branch.index("- checkout: seed"), branch.index("- checkout: self"))
+            self.assertIn(f"- checkout: self\n{indent}path: s\n", branch)
+        self.assertIn(f"path: s\n{indent}fetchDepth: 0\n", pr)
+        self.assertLess(pr.index("- checkout: self"), pr.index("- template: steps/secret-scan.yml"))
+        self.assertNotIn("secret-scan", normal)
+
 
 if __name__ == "__main__":
     unittest.main()

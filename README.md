@@ -262,7 +262,7 @@ Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ei
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
 | `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
 
-Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Danach richtet das Template Node in `nodeVersion` ein (mit Frontend oder `extension`), und „npm-Pakete prüfen“ ([`templates/steps/npm-checks.yml`](templates/steps/npm-checks.yml)) folgt, ebenfalls vor `dotnet build` und vor jedem `npm ci`. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` und `npm` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte der API zusammen rund 15 Sekunden (Pakete 10, Formatierung 5), die npm-Prüfung 2 bis 4 Sekunden je npm-Projekt; auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Danach richtet das Template Node in `nodeVersion` ein (mit Frontend oder `extension`), und „npm-Pakete prüfen“ ([`templates/steps/npm-checks.yml`](templates/steps/npm-checks.yml)) folgt, ebenfalls vor `dotnet build` und vor jedem `npm ci`. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. seed-pipelines kommt zuerst („seed-pipelines auschecken (Skripte der Prüfungen)“, dann „Projekt auschecken“): Der Agent legt beim Jobstart `s/<repo>` je Repo an, und der Checkout nach `s` löscht `s` vorher ganz. In der umgekehrten Reihenfolge fand der zweite Checkout sein Verzeichnis nicht mehr und warnte „Unable move and reuse existing repository to required location“. Werte aus dem Repo und die Ausgaben von `dotnet` und `npm` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte der API zusammen rund 15 Sekunden (Pakete 10, Formatierung 5), die npm-Prüfung 2 bis 4 Sekunden je npm-Projekt; auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
 
 **Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
 
@@ -380,7 +380,8 @@ $common = @{
 # Normaler Lauf: Anmeldung am Feed vor dem Restore, eigene Schritte nach dem Frontend-Build und
 # vor dem Artefakt web
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/extra-build-steps.yml `
-  -ExpectBuildSteps '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
+  -ExpectBuildSteps 'seed-pipelines auschecken (Skripte der Prüfungen)', 'Projekt auschecken', `
+    '.NET SDK laut global.json', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
     'npm run build', 'Lint (Beispiel)', 'Datei ins Frontend (Beispiel)', 'Artefakt web' `
   -AbsentBuildSteps 'npm ci (Erweiterung)', 'Manifest der Erweiterung prüfen', 'Artefakt extension'
 # Mit Browser-Erweiterung: ihr Build nach dem Frontend und vor den eigenen Schritten
@@ -390,7 +391,8 @@ $common = @{
     'Lint (Beispiel)', 'Artefakt web', 'Artefakt extension'
 # Prüflauf wie im PR: Scans, Prüfungen im Build und eigene Schritte ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
-  -ExpectBuildSteps 'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
+  -ExpectBuildSteps 'seed-pipelines auschecken (Skripte der Prüfungen)', 'Projekt auschecken', `
+    'Secret-Scan (gitleaks 8.30.1)', 'Seed-Versionen prüfen', 'terraform fmt und validate', `
     'Terraform-Sicherheitsscan (Trivy 0.76.1)', 'Anmeldung am Feed (Beispiel)', 'dotnet restore', `
     'Offene TODOs in project.yaml', 'Abgeschaltete Regeln prüfen', 'Formatierung prüfen', 'NuGet-Pakete prüfen', `
     'Node 24.x', 'npm-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm ci', 'npm run build', 'Lint (Beispiel)' `

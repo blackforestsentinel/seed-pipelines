@@ -208,23 +208,32 @@ stages:
         steps:
           # Mit dem zweiten Checkout (seed-pipelines, Skripte der Prüfungen in steps/dotnet-checks.yml
           # und steps/npm-checks.yml) käme das Projekt sonst nach s/<repo>; path: s hält es in
-          # $(Build.SourcesDirectory), dem Arbeitsverzeichnis aller Schritte. Die Repository-Ressource heißt in allen Seed-Projekten
-          # seed und hat die ref der Templates, also passt das Skript zum Template.
+          # $(Build.SourcesDirectory), dem Arbeitsverzeichnis aller Schritte. Die Repository-Ressource
+          # heißt in allen Seed-Projekten seed und hat die ref der Templates, also passt das Skript zum
+          # Template.
+          # seed-pipelines zuerst: Bei mehreren Checkouts legt der Agent beim Jobstart s/<repo> je Repo
+          # an, und jeder Checkout verschiebt sein Verzeichnis an den Zielpfad. Für das Ziel s löscht er
+          # s vorher ganz (IOUtil.MoveDirectory), samt s/seed-pipelines; ein Checkout von seed danach
+          # fände sein Verzeichnis nicht mehr und warnte „Unable move and reuse existing repository“.
           - ${{ if or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly) }}:
+              - checkout: seed
+                path: seed
+                fetchDepth: 1
+                displayName: seed-pipelines auschecken (Skripte der Prüfungen)
               # Ganze Historie, damit der Secret-Scan alle Commits des PRs sieht
               - checkout: self
                 path: s
                 fetchDepth: 0
-              - checkout: seed
-                path: seed
-                fetchDepth: 1
+                displayName: Projekt auschecken
               - template: steps/secret-scan.yml
           - ${{ else }}:
-              - checkout: self
-                path: s
               - checkout: seed
                 path: seed
                 fetchDepth: 1
+                displayName: seed-pipelines auschecken (Skripte der Prüfungen)
+              - checkout: self
+                path: s
+                displayName: Projekt auschecken
 
           - bash: |
               set -euo pipefail
