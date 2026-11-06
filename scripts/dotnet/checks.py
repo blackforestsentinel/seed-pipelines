@@ -9,6 +9,12 @@
               Advisory steht mit reason in build.ignoreAdvisories; Low und Moderate sind Warnungen
             - veraltete direkte Referenzen: Warnung; Bfs.Seed.* meldet steps/seed-versions.yml
   format    dotnet format whitespace --verify-no-changes auf der Solution
+  suppressions
+            RS0030 (verbotene APIs) und die Regeln aus Bfs.Seed (SEEDAUTH…, SEEDSUPPRESS…,
+            SEEDOPENAPI…) nur mit Begründung abgeschaltet, in .editorconfig, .globalconfig,
+            Projektdateien, .props, .targets und .rsp (ohne bin, obj, node_modules). Begründung ist ein
+            Kommentar in der Zeile davor mit mindestens 10 Zeichen; ohne ist es ein Fehler. Analyzer
+            pauschal aus (RunAnalyzers false, dotnet_analyzer_diagnostic.severity) gibt eine Warnung.
 
 Läuft im Checkout des Projekts. Werte aus dem Repo und Ausgaben von dotnet kommen nur bereinigt ins
 Log. Scheitert dotnet list package am Netz oder an sich selbst, gibt es eine Warnung statt eines
@@ -20,6 +26,7 @@ Braucht Python ab 3.10 und für packages PyYAML (Paket python3-yaml, auf Ubuntu 
   python3 scripts/dotnet/checks.py todos --project-yaml project.yaml
   python3 scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
   python3 scripts/dotnet/checks.py format --solution api/Api.slnx
+  python3 scripts/dotnet/checks.py suppressions
 """
 
 from __future__ import annotations
@@ -41,7 +48,10 @@ from typing import Callable, Iterator
 # aus nuget.config: Ein privater Feed (Azure Artifacts) liefert keine Daten zu Lücken, und
 # dotnet list package meldet dann still keine. Abgefragt wird nur die Liste der Lücken, kein Paket.
 NUGET_ORG = "https://api.nuget.org/v3/index.json"
-TODO_MARKER = re.compile(r"TODO\(onboarding\)", re.IGNORECASE)
+# Auch „TODO (onboarding)“ mit Leerraum vor der Klammer.
+TODO_MARKER = re.compile(r"TODO\s*\(onboarding\)", re.IGNORECASE)
+# Mindestlänge einer Begründung ohne Leerraum am Rand, in allen Seed-Repos gleich (Analyzer, Trivy).
+MIN_REASON = 10
 # Pakete von Seed selbst; zurückliegende Versionen meldet steps/seed-versions.yml, nicht diese Prüfung.
 SEED_PACKAGE_PREFIX = "bfs.seed."
 SEVERITY_ERROR = ("high", "critical")
@@ -304,6 +314,10 @@ def _entries(build: dict, key: str, id_key: str, config: BuildConfig) -> dict[st
             # yes, no, Zahlen oder Daten liest YAML nicht als Text.
             config.problems.append((f"build.{key}: reason von {short(name, 120)} ist kein Text; in Anführungszeichen setzen.", line))
             continue
+        if len(reason.strip()) < MIN_REASON:
+            config.problems.append((f"build.{key}: reason von {short(name, 120)} ist zu kurz („{short(reason.strip(), 40)}“); "
+                                    f"mindestens {MIN_REASON} Zeichen, die den Grund nennen.", line))
+            continue
         entries[name.strip().lower()] = Entry(name.strip(), reason.strip(), line)
     return entries
 
@@ -438,14 +452,15 @@ def check_outdated(data: dict, log: Log) -> None:
     for package in iter_packages(data):
         if package.transitive or package.auto_referenced or not package.latest or package.latest == package.resolved:
             continue
-        if package.id.lower().startswith(SEED_PACKAGE_PREFIX):
+        if package.id.lower().startswith(SEED_PACKAGE_PREFIX) and package.resolved:
             # Meldet schon der Schritt „Seed-Versionen prüfen“ (steps/seed-versions.yml), samt Hinweis
-            # auf das passende Template; hier käme es doppelt.
+            # auf das passende Template; hier käme es doppelt. Ohne aufgelöste Version sieht auch jener
+            # Schritt nichts; dann meldet diese Prüfung das Paket wie jedes andere.
             seed.add(package.id)
             continue
         group = found.setdefault(package.id.lower(), {"id": package.id, "versions": set(), "latest": package.latest,
                                                       "projects": set()})
-        group["versions"].add(package.resolved)
+        group["versions"].add(package.resolved or package.requested or "?")
         group["projects"].add(package.project)
     for _, group in sorted(found.items()):
         if not re.match(r"[0-9]", group["latest"]):
@@ -494,7 +509,9 @@ def read_format_report(path: Path, root: Path) -> list[tuple[str, int, int, int]
         report = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return []
-    files = []
+    # Eine Datei kann mehrfach im Bericht stehen, etwa je Formatierer (Leerraum, Zeilenende) oder je
+    # Projekt, das sie einbindet; gezählt wird sie einmal, jede Stelle auch.
+    places: dict[str, set[tuple[int, int, str]]] = {}
     for document in report if isinstance(report, list) else []:
         if not isinstance(document, dict):
             continue
@@ -507,9 +524,13 @@ def read_format_report(path: Path, root: Path) -> list[tuple[str, int, int, int]
             file_path = file_path if relative.startswith("..") else relative
         except ValueError:
             pass   # anderes Laufwerk (nur Windows)
-        first = min(changes, key=lambda c: (int(c.get("LineNumber") or 0), int(c.get("CharNumber") or 0)))
-        files.append((file_path.replace("\\", "/"), len(changes), int(first.get("LineNumber") or 0),
-                      int(first.get("CharNumber") or 0)))
+        places.setdefault(file_path.replace("\\", "/"), set()).update(
+            (int(c.get("LineNumber") or 0), int(c.get("CharNumber") or 0), str(c.get("FormatDescription") or ""))
+            for c in changes)
+    files = []
+    for file_path, found in places.items():
+        line, column, _ = min(found)
+        files.append((file_path, len(found), line, column))
     return sorted(files)
 
 
@@ -539,6 +560,183 @@ def check_format(dotnet: str, solution: str, runner: Runner, log: Log, root: Pat
     log.warning(f"Formatierung nicht geprüft (dotnet format whitespace: {reason}): {result.tail()}")
 
 
+# --- Abgeschaltete Regeln ----------------------------------------------------------------------
+# Regeln, die ein Projekt nicht still abschalten soll: verbotene APIs (RS0030, BannedApiAnalyzers) und
+# die Regeln aus Bfs.Seed. SEEDAUTH… und SEEDSUPPRESS… lassen sich ohnehin nicht konfigurieren; eine
+# Zeile, die es versucht, gehört trotzdem begründet oder entfernt.
+# Nur Codes mit Nummer: MSBuild-Eigenschaften wie SeedOpenApiEnabled oder SeedOpenApiReadme sind keine.
+PROTECTED = re.compile(r"\b(RS0030|SEED(?:AUTH|SUPPRESS|OPENAPI)[0-9]+)\b", re.IGNORECASE)
+# Schwere, mit der eine Regel nicht mehr als Warnung und damit nicht mehr als Fehler im Build ankommt.
+WEAK_SEVERITIES = ("none", "silent", "hidden", "suggestion", "info")
+SKIP_DIRECTORIES = ("bin", "obj", "node_modules", ".git")
+# MSBuild-Eigenschaften, die Warnungen abschalten oder zu Meldungen bzw. bloßen Warnungen machen.
+SUPPRESSING = ("nowarn", "warningsnotaserrors", "msbuildwarningsasmessages", "msbuildwarningsnotaserrors")
+HARMLESS = ("warningsaserrors", "msbuildwarningsaserrors")
+
+
+@dataclass
+class Suppression:
+    path: str
+    line: int
+    kind: str       # rule: Regel abgeschaltet, unclear: Regel erwähnt, bulk: Analyzer pauschal aus, generated
+    what: str
+    reason: str
+
+
+def _comment_above(lines: list[str], index: int, markers: str) -> str:
+    """Kommentarzeilen (etwa # oder ;) direkt über lines[index], als ein Text."""
+    texts = []
+    i = index - 1
+    while i >= 0 and lines[i].strip() and lines[i].strip()[0] in markers:
+        texts.insert(0, lines[i].strip()[1:].strip())
+        i -= 1
+    return " ".join(text for text in texts if text)
+
+
+def _xml_comment_above(lines: list[str], index: int) -> str:
+    """XML-Kommentar, der in der Zeile vor lines[index] endet, auch über mehrere Zeilen."""
+    i = index - 1
+    if i < 0 or not lines[i].rstrip().endswith("-->"):
+        return ""
+    collected = [lines[i]]
+    while "<!--" not in collected[0] and i > 0:
+        i -= 1
+        collected.insert(0, lines[i])
+    text = " ".join(part.strip() for part in collected)
+    start = text.rfind("<!--")
+    return " ".join(text[start + 4:-3].split()) if start >= 0 else ""
+
+
+def _config_suppressions(path: str, text: str) -> list[Suppression]:
+    """.editorconfig und .globalconfig: Schwere einzelner Regeln und pauschale Einstellungen."""
+    found = []
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line[0] in "#;[" or "=" not in line:
+            continue
+        key, value = (part.strip().lower() for part in line.split("=", 1))
+        value = (value.split() or [""])[0]
+        match = re.fullmatch(r"dotnet_diagnostic\.([^.]+)\.severity", key)
+        if match and PROTECTED.fullmatch(match.group(1)) and value in WEAK_SEVERITIES:
+            kind, what = "rule", f"{match.group(1).upper()}, severity = {value}"
+        elif re.fullmatch(r"dotnet_analyzer_diagnostic(\.category-[^.]+)?\.severity", key) and value in WEAK_SEVERITIES:
+            kind, what = "bulk", f"{key} = {value}"
+        elif key == "generated_code" and value == "true":
+            kind, what = "generated", "generated_code = true"
+        else:
+            continue
+        found.append(Suppression(path, index + 1, kind, what, _comment_above(lines, index, "#;")))
+    return found
+
+
+def _response_suppressions(path: str, text: str) -> list[Suppression]:
+    """Antwortdateien (Directory.Build.rsp): MSBuild liest sie bei jedem Aufruf mit."""
+    found = []
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rules = sorted({m.group(1).upper() for m in PROTECTED.finditer(line)})
+        if rules:
+            found.append(Suppression(path, index + 1, "rule", f"{', '.join(rules)} in „{short(line, 80)}“",
+                                     _comment_above(lines, index, "#")))
+        elif re.search(r"RunAnalyzers(DuringBuild)?\s*=\s*false", line, re.IGNORECASE):
+            found.append(Suppression(path, index + 1, "bulk", f"„{short(line, 80)}“", _comment_above(lines, index, "#")))
+    return found
+
+
+def _msbuild_suppressions(path: str, text: str) -> list[Suppression]:
+    """Projektdateien, .props und .targets: Regeln in NoWarn und Co., Analyzer pauschal aus."""
+    lines = text.splitlines()
+    # Kommentare zählen nicht als Abschaltung; Zeilenumbrüche bleiben für die Zeilennummern.
+    code = re.sub(r"<!--.*?-->", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.DOTALL)
+
+    def line_of(offset: int) -> int:
+        return code.count("\n", 0, offset) + 1
+
+    found = []
+    by_element: dict[int, tuple[str, set[str]]] = {}
+    for match in PROTECTED.finditer(code):
+        start = max(code.rfind("<", 0, match.start()), 0)
+        context = code[start:match.start()]
+        tag = re.match(r"<\s*/?\s*([\w.:-]+)", context)
+        name = tag.group(1) if tag else "?"
+        if ">" not in context:
+            # Im Tag selbst, also in einem Attribut wie NoWarn="…"
+            attribute = re.search(r"([\w.:-]+)\s*=\s*[\"'][^\"']*$", context)
+            name = attribute.group(1) if attribute else name
+        if name.lower() in HARMLESS:
+            continue
+        by_element.setdefault(start, (name, set()))[1].add(match.group(1).upper())
+    for start, (name, rules) in sorted(by_element.items()):
+        line = line_of(start)
+        kind = "rule" if name.lower() in SUPPRESSING else "unclear"
+        found.append(Suppression(path, line, kind, f"{', '.join(sorted(rules))} in <{name}>",
+                                 _xml_comment_above(lines, line - 1)))
+    bulk = (
+        (r"<(RunAnalyzers|RunAnalyzersDuringBuild)\b[^>]*>\s*false\s*<", None),
+        (r"<Analyzer\s[^>]*\bRemove\s*=", "<Analyzer Remove=…>"),
+        (r"\bExcludeAssets\s*=\s*\"[^\"]*analyzers|<ExcludeAssets>[^<]*analyzers", "ExcludeAssets mit analyzers"),
+    )
+    for pattern, label in bulk:
+        for match in re.finditer(pattern, code, re.IGNORECASE):
+            line = line_of(match.start())
+            what = label or f"<{match.group(1)}>false</{match.group(1)}>"
+            found.append(Suppression(path, line, "bulk", what, _xml_comment_above(lines, line - 1)))
+    return found
+
+
+def find_suppressions(root: Path) -> list[Suppression]:
+    found: list[Suppression] = []
+    for directory, subdirectories, files in os.walk(root):
+        subdirectories[:] = sorted(d for d in subdirectories if d.lower() not in SKIP_DIRECTORIES)
+        for name in sorted(files):
+            lower = name.lower()
+            if lower == ".editorconfig" or lower.endswith(".globalconfig"):
+                scan = _config_suppressions
+            elif lower.endswith((".csproj", ".props", ".targets")):
+                scan = _msbuild_suppressions
+            elif lower.endswith(".rsp"):
+                scan = _response_suppressions
+            else:
+                continue
+            full = Path(directory, name)
+            try:
+                text = full.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            found.extend(scan(full.relative_to(root).as_posix(), text))
+    return found
+
+
+def check_suppressions(root: Path, log: Log) -> None:
+    found = find_suppressions(root)
+    for item in found:
+        where = f"{item.path}, Zeile {item.line}"
+        justified = len(item.reason) >= MIN_REASON
+        if item.kind in ("rule", "unclear", "generated") and justified:
+            log.info(f"Ausnahme: {where}: {item.what}. Grund: {short(item.reason, 300)}")
+        elif item.kind == "rule":
+            why = f"die Begründung „{short(item.reason, 40)}“ ist zu kurz" if item.reason else "ohne Begründung"
+            log.error(f"{where}: {item.what} schaltet eine geschützte Regel ab, {why}. In der Zeile davor einen "
+                      f"Kommentar mit dem Grund ergänzen (mindestens {MIN_REASON} Zeichen) oder die Abschaltung "
+                      f"entfernen ({CHECK_DOC}).", item.path, item.line)
+        elif item.kind == "unclear":
+            log.warning(f"{where}: {item.what}. Schaltet das die Regel ab, gehört in die Zeile davor ein Kommentar "
+                        "mit dem Grund.", item.path, item.line)
+        elif item.kind == "generated":
+            log.warning(f"{where}: generated_code = true; für diese Dateien laufen keine Analyzer und keine "
+                        "Formatprüfung. In der Zeile davor den Grund nennen.", item.path, item.line)
+        else:
+            because = f" Grund: {short(item.reason, 300)}" if item.reason else " Ohne Begründung."
+            log.warning(f"{where}: {item.what} schaltet Analyzer pauschal ab, auch RS0030 und die Regeln aus "
+                        f"Bfs.Seed.{because}", item.path, item.line)
+    if not any(item.kind in ("rule", "unclear", "bulk") for item in found):
+        log.info("Keine Abschaltung von RS0030, SEEDAUTH…, SEEDSUPPRESS… oder SEEDOPENAPI… gefunden.")
+
+
 # --- Aufruf ------------------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None, runner: Runner = run) -> int:
@@ -553,6 +751,8 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
     fmt = commands.add_parser("format", help="dotnet format whitespace --verify-no-changes")
     fmt.add_argument("--solution", required=True)
     fmt.add_argument("--dotnet", default="dotnet")
+    suppressions = commands.add_parser("suppressions", help="abgeschaltete RS0030- und Seed-Regeln")
+    suppressions.add_argument("--root", default=".")
     args = parser.parse_args(argv)
 
     # UTF-8 auch unter LANG=C oder in einer Windows-Konsole (lokaler Aufruf).
@@ -563,6 +763,8 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
         check_todos(args.project_yaml, log)
     elif args.command == "packages":
         check_packages(args.dotnet, args.solution, args.project_yaml, runner, log)
+    elif args.command == "suppressions":
+        check_suppressions(Path(args.root).resolve(), log)
     else:
         check_format(args.dotnet, args.solution, runner, log, Path.cwd())
     if log.errors or log.warnings:

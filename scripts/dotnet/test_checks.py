@@ -107,14 +107,15 @@ class Work(unittest.TestCase):
 
 class TodoTests(Work):
     def test_one_warning_per_marker_with_line(self):
-        self.project_yaml.write_text(PROJECT_YAML + "monitoring:\n  recipients: []  # todo(onboarding) Verteiler\n",
-                                     encoding="utf-8")
+        self.project_yaml.write_text(PROJECT_YAML + "monitoring:\n  recipients: []  # todo(onboarding) Verteiler\n"
+                                     "  budget: {}  # TODO (onboarding): Betrag je Umgebung\n", encoding="utf-8")
         log = checks.Log()
         with contextlib.redirect_stdout(io.StringIO()) as out:
             checks.check_todos(str(self.project_yaml), log)
-        self.assertEqual((log.errors, log.warnings), (0, 2))
+        self.assertEqual((log.errors, log.warnings), (0, 3))
         self.assertIn(":3: Offenes TODO(onboarding)", out.getvalue())
         self.assertIn(":13: Offenes TODO(onboarding)", out.getvalue())
+        self.assertIn(":14: Offenes TODO(onboarding)", out.getvalue())
 
     def test_annotation_has_file_and_line(self):
         log = checks.Log()
@@ -172,6 +173,24 @@ build:
         self.assertIn("kein Objekt", messages)
         self.assertIn("Eintrag ohne name", messages)
         self.assertIn("kein Text", messages)
+
+    def test_reason_needs_ten_characters(self):
+        text = """\
+project: my-app
+build:
+  prereleasePackages:
+    - name: Zu.Kurz
+      reason: Test
+    - name: Mit.Rand
+      reason: "   abc     "
+    - name: Genau.Zehn
+      reason: "0123456789"
+"""
+        self.project_yaml.write_text(text, encoding="utf-8")
+        config = checks.load_build_config(str(self.project_yaml))
+        self.assertEqual(list(config.prerelease), ["genau.zehn"])
+        self.assertEqual([line for _, line in config.problems], [4, 6])
+        self.assertIn("zu kurz", config.problems[0][0])
 
     def test_wrong_shapes(self):
         for text in ("build: [a]\n", "build:\n  prereleasePackages: Example\n"):
@@ -288,6 +307,15 @@ class OutdatedTests(Work):
         self.assertIn("Veraltet: Worker 2.50.0 und 2.51.0, neueste Version 2.52.0 (Projekte Api und Api.Tests)", out)
         self.assertIn("Missing.Internal: keine Version in den Paketquellen gefunden", out)
 
+    def test_seed_package_without_resolved_version_is_reported(self):
+        # Ohne aufgelöste Version sieht sie auch „Seed-Versionen prüfen“ nicht; dann warnt diese Prüfung.
+        top = [package("Bfs.Seed.Auth", "", requested="0.9.0", latest="0.10.0")]
+        fake = FakeDotnet(plain=listing(), vulnerable=listing(), outdated=listing(("/a/api/Api/Api.csproj", top, [])))
+        log, out = self.packages(fake, "project: x\n")
+        self.assertEqual(log.warnings, 1)
+        self.assertIn("Veraltet: Bfs.Seed.Auth 0.9.0, neueste Version 0.10.0", out)
+        self.assertNotIn("übernimmt", out)
+
     def test_seed_packages_are_left_to_seed_versions(self):
         # Zurückliegende Bfs.Seed.*-Pakete meldet „Seed-Versionen prüfen“; hier kämen sie doppelt.
         top = [package("Bfs.Seed.Auth", "0.9.0", latest="0.10.0"), package("bfs.seed.openapi", "0.9.0", latest="0.10.0"),
@@ -371,6 +399,19 @@ class FormatTests(Work):
         self.assertIn("api/Api/Program.cs:1:7: Formatierung: api/Api/Program.cs weicht an 2 Stellen ab", out)
         self.assertIn("Lokal beheben mit „dotnet format whitespace api/Api.slnx“", out)
 
+    def test_same_file_counted_once(self):
+        # dotnet format nennt eine Datei je Formatierer (Leerraum, Zeilenende) gesondert.
+        path = str(self.root / "api" / "Api" / "Program.cs")
+        report = [
+            {"FilePath": path, "FileChanges": [{"LineNumber": 3, "CharNumber": 1, "FormatDescription": "Leerraum"}]},
+            {"FilePath": path, "FileChanges": [{"LineNumber": 1, "CharNumber": 9, "FormatDescription": "Zeilenende"},
+                                               {"LineNumber": 3, "CharNumber": 1, "FormatDescription": "Leerraum"}]},
+        ]
+        log, out, _ = self.run_format(2, report)
+        self.assertEqual(log.errors, 2)
+        self.assertIn("api/Api/Program.cs weicht an 2 Stellen ab, zuerst Zeile 1", out)
+        self.assertIn("1 Datei(en)", out)
+
     def test_many_files_are_cut(self):
         report = [{"FilePath": str(self.root / f"F{i:02}.cs"), "FileChanges": [{"LineNumber": 1, "CharNumber": 1}]}
                   for i in range(checks.MAX_FILES + 5)]
@@ -382,6 +423,113 @@ class FormatTests(Work):
         log, out, _ = self.run_format(1, None)
         self.assertEqual((log.errors, log.warnings), (0, 1))
         self.assertIn("Formatierung nicht geprüft", out)
+
+
+class SuppressionTests(unittest.TestCase):
+    FILES = {
+        ".editorconfig": """\
+root = true
+
+[*.cs]
+# Testnamen wie Methode_Fall_Ergebnis
+dotnet_diagnostic.CA1707.severity = none
+dotnet_diagnostic.RS0030.severity = none
+# Uhrzeit kommt hier aus einem eigenen Dienst, nicht aus DateTime.Now
+dotnet_diagnostic.rs0030.severity=suggestion
+dotnet_diagnostic.SEEDOPENAPI014.severity = warning
+dotnet_analyzer_diagnostic.severity = none
+
+[Migrations/**.cs]
+# Migrationen erzeugt das Werkzeug
+generated_code = true
+""",
+        "api/Api/Api.csproj": """\
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);CS1591;
+      RS0030</NoWarn>
+    <!-- OpenAPI-Hinweise prüft ein eigener Test -->
+    <WarningsNotAsErrors>SEEDOPENAPI014</WarningsNotAsErrors>
+    <WarningsAsErrors>RS0030</WarningsAsErrors>
+    <!-- RS0030 hier nur erwähnt -->
+    <Configuration>Release</Configuration>
+    <MyRules>SEEDAUTH001</MyRules>
+    <RunAnalyzers>false</RunAnalyzers>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Example.Analyzers" Version="1.0.0" ExcludeAssets="analyzers" />
+  </ItemGroup>
+</Project>
+""",
+        "api/Directory.Build.props": """\
+<Project>
+  <PropertyGroup>
+    <!-- Verbotene APIs prüft hier ein eigener Test,
+         weil der Analyzer generierten Code meldet -->
+    <MSBuildWarningsAsMessages>RS0030</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+</Project>
+""",
+        "Directory.Build.rsp": "-p:NoWarn=SEEDSUPPRESS001\n",
+        "tools/analyzers.globalconfig": "is_global = true\n# kurz\ndotnet_diagnostic.SEEDOPENAPI015.severity = none\n",
+        "api/Api/obj/Api.props": "<Project><PropertyGroup><NoWarn>RS0030</NoWarn></PropertyGroup></Project>\n",
+        "api/Api/bin/Release/x.globalconfig": "dotnet_diagnostic.RS0030.severity = none\n",
+        "frontend/node_modules/a/.editorconfig": "dotnet_diagnostic.RS0030.severity = none\n",
+    }
+
+    def scan(self, files):
+        with tempfile.TemporaryDirectory() as directory:
+            for name, text in files.items():
+                path = Path(directory, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            log = checks.Log()
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                checks.check_suppressions(Path(directory), log)
+            return log, out.getvalue()
+
+    def test_findings(self):
+        log, out = self.scan(self.FILES)
+        self.assertEqual((log.errors, log.warnings), (4, 4), out)
+        # Fehler: geschützte Regel abgeschaltet, ohne ausreichende Begründung in der Zeile davor
+        self.assertIn(".editorconfig, Zeile 6: RS0030, severity = none schaltet eine geschützte Regel ab, ohne", out)
+        self.assertIn("api/Api/Api.csproj, Zeile 3: RS0030 in <NoWarn> schaltet", out)
+        self.assertIn("Directory.Build.rsp, Zeile 1: SEEDSUPPRESS001", out)
+        self.assertIn("tools/analyzers.globalconfig, Zeile 3: SEEDOPENAPI015, severity = none schaltet eine "
+                      "geschützte Regel ab, die Begründung „kurz“ ist zu kurz", out)
+        # Ausnahmen mit Grund im Log
+        self.assertIn("Ausnahme: .editorconfig, Zeile 8: RS0030, severity = suggestion. Grund: Uhrzeit kommt", out)
+        self.assertIn("Ausnahme: api/Api/Api.csproj, Zeile 6: SEEDOPENAPI014 in <WarningsNotAsErrors>", out)
+        self.assertIn("Ausnahme: api/Directory.Build.props, Zeile 5: RS0030 in <MSBuildWarningsAsMessages>. Grund: "
+                      "Verbotene APIs prüft hier ein eigener Test, weil der Analyzer generierten Code meldet", out)
+        self.assertIn("Ausnahme: .editorconfig, Zeile 14: generated_code = true. Grund: Migrationen", out)
+        # Warnungen: Analyzer pauschal aus, oder Regel an unklarer Stelle
+        self.assertIn(".editorconfig, Zeile 10: dotnet_analyzer_diagnostic.severity = none schaltet Analyzer "
+                      "pauschal ab", out)
+        self.assertIn("api/Api/Api.csproj, Zeile 10: SEEDAUTH001 in <MyRules>", out)
+        self.assertIn("api/Api/Api.csproj, Zeile 11: <RunAnalyzers>false</RunAnalyzers>", out)
+        self.assertIn("api/Api/Api.csproj, Zeile 14: ExcludeAssets mit analyzers", out)
+        # Nicht gemeldet: andere Regeln, WarningsAsErrors, Kommentare, bin, obj, node_modules
+        self.assertNotIn("CA1707", out)
+        self.assertNotIn("<WarningsAsErrors>", out)
+        self.assertNotIn("Zeile 8: RS0030 in", out)
+        for skipped in ("obj/", "bin/", "node_modules"):
+            self.assertNotIn(skipped, out)
+
+    def test_clean_repo(self):
+        # Eigenschaften von Bfs.Seed.OpenApi heißen ähnlich wie die Codes, sind aber keine.
+        csproj = ("<Project><PropertyGroup><NoWarn>CS1591</NoWarn>\n"
+                  "<SeedOpenApiReadme>../../README.md</SeedOpenApiReadme></PropertyGroup></Project>\n")
+        log, out = self.scan({".editorconfig": "[*.cs]\ndotnet_diagnostic.RS0030.severity = error\n",
+                              "api/Api/Api.csproj": csproj})
+        self.assertEqual((log.errors, log.warnings), (0, 0))
+        self.assertIn("Keine Abschaltung von RS0030", out)
+
+    def test_main_fails_on_finding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, ".editorconfig").write_text("dotnet_diagnostic.SEEDAUTH001.severity = none\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(checks.main(["suppressions", "--root", directory]), 1)
 
 
 class LogTests(unittest.TestCase):

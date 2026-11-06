@@ -1,6 +1,8 @@
 # Prüfungen der API im Build-Job, nach dotnet restore und vor dotnet build, auch im PR-Lauf und mit
 # validationOnly (README, Prüfungen im Build):
 #   - eine Warnung je TODO(onboarding) in project.yaml;
+#   - RS0030 (verbotene APIs) und die Regeln aus Bfs.Seed (SEEDAUTH, SEEDSUPPRESS, SEEDOPENAPI) nur
+#     mit Begründung abgeschaltet, im ganzen Repo; Analyzer pauschal aus gibt eine Warnung;
 #   - NuGet-Pakete: Vorabversionen direkter Referenzen und Lücken High/Critical sind Fehler, außer sie
 #     stehen mit Begründung in project.yaml (build.prereleasePackages, build.ignoreAdvisories);
 #     Lücken Low/Moderate und veraltete direkte Referenzen sind Warnungen;
@@ -24,6 +26,10 @@ steps:
     displayName: Offene TODOs in project.yaml
     env:
       SEED_PROJECT_YAML: ${{ parameters.projectYaml }}
+
+  # Im ganzen Checkout: .editorconfig, .globalconfig, Projektdateien, .props, .targets, .rsp.
+  - bash: python3 "$(Pipeline.Workspace)/seed/scripts/dotnet/checks.py" suppressions
+    displayName: Abgeschaltete Regeln prüfen
 
   # Läuft vor der Paketprüfung: braucht kein Netz und ist schneller als die drei Abfragen dort.
   - bash: >-

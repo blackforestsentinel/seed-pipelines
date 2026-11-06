@@ -181,10 +181,12 @@ Viele Projekte entstehen mit Coding-Agents. Dann wirkt, was den Build bricht; ei
 | Bekannte Lücke High oder Critical, auch in transitiven Paketen | Fehler | `build.ignoreAdvisories` in `project.yaml` |
 | Bekannte Lücke Low oder Moderate | Warnung | – |
 | Veraltete direkte Referenz (außer `Bfs.Seed.*`, die meldet „Seed-Versionen prüfen“) | Warnung | – |
+| `RS0030` (verbotene APIs) oder eine Regel aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) abgeschaltet | Fehler | Kommentar mit dem Grund in der Zeile davor |
+| Analyzer pauschal abgeschaltet (`RunAnalyzers`, `dotnet_analyzer_diagnostic.severity` …) | Warnung | – |
 | Formatierung laut `.editorconfig` (`dotnet format whitespace`) | Fehler | `.editorconfig` |
 | `TODO(onboarding)` in `project.yaml` | Warnung je Zeile | – |
 
-Die Schritte „Offene TODOs in project.yaml“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` kommen nur bereinigt ins Log. Lokal gemessen dauern die drei Schritte zusammen rund 20 Sekunden (Pakete 11, Formatierung 5); auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
+Die Schritte „Offene TODOs in project.yaml“, „Abgeschaltete Regeln prüfen“, „Formatierung prüfen“ und „NuGet-Pakete prüfen“ ([`templates/steps/dotnet-checks.yml`](templates/steps/dotnet-checks.yml)) laufen nach `dotnet restore` und vor `dotnet build`: Sie sind schnell und brauchen keinen Build. Die Logik steht mit Tests in [`scripts/dotnet/checks.py`](scripts/dotnet/checks.py). Dafür checkt der Build-Job seed-pipelines aus (`checkout: seed` nach `$(Pipeline.Workspace)/seed`, dieselbe `ref` wie die Templates); das Projekt bleibt mit `path: s` in `$(Build.SourcesDirectory)`, dem Arbeitsverzeichnis aller Schritte. Werte aus dem Repo und die Ausgaben von `dotnet` kommen nur bereinigt ins Log. Lokal gemessen dauern die vier Schritte zusammen rund 15 Sekunden (Pakete 10, Formatierung 5); auf gehosteten Agents kommen mit dem Checkout etwa 20 bis 40 Sekunden zum Lauf dazu.
 
 **Warnungen als Fehler** (`treatWarningsAsErrors`, Standard `true`): Der Schritt „dotnet build“ baut die Solution mit `-warnaserror`, ebenso `dotnet publish`; `dotnet test` nutzt danach den fertigen Build (`--no-build`). Einen eigenen Build braucht es, weil `dotnet test` mit Microsoft.Testing.Platform Schalter wie `-warnaserror` an die Tests weitergibt statt an MSBuild. Der Schalter gilt für den ganzen Build: Warnungen des Compilers, zu Nullable und der Analyzer, Warnungen von MSBuild-Tasks (etwa `SEEDOPENAPI…` aus `Bfs.Seed.OpenApi`) und die Warnungen des Restores, die der Build aus `project.assets.json` wiederholt. `<TreatWarningsAsErrors>false</TreatWarningsAsErrors>` im Projekt hebt ihn nicht auf. Ausnahmen gelten je Warnung und stehen im Projekt, also im PR:
 
@@ -198,6 +200,8 @@ Die Schritte „Offene TODOs in project.yaml“, „Formatierung prüfen“ und 
   ```
 
 - `NoWarn` (Warnung fällt weg) oder `WarningsNotAsErrors` (bleibt als Warnung sichtbar) in der Projektdatei oder in `Directory.Build.props`, mit Kommentar zum Grund; gilt für das ganze Projekt. Für eine einzelne Paketreferenz geht auch `<PackageReference … NoWarn="NU1701" />`.
+
+Für `RS0030` und die Regeln aus Bfs.Seed ist der Kommentar Pflicht, siehe Abgeschaltete Regeln.
 
 Diese Warnungen bleiben auch mit `-warnaserror` Warnungen (`-warnNotAsError`):
 
@@ -214,7 +218,7 @@ Die übrigen Warnungen von NuGet sind Fehler: Sie hängen an der Konfiguration d
 
 - `dotnet list <solution> package`: direkte Referenzen in einer Vorabversion. Maßgeblich ist die Version, die der Restore aufgelöst hat, nicht der Text in der Projektdatei; das gilt also auch für Central Package Management (`Directory.Packages.props`, `VersionOverride`) und Versionsbereiche. Transitive Pakete und die impliziten Pakete des SDK zählen nicht.
 - `dotnet list <solution> package --vulnerable --include-transitive --source https://api.nuget.org/v3/index.json`: bekannte Lücken aus der GitHub Advisory Database. Immer gegen nuget.org: Ein privater Feed liefert keine Daten zu Lücken, und `dotnet` meldet dann still keine. Geladen wird nur die Liste der Lücken, kein Paket.
-- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
+- `dotnet list <solution> package --outdated`: neuere Versionen direkter Referenzen in den Quellen aus `nuget.config`, also mit der Anmeldung aus `preBuildSteps`. `Bfs.Seed.*` lässt die Prüfung aus, sobald `dotnet` eine aufgelöste Version liefert: Zurückliegende Seed-Pakete meldet schon der Schritt „Seed-Versionen prüfen“, sonst käme die Warnung doppelt.
 
 Scheitert eine Abfrage am Netz oder an `dotnet` selbst (Feed nicht erreichbar, Anmeldung fehlt, mehr als 5 Minuten), gibt es eine Warnung „… nicht möglich“ statt eines Fehlers: Ein Ausfall von nuget.org soll weder PR noch Deploy aufhalten. Die Einträge in `project.yaml` prüft der Schritt trotzdem.
 
@@ -231,22 +235,36 @@ build:
       reason: Betrifft nur Y, das die API nicht nutzt.
 ```
 
-- Ein Eintrag ohne `reason` ist ein Fehler, ebenso einer, dessen `reason` YAML nicht als Text liest (`no`, `2026-01-01`; dann in Anführungszeichen).
+- Ein Eintrag ohne `reason` ist ein Fehler, ebenso einer mit weniger als 10 Zeichen (ohne Leerraum am Rand) und einer, dessen `reason` YAML nicht als Text liest (`no`, `2026-01-01`; dann in Anführungszeichen). Dieselbe Grenze gilt für die Begründungen der Analyzer aus Bfs.Seed und des Terraform-Scans.
 - Trifft ein Eintrag nichts mehr, warnt der Schritt; der Eintrag gehört dann entfernt. So veralten Ausnahmen nicht unbemerkt.
 - Eine Ausnahme, die greift, steht mit ihrem Grund im Log.
 - Eine Lücke in einem transitiven Paket behebt meist eine direkte Referenz auf eine Version ohne die Lücke.
 
-**Formatierung** („Formatierung prüfen“): `dotnet format whitespace <solution> --verify-no-changes`, also Einrückung, Leerzeichen, Zeilenumbrüche, Zeilenende und letzte Zeile laut `.editorconfig`. Das prüft sonst niemand; der Teilbefehl braucht keinen Build und dauert wenige Sekunden. `style` und `analyzers` lässt der Schritt bewusst aus: Sie kompilieren die Solution ein zweites Mal und melden dieselben Regeln wie der Build, sobald das Projekt Code-Stil im Build prüft (`EnforceCodeStyleInBuild`, Schwere in `.editorconfig`). Dort zählen sie als Warnung und damit als Fehler; so gibt es je Regel eine Stelle. Die Meldung nennt je Datei die erste abweichende Zeile, bis zu 20 Dateien. Dateien mit `generated_code = true` in `.editorconfig` oder dem Kopf `<auto-generated>` prüft `dotnet format` nicht.
+**Abgeschaltete Regeln** („Abgeschaltete Regeln prüfen“): `RS0030` (verbotene APIs, `BannedApiAnalyzers`) und die Regeln aus Bfs.Seed (`SEEDAUTH…`, `SEEDSUPPRESS…`, `SEEDOPENAPI…`) darf ein Projekt nur mit Begründung abschalten. Der Schritt durchsucht alle `.editorconfig`, `.globalconfig`, Projektdateien, `.props`, `.targets` und `.rsp` im Repo, ohne `bin`, `obj` und `node_modules`, nach:
 
-**Offene TODOs** („Offene TODOs in project.yaml“): eine Warnung je Zeile mit `TODO(onboarding)` in `project.yaml`, mit Zeilennummer. So markiert ein Projekt Angaben, die beim Onboarding noch fehlen. Den Punkt erledigen und die Markierung entfernen.
+- `dotnet_diagnostic.<Regel>.severity` mit `none`, `silent` oder `suggestion`;
+- der Regel in `NoWarn`, `WarningsNotAsErrors`, `MSBuildWarningsAsMessages` oder `MSBuildWarningsNotAsErrors`, auch über mehrere Zeilen;
+- der Regel in einer Antwortdatei wie `Directory.Build.rsp`.
+
+Die Begründung ist ein Kommentar in der Zeile direkt davor (`#` bzw. `<!-- -->`, auch mehrzeilig) mit mindestens 10 Zeichen. Fehlt er, ist es ein Fehler; sonst steht die Ausnahme mit ihrem Grund im Log. Steht die Regel an anderer Stelle, etwa in einer eigenen Eigenschaft, die später in `NoWarn` landet, gibt es eine Warnung. Pauschal-Abschaltungen gibt es immer als Warnung, auch mit Begründung: `RunAnalyzers` oder `RunAnalyzersDuringBuild` auf `false`, `dotnet_analyzer_diagnostic.severity` (auch je Kategorie) mit schwacher Schwere, `<Analyzer Remove=…>` und `ExcludeAssets` mit `analyzers`. `generated_code = true` warnt nur ohne Begründung: Für diese Dateien laufen keine Analyzer und keine Formatprüfung. `TreatWarningsAsErrors` im Projekt spielt keine Rolle, die Pipeline baut ohnehin mit `-warnaserror`.
+
+```xml
+<!-- Hinweise zu Enums prüft ein eigener Test des OpenAPI-Exports -->
+<WarningsNotAsErrors>$(WarningsNotAsErrors);SEEDOPENAPI014</WarningsNotAsErrors>
+```
+
+**Formatierung** („Formatierung prüfen“): `dotnet format whitespace <solution> --verify-no-changes`, also Einrückung, Leerzeichen, Zeilenumbrüche, Zeilenende und letzte Zeile laut `.editorconfig`. Das prüft sonst niemand; der Teilbefehl braucht keinen Build und dauert wenige Sekunden. `style` und `analyzers` lässt der Schritt bewusst aus: Sie kompilieren die Solution ein zweites Mal und melden dieselben Regeln wie der Build, sobald das Projekt Code-Stil im Build prüft (`EnforceCodeStyleInBuild`, Schwere in `.editorconfig`). Dort zählen sie als Warnung und damit als Fehler; so gibt es je Regel eine Stelle. Vor dem Commit deshalb `dotnet format` ausführen; es behebt Leerraum und, soweit es geht, Stil. Die Pipeline prüft den Leerraum, den Rest der Build. Der Stop-Hook im Projekt (seed-template) prüft dasselbe wie die Pipeline. Die Meldung nennt je Datei die Zahl der Stellen und die erste abweichende Zeile, bis zu 20 Dateien. Dateien mit `generated_code = true` in `.editorconfig` oder dem Kopf `<auto-generated>` prüft `dotnet format` nicht.
+
+**Offene TODOs** („Offene TODOs in project.yaml“): eine Warnung je Zeile mit `TODO(onboarding)` in `project.yaml` (auch `TODO (onboarding)`), mit Zeilennummer. So markiert ein Projekt Angaben, die beim Onboarding noch fehlen. Den Punkt erledigen und die Markierung entfernen.
 
 **Lokal**, im Checkout des Projekts, mit einem Klon von seed-pipelines daneben und Python mit PyYAML:
 
 ```bash
 dotnet restore api/Api.slnx
-dotnet format whitespace api/Api.slnx                    # formatiert; danach committen
+dotnet format api/Api.slnx                               # vor dem Commit: Leerraum und Stil
 dotnet build api/Api.slnx -c Release --no-restore -warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026
 python3 ../seed-pipelines/scripts/dotnet/checks.py todos --project-yaml project.yaml
+python3 ../seed-pipelines/scripts/dotnet/checks.py suppressions
 python3 ../seed-pipelines/scripts/dotnet/checks.py format --solution api/Api.slnx
 python3 ../seed-pipelines/scripts/dotnet/checks.py packages --solution api/Api.slnx --project-yaml project.yaml
 ```
@@ -278,7 +296,7 @@ $common = @{
 # Prüflauf wie im PR: eigene Schritte und Prüfungen im Build ja, Artefakte nein; Warnungen als Fehler
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/validation-only.yml `
   -ExpectBuildSteps 'Anmeldung am Feed (Beispiel)', 'dotnet restore', 'Offene TODOs in project.yaml', `
-    'Formatierung prüfen', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm run build', 'Lint (Beispiel)' `
+    'Abgeschaltete Regeln prüfen', 'Formatierung prüfen', 'NuGet-Pakete prüfen', 'dotnet build', 'dotnet test', 'npm run build', 'Lint (Beispiel)' `
   -AbsentBuildSteps 'Artefakt web', 'Artefakt api' -ExpectText 'warnaserror -warnNotAsError:NU1603'
 # Ohne Warnungen als Fehler (treatWarningsAsErrors: false), die übrigen Prüfungen bleiben
 ./tests/preview/Invoke-SeedPipelinePreview.ps1 @common -YamlPath tests/preview/warnings-allowed.yml `
