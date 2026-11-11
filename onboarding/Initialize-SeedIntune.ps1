@@ -23,7 +23,9 @@
          blackforestsentinel/seed-pipelines auf refs/tags/<-SeedPipelinesVersion>). Nur Läufe von
          main, die genau dieses Template einbinden, bekommen die Identität. Vorhandene Checks mit
          anderen Werten werden aktualisiert.
-      6. Environment seed-intune mit Freigabe durch -Approvers
+      6. Environment seed-intune mit Freigabe durch -Approvers; wer den Lauf gestartet hat, gibt
+         nicht selbst frei (außer mit -RequesterCanApprove). Eine vorhandene Freigabe mit anderer
+         Einstellung wird angeglichen.
       7. Repo seed-tenant; fehlt main, mit Startinhalt aus tenant/ (extensions.yaml leer,
          azure-pipelines.yml mit extends, README). Ein vorhandenes Repo bleibt unverändert; das
          Skript prüft nur, dass azure-pipelines.yml das Template auf -SeedPipelinesVersion einbindet.
@@ -77,6 +79,10 @@
     Freigaben, die ein Pull Request auf main von seed-tenant braucht, Standard 1. Die Person, die
     ihn erstellt oder zuletzt gepusht hat, zählt nicht (außer mit -AllowSelfApproval).
 
+.PARAMETER RequesterCanApprove
+    Auch die Person, die den Lauf gestartet hat, darf die Änderung an der Richtlinie im Environment
+    freigeben. Ohne den Schalter darf sie es nicht, und ein erneuter Lauf setzt das wieder.
+
 .PARAMETER AllowSelfApproval
     Auch die Person des Pull Requests darf ihn freigeben. Für Teams, in denen nur eine Person die
     Erweiterungen verantwortet; die Freigabe bleibt ein bewusster Schritt, ist aber kein
@@ -111,6 +117,7 @@ param(
     [string[]] $TemplateRefs = @('refs/tags/v*'),
     [ValidateRange(1, 10)] [int] $MinimumReviewers = 1,
     [switch] $AllowSelfApproval,
+    [switch] $RequesterCanApprove,
     [switch] $DryRun
 )
 
@@ -502,26 +509,37 @@ try {
             name = $EnvironmentName; description = ('Intune-Richtlinie {0} (Pipeline {1})' -f (Format-Name $PolicyName), $PipelineName)
         }
     }
-    Invoke-Step "Freigabe an $EnvironmentName" {
-        if ($environment) {
-            (Invoke-AzDevOps get "$api/pipelines/checks/configurations?resourceType=environment&resourceId=$($environment.id)&api-version=7.1-preview.1").value |
-                Where-Object { $_.type.id -eq $ApprovalCheckType }
-        }
-    } {
-        Invoke-AzDevOps post "$api/pipelines/checks/configurations?api-version=7.1-preview.1" @{
-            type     = @{ id = $ApprovalCheckType; name = 'Approval' }
-            resource = @{ type = 'environment'; id = "$($environment.id)"; name = $environment.name }
-            settings = @{
-                approvers                 = @($approverIds | ForEach-Object { @{ id = $_ } })
-                executionOrder            = 'anyOrder'
-                minRequiredApprovers      = 1
-                requesterCannotBeApprover = $false
-                instructions              = 'Änderungen an der Intune-Richtlinie im Log der Stage Plan prüfen (entfernte Erweiterungen deinstalliert Edge auf allen Geräten), dann freigeben.'
-                blockedApprovers          = @()
+    $approval = if ($environment) {
+        (Invoke-AzDevOps get "$api/pipelines/checks/configurations?resourceType=environment&resourceId=$($environment.id)&`$expand=settings&api-version=7.1-preview.1").value |
+            Where-Object { $_.type.id -eq $ApprovalCheckType } | Select-Object -First 1
+    }
+    # Die Person, die den Lauf gestartet hat, gibt standardmäßig nicht selbst frei.
+    $requesterCannot = -not $RequesterCanApprove
+    $requesterText = if ($requesterCannot) { 'nicht durch die startende Person' } else { 'auch durch die startende Person' }
+    if ($approval -and [bool] $approval.settings.requesterCannotBeApprover -ne $requesterCannot) {
+        Update-Step "Freigabe an ${EnvironmentName}: $requesterText" $(if ($requesterCannot) { 'auch durch die startende Person' } else { 'nicht durch die startende Person' }) {
+            $approval.settings | Add-Member -NotePropertyName requesterCannotBeApprover -NotePropertyValue $requesterCannot -Force
+            Invoke-AzDevOps patch "$api/pipelines/checks/configurations/$($approval.id)?api-version=7.1-preview.1" @{
+                id = $approval.id; type = $approval.type; resource = $approval.resource; settings = $approval.settings; timeout = $approval.timeout
             }
-            timeout  = 43200
         }
-    } | Out-Null
+    } else {
+        Invoke-Step "Freigabe an ${EnvironmentName}: $requesterText" { $approval } {
+            Invoke-AzDevOps post "$api/pipelines/checks/configurations?api-version=7.1-preview.1" @{
+                type     = @{ id = $ApprovalCheckType; name = 'Approval' }
+                resource = @{ type = 'environment'; id = "$($environment.id)"; name = $environment.name }
+                settings = @{
+                    approvers                 = @($approverIds | ForEach-Object { @{ id = $_ } })
+                    executionOrder            = 'anyOrder'
+                    minRequiredApprovers      = 1
+                    requesterCannotBeApprover = $requesterCannot
+                    instructions              = 'Änderungen an der Intune-Richtlinie im Log der Stage Plan prüfen (entfernte Erweiterungen deinstalliert Edge auf allen Geräten), dann freigeben.'
+                    blockedApprovers          = @()
+                }
+                timeout  = 43200
+            }
+        } | Out-Null
+    }
 
     # --- 7. Repo seed-tenant ------------------------------------------------------------------
     Write-Host "7. Azure DevOps: Repo $Repository"

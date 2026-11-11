@@ -129,10 +129,18 @@ steps:
           for path in files:
               zip_file.write(os.path.join(copy, path), path.replace(os.sep, "/"))
       print(f"{package}.zip: {len(files)} Dateien, {os.path.getsize(archive)} Bytes")
-      ' "${{ parameters.buildDir }}" "${{ parameters.outputsFile }}" "${{ parameters.name }}-${{ parameters.environment }}" \
-        "${{ parameters.environment }}" "${{ join(',', parameters.storeEnvironments) }}" "${{ lower(parameters.sign) }}" "$(Build.BuildId)" \
-        "$(Agent.TempDirectory)/extension" "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}"
+      ' "$SEED_BUILD_DIR" "$SEED_OUTPUTS_FILE" "$SEED_PACKAGE-$SEED_ENVIRONMENT" \
+        "$SEED_ENVIRONMENT" "$SEED_STORE_ENVIRONMENTS" "$SEED_SIGN" "$(Build.BuildId)" \
+        "$(Agent.TempDirectory)/extension" "$(Build.ArtifactStagingDirectory)/extension_$SEED_ENVIRONMENT"
     displayName: Browser-Erweiterung packen
+    # Parameter über die Umgebung statt als Text im Skript (wie in web-app.yml)
+    env:
+      SEED_BUILD_DIR: ${{ parameters.buildDir }}
+      SEED_OUTPUTS_FILE: ${{ parameters.outputsFile }}
+      SEED_PACKAGE: ${{ parameters.name }}
+      SEED_ENVIRONMENT: ${{ parameters.environment }}
+      SEED_STORE_ENVIRONMENTS: ${{ join(',', parameters.storeEnvironments) }}
+      SEED_SIGN: ${{ lower(parameters.sign) }}
 
   - ${{ if parameters.sign }}:
       # Das Skript liegt in seed-pipelines unter scripts/extension statt inline wie die übrigen
@@ -155,18 +163,23 @@ steps:
       - task: AzureCLI@2
         name: extensionRelease
         displayName: Erweiterung signieren und veröffentlichen
+        env:
+          SEED_PACKAGE: ${{ parameters.name }}
+          SEED_ENVIRONMENT: ${{ parameters.environment }}
+          SEED_EXTENSION_ID: ${{ parameters.signing.id }}
+          SEED_RESOURCE_GROUP: ${{ parameters.resourceGroup }}
         inputs:
           azureSubscription: ${{ parameters.serviceConnection }}
           scriptType: bash
           scriptLocation: inlineScript
           inlineScript: >-
             python3 "$(Pipeline.Workspace)/seed/scripts/extension/publish.py"
-            --zip "$(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}/${{ parameters.name }}-${{ parameters.environment }}.zip"
+            --zip "$(Build.ArtifactStagingDirectory)/extension_$SEED_ENVIRONMENT/$SEED_PACKAGE-$SEED_ENVIRONMENT.zip"
             --key "$(extensionKey.secureFilePath)"
-            --expect-id "${{ parameters.signing.id }}"
-            --name "${{ parameters.name }}"
-            --resource-group "${{ parameters.resourceGroup }}"
-            --out "$(Build.ArtifactStagingDirectory)/extension_release_${{ parameters.environment }}"
+            --expect-id "$SEED_EXTENSION_ID"
+            --name "$SEED_PACKAGE"
+            --resource-group "$SEED_RESOURCE_GROUP"
+            --out "$(Build.ArtifactStagingDirectory)/extension_release_$SEED_ENVIRONMENT"
       - publish: $(Build.ArtifactStagingDirectory)/extension_${{ parameters.environment }}
         artifact: extension_${{ parameters.environment }}
         displayName: Artefakt extension_${{ parameters.environment }}
