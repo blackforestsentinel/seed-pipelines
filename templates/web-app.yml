@@ -533,9 +533,12 @@ stages:
                         SEED_CONFIRM_DATA_DELETION: ${{ lower(parameters.confirmDataDeletion) }}
                         SEED_PROTECTED_TYPES: ${{ join(',', parameters.protectedResourceTypes) }}
                       script: |
+                        # Über das Objekt env von steps/terraform.yml kommt der Wahrheitswert als
+                        # True oder False an; Terraform und der Vergleich unten brauchen true/false.
+                        confirm_deletion="${SEED_CONFIRM_DATA_DELETION,,}"
                         # Nur in einem Lauf mit confirmDataDeletion; Projekte ohne die Variable
                         # ignorieren sie (TF_VAR_ für unbekannte Variablen ist kein Fehler).
-                        export TF_VAR_allow_data_deletion="$SEED_CONFIRM_DATA_DELETION"
+                        export TF_VAR_allow_data_deletion="$confirm_deletion"
                         set +e
                         terraform plan -var "environment=$SEED_ENVIRONMENT" -out=tfplan -detailed-exitcode
                         code=$?
@@ -570,7 +573,7 @@ stages:
                                 print(r["address"])
                         ' "$SEED_PROTECTED_TYPES")
                         if [ -n "$deletions" ]; then
-                          if [ "$SEED_CONFIRM_DATA_DELETION" = true ]; then
+                          if [ "$confirm_deletion" = true ]; then
                             while read -r address; do
                               echo "##vso[task.logissue type=warning]Bestätigt: Der Plan löscht oder ersetzt $address."
                             done <<< "$deletions"
