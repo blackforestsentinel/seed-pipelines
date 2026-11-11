@@ -17,6 +17,11 @@
          des Schlüssels passt, sonst weist es nur darauf hin.
       3. Berechtigung der Pipeline -PipelineName für die Secure File, damit ihr erster Lauf nicht
          nach Zugriff fragt.
+      4. Branch-Prüfung (Check „Branch control“) an der Secure File: Nur Läufe von -AllowedBranches
+         (Standard main) mit seed-pipelines aus -TemplateRefs bekommen den Schlüssel, PR-Läufe und
+         Feature-Branches nicht. Die Berechtigung aus 3 gilt sonst für jeden Lauf der Pipeline, auch
+         für eine geänderte Pipeline-Datei in einem PR, die die Secure File lädt und ausgibt. Eine
+         vorhandene Prüfung mit anderen Branches wird aktualisiert.
 
     Am Ende nennt das Skript die Werte für extension.signing in azure-pipelines.yml und für
     project.yaml (auth.extraRedirectUris, hosting.corsAllowedOrigins).
@@ -43,6 +48,15 @@
 .PARAMETER PipelineName
     Pipeline des Projekts, die die Secure File nutzt.
 
+.PARAMETER AllowedBranches
+    Branches, deren Läufe die Secure File laden dürfen (Check „Branch control“), Standard main. Muster
+    wie refs/heads/release/* sind erlaubt.
+
+.PARAMETER TemplateRefs
+    Refs von seed-pipelines, die die Branch-Prüfung zusätzlich erlaubt, Standard refs/tags/v*. Die
+    Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch seed-pipelines, das der Deploy
+    zum Signieren auscheckt (wie bei der Service Connection, README, Branch-Prüfung).
+
 .PARAMETER DryRun
     Nur prüfen und anzeigen, was angelegt würde. Legt weder Schlüssel noch Secure File an.
 
@@ -62,6 +76,8 @@ param(
     [Parameter(Mandatory)] [string] $AzureDevOpsProject,
     [string] $SecureFileName = '',
     [Parameter(Mandatory)] [string] $PipelineName,
+    [string[]] $AllowedBranches = @('main'),
+    [string[]] $TemplateRefs = @('refs/tags/v*'),
     [switch] $DryRun
 )
 
@@ -78,6 +94,15 @@ if ($Org -notmatch '^https://dev\.azure\.com/[^/]+$' -and $Org -notmatch '^https
 }
 $AzureDevOpsResource = '499b84ac-1321-427f-aa17-267ca6975798'
 $IdProperty = 'extensionId'
+$BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
+$BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
+# Listen auch als "main,release/*" in einem Argument, etwa beim Aufruf über pwsh -File.
+function Split-List([string[]] $Values) {
+    @($Values | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$AllowedBranchRefs = @(@(Split-List $AllowedBranches | ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/heads/$_" } }) +
+    @(Split-List $TemplateRefs)) -join ','
+if (-not (Split-List $AllowedBranches)) { throw 'AllowedBranches: mindestens ein Branch.' }
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "seed-extension-key-$(Get-Random)")
 $missing = [Collections.Generic.List[string]]::new()
@@ -279,6 +304,44 @@ try {
             Invoke-AzDevOps patch $permissionsUrl @{ pipelines = @(@{ id = $definition.id; authorized = $true }) } | Out-Null
             $true
         } | Out-Null
+    }
+
+    # --- 4. Branch-Prüfung ------------------------------------------------------------------
+    # Die Berechtigung aus 3 hängt nicht am Branch: Ohne Prüfung lädt auch ein PR-Lauf mit
+    # geänderter Pipeline-Datei den Schlüssel (DownloadSecureFile@1) und kann ihn ausgeben.
+    Write-Host '4. Branch-Prüfung an der Secure File'
+    $branchTitle = "Branch-Prüfung an Secure File ${SecureFileName}: $AllowedBranchRefs"
+    if (-not $secureFile) {
+        Write-Missing $branchTitle 'Die Secure File fehlt noch.'
+    } else {
+        $checks = "$api/pipelines/checks/configurations"
+        $existing = (Invoke-AzDevOps get "$checks`?resourceType=securefile&resourceId=$($secureFile.id)&`$expand=settings&api-version=7.1-preview.1").value |
+            Where-Object { $_.type.id -eq $BranchControlCheckType -and $_.settings.definitionRef.id -eq $BranchControlDefinition } |
+            Select-Object -First 1
+        $body = @{
+            type     = @{ id = $BranchControlCheckType; name = 'Task Check' }
+            resource = @{ type = 'securefile'; id = "$($secureFile.id)"; name = $secureFile.name }
+            settings = @{
+                definitionRef = @{ id = $BranchControlDefinition; name = 'evaluatebranchProtection'; version = '0.0.1' }
+                displayName   = 'Sentinel Seed: nur freigegebene Branches'
+                inputs        = @{ allowedBranches = $AllowedBranchRefs; ensureProtectionOfBranch = 'false'; allowUnknownStatusBranch = 'false' }
+            }
+            timeout  = 1440
+        }
+        if ($existing -and $existing.settings.inputs.allowedBranches -ne $AllowedBranchRefs) {
+            if ($DryRun) {
+                Write-Host "  [alt]   $branchTitle (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Yellow
+                $missing.Add($branchTitle)
+            } else {
+                $body.id = $existing.id
+                Invoke-AzDevOps patch "$checks/$($existing.id)?api-version=7.1-preview.1" $body | Out-Null
+                Write-Host "  [neu]   $branchTitle (bisher $($existing.settings.inputs.allowedBranches))" -ForegroundColor Green
+            }
+        } else {
+            Invoke-Step $branchTitle { $existing } {
+                Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
+            } | Out-Null
+        }
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------
