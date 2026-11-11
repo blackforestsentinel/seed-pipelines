@@ -9,11 +9,14 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest import mock
 
 # Laden über den Pfad: Bei der Suche ab scripts/ heißt das Paket dieses Ordners schon „intune“.
 _spec = importlib.util.spec_from_file_location("seed_intune", Path(__file__).with_name("intune.py"))
@@ -343,6 +346,85 @@ class PublishedTests(unittest.TestCase):
             with quiet() as out:
                 self.assertEqual(intune.main(["check", "--registry", str(registry)], get=None), 0)
             self.assertIn("keine Erweiterung", out.getvalue())
+
+
+def resolves_to(*addresses):
+    """Ersatz für socket.getaddrinfo: jeder Host hat genau diese Adressen."""
+    def getaddrinfo(host, port, *args, **kwargs):
+        return [(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port))
+                for a in addresses]
+    return mock.patch.object(intune.socket, "getaddrinfo", getaddrinfo)
+
+
+class AddressTests(unittest.TestCase):
+    """check ruft updateUrl aus dem PR ab, auch auf eigenen Agents: nur öffentliche Adressen."""
+
+    def test_blocks_internal_addresses(self):
+        for address in ("127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+                        "100.100.100.200", "168.63.129.16", "0.0.0.0", "224.0.0.1", "::1", "::", "fe80::1",
+                        "fc00::1", "fd00:ec2::254", "::ffff:10.0.0.1", "::ffff:169.254.169.254",
+                        "64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1", "fe80::1%eth0"):
+            with self.subTest(address=address):
+                self.assertIsNotNone(intune.address_problem(address))
+
+    def test_allows_public_addresses(self):
+        for address in ("20.38.0.1", "8.8.8.8", "2620:1ec:4::1", "::ffff:8.8.8.8", "64:ff9b::808:808"):
+            with self.subTest(address=address):
+                self.assertIsNone(intune.address_problem(address))
+
+    def test_check_url(self):
+        with resolves_to("20.38.0.1"):
+            intune.check_url(PORTAL_URL)
+        cases = [
+            (("10.0.0.5",), PORTAL_URL),
+            (("20.38.0.1", "169.254.169.254"), PORTAL_URL),  # eine interne Adresse genügt
+            (("20.38.0.1",), PORTAL_URL.replace("https://", "http://")),
+        ]
+        for addresses, url in cases:
+            with self.subTest(addresses=addresses, url=url), resolves_to(*addresses),                     self.assertRaises(intune.BlockedAddress):
+                intune.check_url(url)
+
+    def test_literal_and_localhost_without_network(self):
+        for url in ("https://127.0.0.1/api/extension/updates.xml", "https://[::1]/api/extension/updates.xml",
+                    "https://169.254.169.254/api/extension/updates.xml", "https://localhost/api/extension/updates.xml"):
+            with self.subTest(url=url), self.assertRaises(intune.BlockedAddress):
+                intune.fetch(url)
+
+    def test_redirect_is_checked(self):
+        handler = intune.PublicRedirectHandler()
+        request = urllib.request.Request(PORTAL_URL)
+        for url in ("http://example.org/api/extension/updates.xml", "https://intern.example.org/api/extension/updates.xml"):
+            with self.subTest(url=url), resolves_to("10.0.0.5"), self.assertRaises(intune.BlockedAddress):
+                handler.redirect_request(request, None, 302, "Found", {}, url)
+        with resolves_to("20.38.0.1"):
+            self.assertIsNotNone(handler.redirect_request(request, None, 302, "Found", {}, OTHER_URL))
+
+    def test_connection_goes_to_checked_address(self):
+        # Die Verbindung geht an die geprüfte Adresse, nicht an eine zweite DNS-Antwort.
+        connected = []
+        with mock.patch.object(intune.socket, "create_connection", lambda address, *args: connected.append(address)):
+            connection = intune.PublicHTTPSConnection("func-demo.azurewebsites.net", 443)
+            with resolves_to("20.38.0.1"):
+                connection._create_connection(("func-demo.azurewebsites.net", 443), 10)
+            with resolves_to("10.0.0.5"), self.assertRaises(intune.BlockedAddress):
+                connection._create_connection(("func-demo.azurewebsites.net", 443), 10)
+            # Über einen Proxy (CONNECT) geht die Verbindung zum Proxy, der Host ist vorher geprüft.
+            proxied = intune.PublicHTTPSConnection("proxy.intern", 3128)
+            proxied.set_tunnel("func-demo.azurewebsites.net", 443)
+            proxied._create_connection(("proxy.intern", 3128), 10)
+        self.assertEqual(connected, [("20.38.0.1", 443), ("proxy.intern", 3128)])
+
+    def test_check_published_does_not_retry_blocked(self):
+        calls = []
+
+        def blocked(url):
+            calls.append(url)
+            raise intune.BlockedAddress("intern.example.org: 10.0.0.5 ist keine öffentliche Adresse")
+
+        with quiet():
+            problems = intune.check_published([intune.Extension("kundenportal", PORTAL_ID, PORTAL_URL)], blocked, delay=0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("wird nicht abgerufen", problems[0])
 
 
 class PlanTests(unittest.TestCase):

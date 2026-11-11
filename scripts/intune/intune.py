@@ -2,7 +2,8 @@
 """Sentinel Seed: die eine Intune-Richtlinie für die Edge-Erweiterungen aller Seed-Projekte.
 
   check  prüft die Registerdatei: Format und je Erweiterung, dass updates.xml erreichbar ist und
-         die ID nennt (veröffentlicht?). Braucht keine Anmeldung, läuft auch im PR.
+         die ID nennt (veröffentlicht?). Braucht keine Anmeldung, läuft auch im PR; ruft nur Hosts mit
+         öffentlichen Adressen ab.
   plan   zeigt, was sich an der Richtlinie ändern würde; in Azure Pipelines setzt es die
          Ausgabevariablen changes und planId.
   apply  gleicht die Richtlinie an, liest sie danach erneut und prüft, dass nichts mehr fehlt.
@@ -36,9 +37,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -347,11 +351,105 @@ def desired_value(entries: list[str]) -> dict:
 
 
 # --- Veröffentlicht? ---------------------------------------------------------------------------
+# check läuft auch im PR-Lauf, mit einer updateUrl aus dem PR. Auf einem eigenen Agent im internen
+# Netz wäre fetch sonst eine Sonde für interne Dienste: Abgerufen werden deshalb nur Hosts, deren
+# Adressen alle öffentlich sind, keine privaten, Loopback-, Link-Local- oder Metadaten-Adressen
+# (IPv4 und IPv6). Die Prüfung gilt für jede Weiterleitung und für die Verbindung selbst, die an
+# die geprüfte Adresse geht; eine zweite DNS-Antwort zwischen Prüfung und Verbindung zählt nicht.
+
+# Öffentlich, aber Dienste der Plattform: Azure-Host (DNS, Metadaten, Health) und der
+# Metadaten-Dienst von AWS über IPv6. Link-Local (169.254.169.254) und private Bereiche schließt
+# ipaddress.is_global ohnehin aus.
+BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in ("168.63.129.16/32", "fd00:ec2::/32"))
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+class BlockedAddress(ValueError):
+    """Die URL zeigt auf eine Adresse, die check nicht abruft."""
+
+
+def address_problem(address: str) -> str | None:
+    """Warum check diese IP-Adresse nicht abruft, oder None, wenn sie öffentlich ist."""
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        # IPv4 in IPv6 (::ffff:10.0.0.1, 6to4, Teredo, NAT64) gilt als die IPv4-Adresse darin.
+        candidates += [a for a in (ip.ipv4_mapped, ip.sixtofour, *(ip.teredo or ())) if a]
+        if ip in NAT64:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    for candidate in candidates:
+        if any(candidate in network for network in BLOCKED_NETWORKS if network.version == candidate.version):
+            return f"{candidate} ist eine Adresse der Plattform (Metadaten)"
+        if not candidate.is_global or candidate.is_multicast:
+            return f"{candidate} ist keine öffentliche Adresse"
+    return None
+
+
+def public_addresses(host: str, port: int) -> list[str]:
+    """Alle Adressen des Hosts; BlockedAddress, wenn eine davon nicht öffentlich ist."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise OSError(f"{host} lässt sich nicht auflösen ({error})") from error
+    addresses = list(dict.fromkeys(info[4][0] for info in infos))
+    for address in addresses:
+        problem = address_problem(address)
+        if problem:
+            raise BlockedAddress(f"{host}: {problem}, check ruft sie nicht ab")
+    if not addresses:
+        raise OSError(f"{host} lässt sich nicht auflösen")
+    return addresses
+
+
+def check_url(url: str) -> None:
+    """Nur https und nur Hosts mit öffentlichen Adressen; sonst BlockedAddress."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise BlockedAddress(f"{url}: Edge braucht https")
+    public_addresses(parts.hostname, parts.port or 443)
+
+
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    """Verbindet nur zu einer geprüften, öffentlichen Adresse des Hosts. Über einen Proxy (CONNECT)
+    löst der Proxy den Host auf; geprüft ist er dann vorher in check_url."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = self._connect_public
+
+    def _connect_public(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        if self._tunnel_host:
+            return socket.create_connection(address, timeout, source_address)
+        host, port = address
+        error: OSError | None = None
+        for ip in public_addresses(host, port):
+            try:
+                return socket.create_connection((ip, port), timeout, source_address)
+            except OSError as failure:
+                error = failure
+        raise error or OSError(f"{host} nicht erreichbar")
+
+
+class PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(PublicHTTPSConnection, request, context=self._context)
+
+
+class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prüft jede Weiterleitung wie die URL selbst, bevor sie abgerufen wird."""
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            raise BlockedAddress(f"leitet auf {newurl} um, Edge braucht https")
+        check_url(newurl)
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
 def fetch(url: str, timeout: int = 30) -> bytes:
+    check_url(url)
+    opener = urllib.request.build_opener(PublicHTTPSHandler(), PublicRedirectHandler())
     request = urllib.request.Request(url, headers={"User-Agent": "sentinel-seed-intune", "Accept": "text/xml, application/xml"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with opener.open(request, timeout=timeout) as response:
         if not response.geturl().startswith("https://"):
             raise ValueError(f"leitet auf {response.geturl()} um, Edge braucht https")
         data = response.read(MAX_MANIFEST_BYTES + 1)
@@ -395,6 +493,15 @@ def check_published(extensions: list[Extension], get: Callable[[str], bytes] = f
                 problem = f"antwortet mit {error.code}"
                 if error.code < 500:
                     break
+            except BlockedAddress as error:
+                problem = f"wird nicht abgerufen ({error})"
+                break
+            except urllib.error.URLError as error:
+                # urllib verpackt Fehler beim Verbinden, auch die Prüfung der Adresse
+                if isinstance(error.reason, BlockedAddress):
+                    problem = f"wird nicht abgerufen ({error.reason})"
+                    break
+                problem = f"ist nicht erreichbar ({error})"
             except (OSError, ValueError) as error:
                 problem = f"ist nicht erreichbar ({error})"
             if attempt < attempts:
