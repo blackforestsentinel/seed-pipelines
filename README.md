@@ -451,7 +451,7 @@ Mit `features.customConnector` in `project.yaml` liefert Terraform den Output `c
 
 1. Das OpenAPI-Dokument aus dem Build (Artefakt `openapi`, Paket `Bfs.Seed.OpenApi`) bekommt den Host der Function dieser Umgebung.
 2. Der Connector entsteht per Dataverse-Web-API in der Tabelle `connectors` der Power-Platform-Umgebung, wie bei `pac connector create`; ab dem zweiten Lauf wird er aktualisiert. Bestehende Verbindungen bleiben erhalten. Der Name bleibt, der Anzeigename darf sich ändern (höchstens 30 Zeichen).
-3. Anmeldung mit Entra ID im Namen der Person, ohne Secret: Der Connector nutzt seine Managed Identity (Option der Power Platform, Preview). Redirect-URI und Federated Credential, die die Power Platform dafür vergibt, trägt der Schritt an der Client-Registrierung aus dem Modul `sso` ein; die Pipeline ist deren Besitzerin.
+3. Anmeldung mit Entra ID im Namen der Person, ohne Secret: Der Connector nutzt seine Managed Identity (Option der Power Platform, Preview). Redirect-URI und Federated Credential, die die Power Platform dafür vergibt, trägt der Schritt an der Client-Registrierung aus dem Modul `sso` ein; die Pipeline ist deren Besitzerin. Die Werte liest er aus der Connector-Zeile in Dataverse, die auch Administratoren der Power-Platform-Umgebung ändern können. Eingetragen werden sie deshalb nur in der Form, die die Power Platform vergibt, sonst endet der Schritt mit einem Fehler: Redirect-URI `https://global.consent.azure-apim.net/redirect/<schlüssel>`, Aussteller `https://login.microsoftonline.com/<tenant>/v2.0`, Subject `/eid1/c/pub/t/<tenant>/a/<app der Power Platform>/<region>_<schlüssel>`, Audience `api://AzureADTokenExchange`; `<schlüssel>` ist die Kennung dieses Connectors (`connectorinternalid` ohne `shared_`).
 4. Mit `customConnector.shareWith: everyone` (Standard) bekommt das Standardteam der Root-Business-Unit Lesezugriff, also alle Personen der Umgebung. Ohne Freigabe sähe nur die Pipeline den Connector, denn Basic User liest Connectors nur auf Benutzerebene. Was eine Person über den Connector darf, regeln wie im Browser App-Rollen und Capabilities der API.
 
 Voraussetzung: Die Service-Connection-Identität ist in der Power-Platform-Umgebung Anwendungsbenutzer mit der Rolle Environment Maker; das richtet das Onboarding mit `-PowerPlatformEnvironmentUrl` ein. Fehlt das, endet der Schritt mit einem Hinweis darauf. Ohne Output `custom_connector` (Feature aus oder keine Umgebung angegeben) tut er nichts; das Artefakt `openapi` gibt es trotzdem, im Zweifel mit einer Notiz statt des Dokuments.
@@ -584,6 +584,7 @@ Die Erweiterungs-ID folgt aus dem öffentlichen Schlüssel (SHA-256, die ersten 
 - **Die Datei** darf vom Anlegen an nur der eigene Benutzer lesen: unter Windows mit eigener Zugriffsliste ohne geerbte Einträge, sonst mit Modus 600.
 - **Den Schlüssel sicher offline ablegen** (Passwortmanager, Tresor) und die Datei danach löschen. Azure DevOps gibt Secure Files nicht wieder heraus, und ein neuer Schlüssel ergibt eine neue ID: Browser sehen eine neue Erweiterung, Redirect-URI, CORS und die Intune-Richtlinie brauchen die neue ID.
 - **Wiederholen:** Gibt es die Secure File schon, entsteht kein neuer Schlüssel. Mit `-ExistingKey -KeyFile <pem>` lädt das Skript einen vorhandenen Schlüssel hoch, falls die Secure File fehlt, und prüft ihn sonst gegen die ID, die es beim Hochladen an der Secure File vermerkt hat (Eigenschaft `extensionId`).
+- **Branch-Prüfung an der Secure File:** Die Berechtigung der Pipeline hängt nicht am Branch; ohne Prüfung könnte ein PR-Lauf mit geänderter Pipeline-Datei die Secure File laden und ausgeben. Das Skript setzt deshalb den Check „Branch control“ an der Secure File: Nur Läufe von `-AllowedBranches` (Standard `main`) mit seed-pipelines aus `-TemplateRefs` (Standard `refs/tags/v*`, der Deploy checkt seed-pipelines zum Signieren aus) bekommen den Schlüssel. Eine vorhandene Prüfung mit anderen Branches wird aktualisiert. Für bestehende Secure Files das Skript mit `-ExistingKey` oder ohne erneut ausführen; es erzeugt dabei keinen neuen Schlüssel.
 - Der private Schlüssel erscheint in keiner Ausgabe. Im Deploy liegt er nur für die Dauer des Jobs auf dem Agent (`DownloadSecureFile@1`).
 
 ### Voraussetzungen
@@ -641,7 +642,7 @@ cd seed-pipelines
 2. Azure: `Contributor` und `Role Based Access Control Administrator` auf der Subscription. Die Bedingung erlaubt nur die Rollen, die Seed-Module vergeben: Storage-Datenrollen, `Key Vault Secrets User` und `Key Vault Secrets Officer`, `Monitoring Metrics Publisher`. Nach einem Seed-Update mit neuen Rollen das Skript erneut ausführen; es ersetzt dann die ältere Bedingung. Dazu kommt die eigene Rolle `Sentinel Seed Lock Contributor`, die nur Löschsperren lesen, setzen und entfernen darf (Modul `storage`); Contributor allein darf das nicht.
 3. Microsoft Graph: `Application.ReadWrite.OwnedBy` mit Admin-Consent (Modul `sso`)
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
-5. Service Connection per Workload Identity Federation, mit Branch-Prüfung (siehe unten)
+5. Service Connection per Workload Identity Federation, mit Branch-Prüfung und Required template (siehe unten)
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
 7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
 8. GitHub-Service-Connection für alle Pipelines
@@ -652,6 +653,21 @@ cd seed-pipelines
 **Branch-Prüfung:** An der Azure-Service-Connection hängt der Check „Branch control“: Nur Läufe von `-AllowedBranches` (Standard `main`, Muster wie `release/*` erlaubt) bekommen die Deployment-Identität, PR-Läufe und Feature-Branches nicht. Freigaben allein reichen dafür nicht, denn sie hängen an den Environments: Eine geänderte Pipeline-Datei auf einem Feature-Branch, die die Service Connection direkt nutzt, käme ohne die Prüfung an der Freigabe vorbei und hätte die Rechte der Identität auf der ganzen Subscription. Ein erneuter Lauf mit anderen Branches aktualisiert die Prüfung.
 
 Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed-pipelines`, das Projekte über einen Tag einbinden. Deshalb erlaubt sie zusätzlich `-TemplateRefs` (Standard `refs/tags/v*`); ohne sie scheitert jeder Lauf auf `main`. Die Kehrseite: Ein Tag `v…` im Projekt-Repo und ein Lauf darauf kämen ebenfalls durch, ohne Review und ohne Freigabe. Deshalb dürfen dort nur Administratoren Tags anlegen: Das Onboarding setzt „Create tag“ auf Deny für Contributors, Build Administrators, `<Projekt> Build Service` und `Project Collection Build Service`, also auch für die Job-Tokens der Pipelines. `Initialize-SeedTenant.ps1` tut das für das ganze Azure-DevOps-Projekt (nicht mit `-SkipScaffold`), `Initialize-SeedProject.ps1` für das Repo des Projekts, `Grant-SeedScaffoldAccess.ps1` für ein Zielprojekt des zentralen Scaffolds. Brauchen andere Repos im selben Projekt Tags, lässt `-AllowTagCreation` das projektweite Verbot weg; das Skript warnt dann. Ein Deny gilt auch für Administratoren, die zugleich Contributors sind; Seed-Pipelines legen selbst keine Tags an. Wer Seed-Änderungen in einem Testprojekt vor dem Release prüft, nimmt die Branches von seed-pipelines in `-TemplateRefs` auf, etwa `refs/heads/feat/*`.
+
+Das Verbot trifft auch jede weitere Identität, der „Create tag“ in den Zugriffslisten ausdrücklich erlaubt ist: Nach den vier Denies liest das Skript die Liste des Projekts und seiner Repos (`Initialize-SeedProject.ps1`: des Projekts und des Repos) und verbietet das Recht dort, wo es erlaubt ist, etwa der Person, die ein Repo angelegt hat (sie bekommt das Recht beim Anlegen ausdrücklich), oder einer eigenen Gruppe. Die übrigen Rechte des Eintrags bleiben. Ausgenommen sind Project Administrators, Project Collection Administrators und Project Collection Service Accounts. `-DryRun` nennt die Identitäten nur. Ein Deny für eine Person gilt auch, wenn sie Administratorin ist; Tags legt sie dann nach einer Änderung der Rechte von Hand an.
+
+**Required template:** Die Branch-Prüfung lässt jede Pipeline-Datei auf `main` an die Service Connection, auch eine, die sie direkt nutzt statt über `web-app.yml` (etwa ein `AzureCLI@2`, der das Token ausgibt). Deshalb hängt an der Azure-Service-Connection zusätzlich die Prüfung „Required template“ (ExtendsCheck): Nur Läufe, die `templates/web-app.yml` aus `blackforestsentinel/seed-pipelines` an einem erlaubten Tag per `extends` einbinden, bekommen die Deployment-Identität. Erlaubt sind ohne weitere Angabe `-SeedPipelinesVersion` und die Tags, die die für die Service Connection berechtigten Pipelines auf ihrem Default-Branch einbinden; vorhandene Einträge bleiben. `seed-scaffold` (PAT) nutzt dieselbe Service Connection und bekommt `templates/scaffold.yml` am selben Tag und an dem Tag, den sein `azure-pipelines.yml` nennt. `-RequiredTemplateRefs v0.19.0[,v0.18.1]` ersetzt die Einträge für `web-app.yml` durch genau diese Tags, etwa um alte zu entfernen; das Skript warnt, wenn eine berechtigte Pipeline dann scheitern würde. `-SkipRequiredTemplate` lässt die Prüfung weg, etwa wenn die Service Connection auch Pipelines außerhalb von Seed dient; das Skript warnt dann. Branches von seed-pipelines nimmt die Prüfung nie von selbst auf; wer vor dem Release in einem Testprojekt prüft, nennt sie in `-RequiredTemplateRefs` (etwa `refs/heads/feat/x`) und entfernt sie danach wieder.
+
+**Versionswechsel mit Required template:** Die Prüfung kennt nur die Tags, die sie nennt. Vor dem Merge eines Pull Requests, der `ref` eines Projekts auf einen neuen Tag hebt, den Tag deshalb ergänzen, sonst scheitert der erste Lauf auf `main` an der Prüfung (PR-Läufe nicht, sie nutzen die Service Connection nicht):
+
+```powershell
+# ergänzt v0.19.0, vorhandene Tags bleiben
+./onboarding/Initialize-SeedTenant.ps1 <Parameter wie beim Onboarding> -SeedPipelinesVersion v0.19.0 -DryRun
+# bzw. für ein migriertes Projekt
+./onboarding/Initialize-SeedProject.ps1 <Parameter wie beim Einrichten> -RequiredTemplateRefs v0.18.1,v0.19.0 -DryRun
+```
+
+Ohne `-DryRun` wiederholen, dann mergen. Sind alle Projekte umgestellt, entfernt ein Lauf mit `-RequiredTemplateRefs <neuer Tag>` die alten. Von Hand geht es auch: Service Connection, „Approvals and checks“, „Required template“, Eintrag mit dem neuen Ref ergänzen.
 
 Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1`, sobald das Projekt umgestellt ist. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` (nach dem Umschalten) bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
@@ -751,11 +767,11 @@ Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `te
 
 Ein Projekt mit eigenem Repo und eigenen Pipelines zieht ohne neues Repo auf Seed um. [`onboarding/Initialize-SeedProject.ps1`](onboarding/Initialize-SeedProject.ps1) legt dafür an, was sonst `seed-terraform//ado-project` für neue Projekte anlegt, mit denselben Einstellungen, aber ohne Repo-Import und ohne Dateien zu schreiben:
 
-- Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`
+- Environments `<name>-<env>` mit Freigabe und `<name>-<env>-app`, dort mit Freigabe nur für `-AppApprovalEnvironments`. Wer einen Lauf gestartet hat, gibt ihn nicht selbst frei; `-RequesterCanApprove` erlaubt das ausdrücklich. Ein erneuter Lauf gleicht vorhandene Freigaben an (bis v0.18 war es umgekehrt: Freigabe auch durch die startende Person, außer mit `-RequesterCannotApprove`; der Schalter bleibt ohne Wirkung erhalten)
 - die Pipeline-Definition für die YAML-Datei (Default `azure-pipelines.yml`), ohne sie zu starten
 - die Berechtigungen der Pipeline für die Environments, die Azure- und die GitHub-Service-Connection; das „Permit“ beim ersten Lauf entfällt
-- nach dem Umschalten den Branch-Schutz: die Branch-Policy der PR-Validierung, einen Pflicht-Reviewer (`-MinReviewers`, Standard 1, die eigene Stimme zählt nicht) und die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch); siehe unten, PR-Validierung als Standard
-- Tags im Repo nur für Administratoren (siehe [Branch-Prüfung](#tenant-onboarding)); `-AllowTagCreation` lässt das mit Warnung weg
+- nach dem Umschalten den Branch-Schutz: die Branch-Policy der PR-Validierung, einen Pflicht-Reviewer (`-MinReviewers`, Standard 1, die eigene Stimme zählt nicht), die Branch-Prüfung an der Azure-Service-Connection (`-AllowedBranches`, Standard der Default-Branch) und dort die Prüfung „Required template“ mit dem Tag, den die YAML-Datei auf dem Default-Branch einbindet, und den Tags der übrigen berechtigten Pipelines (`-RequiredTemplateRefs`, `-SkipRequiredTemplate`, siehe [Required template](#tenant-onboarding)); siehe unten, PR-Validierung als Standard
+- Tags im Repo nur für Administratoren, auch für Identitäten, denen „Create tag“ im Projekt oder Repo ausdrücklich erlaubt ist (siehe [Branch-Prüfung](#tenant-onboarding)); `-AllowTagCreation` lässt das mit Warnung weg
 - mit `-Pool` Warnungen, wenn die Agent-Queue ohne Freigabe oder Branch-Prüfung ist, allen Pipelines offensteht oder der Pool in jedes neue Projekt kommt (siehe [Eigene Agents](#eigene-agents))
 
 Es läuft mit dem `az`-Login einer Person, die Projektadministrator ist. Wie das Onboarding prüft es jeden Schritt zuerst, und `-DryRun` zeigt nur an, was fehlt. Die Reihenfolge:
@@ -787,7 +803,7 @@ Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben
 
 ### PR-Validierung als Standard
 
-Den Branch-Schutz (Branch-Policy mit Build-Validierung durch die Seed-Pipeline, Pflicht-Reviewer, Branch-Prüfung an der Service Connection) setzt `Initialize-SeedProject.ps1` ohne weiteren Schalter, sobald die YAML-Datei auf dem Default-Branch `web-app.yml` ab v0.5.0 einbindet. Neue Projekte aus `seed-scaffold` bekommen die Policy ohnehin (`seed-terraform//ado-project`, `pr_validation`, Standard `true`).
+Den Branch-Schutz (Branch-Policy mit Build-Validierung durch die Seed-Pipeline, Pflicht-Reviewer, Branch-Prüfung und Required template an der Service Connection) setzt `Initialize-SeedProject.ps1` ohne weiteren Schalter, sobald die YAML-Datei auf dem Default-Branch `web-app.yml` ab v0.5.0 einbindet. Neue Projekte aus `seed-scaffold` bekommen die Policy ohnehin (`seed-terraform//ado-project`, `pr_validation`, Standard `true`).
 
 - **Warum erst nach dem Umschalten:** Vorher sperrte die Pflicht-Policy direkte Pushes auf den Default-Branch, und die Branch-Prüfung hielte die Testläufe der Migration auf ihrem Branch auf; mit der alten YAML-Datei würden PR-Läufe sogar deployen. Bis dahin übergeht das Skript den Branch-Schutz mit einem Hinweis, ohne Fehler; ein erneuter Lauf nach dem Merge holt ihn nach.
 - **`-EnableBranchPolicy`** verlangt den Branch-Schutz: Ist der Default-Branch noch nicht umgestellt, fehlt die Policy, und das Skript endet mit Exit-Code 1 (außer im DryRun). So arbeitet der Modus `enableBranchPolicy` des zentralen Scaffolds.
@@ -854,7 +870,7 @@ extensions:
 
 - **Format:** ein bewusst kleiner Ausschnitt aus YAML, den `intune.py` selbst liest: nur der Schlüssel `extensions`, eine Liste von Einträgen mit genau diesen fünf Schlüsseln, Kommentare, Werte ohne, in `'…'` oder in `"…"` Anführungszeichen; `extensions: []` für keinen Eintrag. Abgelehnt mit Zeilennummer werden Tabulatoren, mehrzeilige Werte, `{…}`, Anker, unbekannte oder doppelte Schlüssel und Werte, die YAML nicht als Text läse (`yes`, `2026-01-01`, Zahlen). Jede gültige Datei liest ein YAML-Parser genauso (die Tests prüfen das gegen PyYAML). PyYAML selbst kommt nicht in die Pipeline, weil es auf dem Agent nicht sicher vorhanden ist und ein `pip install` eine weitere Abhängigkeit aus dem Netz wäre. JSON ginge ohne eigenen Parser, kennt aber keine Kommentare; die Datei pflegen Menschen per Pull Request, und Seed nutzt YAML auch für `project.yaml`.
 - **Werte:** `name` 3 bis 40 Zeichen (`a-z`, `0-9`, `-`), `id` 32 Zeichen `a` bis `p`, beide eindeutig. `updateUrl` per `https`, ohne Anmeldedaten, Query, Fragment und `;`, endet auf `/api/extension/updates.xml`.
-- **Veröffentlicht?** „Registerdatei prüfen“ lädt jede `updateUrl` (bis zu drei Versuche) und verlangt ein Update-Manifest (`gupdate`, Namespace `http://www.google.com/update2/response`) mit `app/@appid` gleich `id` und einem `updatecheck` mit `version` und `https`-`codebase`. Sonst endet der Lauf mit „Erst veröffentlichen (Deploy des Projekts), dann eintragen“, im Pull Request also vor dem Merge.
+- **Veröffentlicht?** „Registerdatei prüfen“ lädt jede `updateUrl` (bis zu drei Versuche) und verlangt ein Update-Manifest (`gupdate`, Namespace `http://www.google.com/update2/response`) mit `app/@appid` gleich `id` und einem `updatecheck` mit `version` und `https`-`codebase`. Sonst endet der Lauf mit „Erst veröffentlichen (Deploy des Projekts), dann eintragen“, im Pull Request also vor dem Merge. Weil die Adresse aus dem Pull Request kommt, ruft die Prüfung nur Hosts ab, deren Adressen alle öffentlich sind: keine privaten, Loopback-, Link-Local- und Metadaten-Adressen (IPv4 und IPv6, auch eingebettet wie `::ffff:10.0.0.1`). Das gilt für jede Weiterleitung, und die Verbindung geht an die geprüfte Adresse. Auf einem eigenen Agent im internen Netz wird die Prüfung so keine Sonde für interne Dienste.
 
 ### Plan und Apply
 
@@ -899,7 +915,7 @@ Beispiel: Ein Projekt verteilt seine Erweiterung bisher mit einer eigenen Pipeli
 3. Resource Group `rg-seed-intune` (leer) und Reader darauf
 4. Service Connection `sc-seed-intune` und Federated Credential
 5. Checks „Branch control“ und „Required template“ (vorhandene mit anderen Werten werden aktualisiert)
-6. Environment `seed-intune` mit Freigabe durch `-Approvers` (Pflicht)
+6. Environment `seed-intune` mit Freigabe durch `-Approvers` (Pflicht); wer den Lauf gestartet hat, gibt nicht selbst frei, außer mit `-RequesterCanApprove`. Ein erneuter Lauf gleicht eine vorhandene Freigabe an (bis v0.18 durfte die startende Person freigeben).
 7. Repo `seed-tenant`; ohne `main` mit dem Startinhalt aus [`tenant/`](tenant/) (leere Registerdatei, `azure-pipelines.yml`, README). Ein vorhandenes Repo bleibt unverändert; geprüft wird nur, dass `azure-pipelines.yml` das Template auf `-SeedPipelinesVersion` einbindet.
 8. Pipeline `seed-intune`, berechtigt für Service Connection, Environment und GitHub-Service-Connection
 9. Branch-Policies auf `main`: Build-Validierung und `-MinimumReviewers` (Standard 1)
@@ -927,6 +943,8 @@ Neue Projekte bekommen die Versionen, die hier als Standard stehen. Vor jedem Ta
 - die Beispiele in dieser README.
 
 Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`. Für `seed-tenant` erst `Initialize-SeedIntune.ps1` mit dem neuen Tag ausführen, dann `ref` per Pull Request anheben (siehe Intune).
+
+Die Prüfung „Required template“ an den Deployment-Service-Connections kennt nur die Tags, die sie nennt. Vor dem Merge jedes Pull Requests, der ein Projekt oder `seed-scaffold` auf den neuen Tag hebt, den Tag dort ergänzen: `Initialize-SeedTenant.ps1` mit der neuen `-SeedPipelinesVersion` bzw. `Initialize-SeedProject.ps1` mit `-RequiredTemplateRefs <alt>,<neu>` (siehe [Versionswechsel mit Required template](#tenant-onboarding)). Sonst scheitert der erste Lauf auf `main` an der Prüfung. Alte Tags danach mit `-RequiredTemplateRefs <neu>` entfernen.
 
 ## Sicherheit
 
