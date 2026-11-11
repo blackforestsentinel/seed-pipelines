@@ -30,8 +30,11 @@ steps:
         /^[^[:space:]#]/ { in_features = ($1 == "features:"); next }
         in_features && $1 ~ /^[A-Za-z0-9_]+:$/ && tolower($2) ~ /^(true|false)$/ {
           name = $1; sub(/:$/, "", name); print name, tolower($2)
-        }' "${{ parameters.projectDir }}/project.yaml")
+        }' "$SEED_PROJECT_DIR/project.yaml")
     displayName: Features aus project.yaml
+    # Parameter über die Umgebung statt als Text im Skript (wie in web-app.yml)
+    env:
+      SEED_PROJECT_DIR: ${{ parameters.projectDir }}
 
   - bash: |
       set -euo pipefail
@@ -60,7 +63,7 @@ steps:
       clean "$body"
       echo
 
-      if [ "${{ lower(parameters.frontend) }}" = true ]; then
+      if [ "$SEED_FRONTEND" = true ]; then
         # CORS-Preflight wie aus dem Browser: Der Ursprung des Frontends ist erlaubt, ein fremder nicht.
         # Mit Wiederholungen: Direkt nach dem Deploy startet die Function teils noch eine weitere
         # Instanz; ein Aufruf lief dabei schon einmal 10 Sekunden ohne Antwort ab, obwohl der
@@ -85,6 +88,8 @@ steps:
         echo "CORS: $frontend erlaubt, fremde Ursprünge nicht."
       fi
     displayName: Smoke-Test API
+    env:
+      SEED_FRONTEND: ${{ lower(parameters.frontend) }}
 
   # Mit sso muss eine Function ohne [AllowAnonymous] ein Token verlangen. Fehlt etwa
   # UseSeedAuth() in Program.cs, wäre die API sonst offen, während das Frontend anmeldet.

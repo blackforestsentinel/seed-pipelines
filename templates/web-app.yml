@@ -235,27 +235,33 @@ stages:
                 path: s
                 displayName: Projekt auschecken
 
+          # Parameter kommen über env: in die Skripte, nicht als ${{ }} in den Skripttext: Ein Wert mit
+          # Anführungszeichen, $( oder Zeilenumbruch würde sonst zu Shell-Code. Das gilt in allen
+          # Schritten dieses Templates; in displayName, condition und Task-Eingaben bleibt ${{ }}.
           - bash: |
               set -euo pipefail
               # Text aus dem Repo nur bereinigt ins Log: Der Agent führt ##vso[...] in jeder Zeile aus,
               # und ein Zeilenumbruch im Wert begänne eine neue.
               clean() { printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/##vso\[/##vso_[/g'; }
               actual="$(grep -E '^project:' project.yaml | awk '{print $2}' | tr -d "\"'")"
-              if [ "$actual" != "${{ parameters.project }}" ]; then
-                echo "##vso[task.logissue type=error]project.yaml nennt '$(clean "$actual")', die Pipeline '${{ parameters.project }}'."
+              if [ "$actual" != "$SEED_PROJECT" ]; then
+                echo "##vso[task.logissue type=error]project.yaml nennt '$(clean "$actual")', die Pipeline '$(clean "$SEED_PROJECT")'."
                 exit 1
               fi
               # hosting.staticWebApp: none gehört zu frontend: false und umgekehrt.
               static_web_app="$(awk '/^[[:space:]]+staticWebApp:/ { gsub(/["\047]/, "", $2); print tolower($2) }' project.yaml)"
-              if [ "$static_web_app" = none ] && [ "${{ lower(parameters.frontend) }}" = true ]; then
+              if [ "$static_web_app" = none ] && [ "$SEED_FRONTEND" = true ]; then
                 echo "##vso[task.logissue type=error]project.yaml hat hosting.staticWebApp: none, die Pipeline aber nicht frontend: false."
                 exit 1
               fi
-              if [ "$static_web_app" != none ] && [ "${{ lower(parameters.frontend) }}" = false ]; then
+              if [ "$static_web_app" != none ] && [ "$SEED_FRONTEND" = false ]; then
                 echo "##vso[task.logissue type=error]Die Pipeline hat frontend: false, project.yaml aber nicht hosting.staticWebApp: none."
                 exit 1
               fi
             displayName: project.yaml abgleichen
+            env:
+              SEED_PROJECT: ${{ parameters.project }}
+              SEED_FRONTEND: ${{ lower(parameters.frontend) }}
           # Warnung, wenn Template-Ref, Modul-Refs oder Seed-Pakete hinter dem neuesten Release liegen
           - template: steps/seed-versions.yml
             parameters:
@@ -308,7 +314,7 @@ stages:
           # Audit-Warnungen NU1901–NU1904 sonst schon hier zu Fehlern, ohne Rücksicht auf die Ausnahmen.
           - bash: |
               set -uo pipefail
-              timeout --kill-after=30 600 dotnet restore ${{ parameters.apiSolution }} -p:NuGetAudit=false
+              timeout --kill-after=30 600 dotnet restore "$SEED_API_SOLUTION" -p:NuGetAudit=false
               code=$?
               # 124: timeout, 137: nach weiteren 30 s hart beendet
               if [ "$code" = 124 ] || [ "$code" = 137 ]; then
@@ -316,6 +322,8 @@ stages:
               fi
               exit "$code"
             displayName: dotnet restore
+            env:
+              SEED_API_SOLUTION: ${{ parameters.apiSolution }}
           # TODO(onboarding) in project.yaml, Formatierung, Pakete (Vorabversionen, Lücken, veraltete);
           # vor dem Build, weil schnell und ohne Build möglich.
           - template: steps/dotnet-checks.yml
@@ -337,15 +345,20 @@ stages:
           # Eigener Build, weil dotnet test (Microsoft.Testing.Platform) -warnaserror an die Tests gäbe
           # statt an MSBuild. Welche Warnungen trotzdem Warnungen bleiben und warum: README, Prüfungen
           # im Build; dotnet publish nutzt dieselbe Liste.
+          # Der Schalter für -warnaserror ist fester Text des Templates, kein Wert aus einem Parameter.
           - script: >-
-              dotnet build ${{ parameters.apiSolution }} --configuration Release --no-restore
+              dotnet build "$SEED_API_SOLUTION" --configuration Release --no-restore
               ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
             displayName: dotnet build
-          - script: dotnet test --solution ${{ parameters.apiSolution }} --configuration Release --no-build
+            env:
+              SEED_API_SOLUTION: ${{ parameters.apiSolution }}
+          - script: dotnet test --solution "$SEED_API_SOLUTION" --configuration Release --no-build
             displayName: dotnet test
+            env:
+              SEED_API_SOLUTION: ${{ parameters.apiSolution }}
           - ${{ if not(or(eq(variables['Build.Reason'], 'PullRequest'), parameters.validationOnly)) }}:
               - script: >
-                  dotnet publish ${{ parameters.apiProject }}
+                  dotnet publish "$SEED_API_PROJECT"
                   --configuration Release
                   --no-restore
                   --output $(Build.ArtifactStagingDirectory)/api
@@ -353,6 +366,8 @@ stages:
                   -p:SeedOpenApiPublishDir=$(Build.ArtifactStagingDirectory)/openapi
                   ${{ iif(eq(parameters.treatWarningsAsErrors, true), '-warnaserror -warnNotAsError:NU1603,NU1608,NU1801,NU1900,NU1901,NU1902,NU1903,NU1904,NU1905,MSB3026', '') }}
                 displayName: dotnet publish
+                env:
+                  SEED_API_PROJECT: ${{ parameters.apiProject }}
               - task: ArchiveFiles@2
                 displayName: Paket packen
                 inputs:
@@ -454,11 +469,12 @@ stages:
                       if missing:
                           fail(f"extension.signing.environments nennt {missing}, die Pipeline hat nur " + ", ".join(environments) + ". Ohne passende Umgebung signiert sie nie.")
                       print("Signieren und veröffentlichen in " + ", ".join(wanted) + f": {package}-<version>.crx, ID {extension_id}, Secure File {secure_file}")
-                  ' "${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}/manifest.json" \
-                    "${{ coalesce(parameters.extension.name, parameters.project) }}"
+                  ' "$SEED_MANIFEST" "$SEED_PACKAGE"
                 displayName: Manifest der Erweiterung prüfen
-                ${{ if parameters.extension.signing }}:
-                  env:
+                env:
+                  SEED_MANIFEST: ${{ parameters.extension.path }}/${{ coalesce(parameters.extension.outputPath, 'dist') }}/manifest.json
+                  SEED_PACKAGE: ${{ coalesce(parameters.extension.name, parameters.project) }}
+                  ${{ if parameters.extension.signing }}:
                     SEED_EXTENSION_SIGNING: ${{ convertToJson(parameters.extension.signing) }}
                     SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
 
@@ -509,12 +525,19 @@ stages:
                       terraformState: ${{ parameters.terraformState }}
                       stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                       outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
+                      # Werte für das Skript; Storage Account und Container des States setzt
+                      # steps/terraform.yml selbst (SEED_TF_STATE_*).
+                      env:
+                        SEED_PROJECT: ${{ parameters.project }}
+                        SEED_ENVIRONMENT: ${{ env.name }}
+                        SEED_CONFIRM_DATA_DELETION: ${{ lower(parameters.confirmDataDeletion) }}
+                        SEED_PROTECTED_TYPES: ${{ join(',', parameters.protectedResourceTypes) }}
                       script: |
                         # Nur in einem Lauf mit confirmDataDeletion; Projekte ohne die Variable
                         # ignorieren sie (TF_VAR_ für unbekannte Variablen ist kein Fehler).
-                        export TF_VAR_allow_data_deletion=${{ lower(parameters.confirmDataDeletion) }}
+                        export TF_VAR_allow_data_deletion="$SEED_CONFIRM_DATA_DELETION"
                         set +e
-                        terraform plan -var "environment=${{ env.name }}" -out=tfplan -detailed-exitcode
+                        terraform plan -var "environment=$SEED_ENVIRONMENT" -out=tfplan -detailed-exitcode
                         code=$?
                         set -e
                         case "$code" in
@@ -545,9 +568,9 @@ stages:
                         for r in json.load(sys.stdin).get("resource_changes", []):
                             if r["type"] in protected and "delete" in r["change"]["actions"]:
                                 print(r["address"])
-                        ' "${{ join(',', parameters.protectedResourceTypes) }}")
+                        ' "$SEED_PROTECTED_TYPES")
                         if [ -n "$deletions" ]; then
-                          if [ "${{ lower(parameters.confirmDataDeletion) }}" = true ]; then
+                          if [ "$SEED_CONFIRM_DATA_DELETION" = true ]; then
                             while read -r address; do
                               echo "##vso[task.logissue type=warning]Bestätigt: Der Plan löscht oder ersetzt $address."
                             done <<< "$deletions"
@@ -567,24 +590,24 @@ stages:
                         # abgelaufen), räumt der nächste Plan nach 31 Tagen ab.
                         if [ "$changes" = true ]; then
                           az storage blob upload --auth-mode login --only-show-errors -o none \
-                            --account-name "${{ parameters.terraformState.storageAccount }}" \
-                            --container-name "${{ parameters.terraformState.container }}" \
-                            --name "plans/${{ parameters.project }}/${{ env.name }}/$(Build.BuildId).tfplan" \
+                            --account-name "$SEED_TF_STATE_STORAGE_ACCOUNT" \
+                            --container-name "$SEED_TF_STATE_CONTAINER" \
+                            --name "plans/$SEED_PROJECT/$SEED_ENVIRONMENT/$(Build.BuildId).tfplan" \
                             --file tfplan --overwrite
                         fi
                         rm -f tfplan
                         # Zeitstempel im Format von az (2026-01-31T12:00:00+00:00), als Text vergleichbar
                         cutoff="$(date -u -d '31 days ago' +%Y-%m-%dT%H:%M:%S+00:00)"
                         az storage blob list --auth-mode login --only-show-errors \
-                          --account-name "${{ parameters.terraformState.storageAccount }}" \
-                          --container-name "${{ parameters.terraformState.container }}" \
-                          --prefix "plans/${{ parameters.project }}/${{ env.name }}/" \
+                          --account-name "$SEED_TF_STATE_STORAGE_ACCOUNT" \
+                          --container-name "$SEED_TF_STATE_CONTAINER" \
+                          --prefix "plans/$SEED_PROJECT/$SEED_ENVIRONMENT/" \
                           --query "[].[name, properties.lastModified]" -o tsv |
                           while read -r old modified; do
                             if [[ "$modified" < "$cutoff" ]]; then
                               az storage blob delete --auth-mode login --only-show-errors -o none \
-                                --account-name "${{ parameters.terraformState.storageAccount }}" \
-                                --container-name "${{ parameters.terraformState.container }}" --name "$old"
+                                --account-name "$SEED_TF_STATE_STORAGE_ACCOUNT" \
+                                --container-name "$SEED_TF_STATE_CONTAINER" --name "$old"
                             fi
                           done
                         echo "##vso[task.setvariable variable=changes;isOutput=true]$changes"
@@ -658,13 +681,16 @@ stages:
                             terraformState: ${{ parameters.terraformState }}
                             stateKey: ${{ parameters.project }}/${{ env.name }}.tfstate
                             outputsDir: $(Build.ArtifactStagingDirectory)/tfoutputs
+                            env:
+                              SEED_PROJECT: ${{ parameters.project }}
+                              SEED_ENVIRONMENT: ${{ env.name }}
                             script: |
                               # Der geprüfte Plan aus plan_<env>, abgelegt neben dem State (siehe dort)
-                              plan_blob="plans/${{ parameters.project }}/${{ env.name }}/$(Build.BuildId).tfplan"
+                              plan_blob="plans/$SEED_PROJECT/$SEED_ENVIRONMENT/$(Build.BuildId).tfplan"
                               plan="$(Agent.TempDirectory)/tfplan"
                               az storage blob download --auth-mode login --only-show-errors -o none \
-                                --account-name "${{ parameters.terraformState.storageAccount }}" \
-                                --container-name "${{ parameters.terraformState.container }}" \
+                                --account-name "$SEED_TF_STATE_STORAGE_ACCOUNT" \
+                                --container-name "$SEED_TF_STATE_CONTAINER" \
                                 --name "$plan_blob" --file "$plan"
                               if ! terraform apply "$plan" 2>&1 | tee apply.log; then
                                 if grep -q "Saved plan is stale" apply.log; then
@@ -674,8 +700,8 @@ stages:
                               fi
                               rm -f "$plan" apply.log
                               az storage blob delete --auth-mode login --only-show-errors -o none \
-                                --account-name "${{ parameters.terraformState.storageAccount }}" \
-                                --container-name "${{ parameters.terraformState.container }}" \
+                                --account-name "$SEED_TF_STATE_STORAGE_ACCOUNT" \
+                                --container-name "$SEED_TF_STATE_CONTAINER" \
                                 --name "$plan_blob"
                               mkdir -p "$(Build.ArtifactStagingDirectory)/tfoutputs"
                               cp "$(Build.SourcesDirectory)/project.yaml" "$(Build.ArtifactStagingDirectory)/tfoutputs/"
@@ -720,14 +746,14 @@ stages:
 
                         - bash: |
                             set -euo pipefail
-                            outputs="$(Pipeline.Workspace)/tfoutputs_${{ env.name }}/outputs.json"
+                            outputs="$(Pipeline.Workspace)/tfoutputs_$SEED_ENVIRONMENT/outputs.json"
                             output() {
                               python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$outputs" "$1"
                             }
                             for name in resource_group_name function_app_name function_app_url static_web_app_name static_web_app_url; do
                               echo "##vso[task.setvariable variable=tf_${name}]$(output "$name")"
                             done
-                            if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                            if [ "$SEED_FRONTEND" = true ]; then
                               if [ -z "$(output static_web_app_name)" ]; then
                                 echo "##vso[task.logissue type=error]Keine Static Web App im Terraform-Output. Für ein Projekt ohne Frontend frontend: false setzen."
                                 exit 1
@@ -754,6 +780,9 @@ stages:
                             displayName: Outputs, config.json und CSP
                           ${{ else }}:
                             displayName: Outputs
+                          env:
+                            SEED_ENVIRONMENT: ${{ env.name }}
+                            SEED_FRONTEND: ${{ lower(parameters.frontend) }}
 
                         # Function-Deploy über Kudu (/api/publish) mit Entra-Token; Basic Auth ist an
                         # der Function abgeschaltet. Kudu verarbeitet das Paket rund eine Minute lang,
@@ -765,6 +794,8 @@ stages:
                             displayName: Function-Deploy starten, Token der Static Web App
                           ${{ else }}:
                             displayName: Function-Deploy starten
+                          env:
+                            SEED_FRONTEND: ${{ lower(parameters.frontend) }}
                           inputs:
                             azureSubscription: ${{ coalesce(env.serviceConnection, parameters.serviceConnection) }}
                             scriptType: bash
@@ -795,7 +826,7 @@ stages:
                               fi
                               echo "##vso[task.setvariable variable=kudu_deployment]$id"
 
-                              if [ "${{ lower(parameters.frontend) }}" = true ]; then
+                              if [ "$SEED_FRONTEND" = true ]; then
                                 # Deployment-Token bei jedem Deploy neu: azurerm_static_web_app liest ihn mit in
                                 # den Terraform-State und in jeden Plan. Nach dem Zurücksetzen gelten diese
                                 # Kopien nicht mehr; der neue Token steht nur in der geheimen Variable.
