@@ -21,7 +21,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.14.0
+      ref: refs/tags/v0.19.0
       endpoint: github-blackforestsentinel
 
 extends:
@@ -631,7 +631,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 [`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal je Subscription und Azure-DevOps-Projekt alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
-git clone --branch v0.14.0 https://github.com/blackforestsentinel/seed-pipelines.git
+git clone --branch v0.19.0 https://github.com/blackforestsentinel/seed-pipelines.git
 cd seed-pipelines
 ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
   -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
@@ -834,7 +834,7 @@ resources:
     - repository: seed                    # Name fest: das Template checkt das Repo aus
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.14.0
+      ref: refs/tags/v0.19.0
       endpoint: github-blackforestsentinel
 
 extends:
