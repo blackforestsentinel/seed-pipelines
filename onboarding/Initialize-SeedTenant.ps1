@@ -17,10 +17,15 @@
       4. Terraform-State: Resource Group, Storage Account ohne Shared Key, Container;
          Storage Blob Data Contributor nur auf dem Container
       5. Azure DevOps: Service Connection per Workload Identity Federation, mit Branch-Prüfung:
-         nur Läufe von -AllowedBranches (Standard main) bekommen die Identität (nicht mit
-         -SkipScaffold, dort setzt sie Initialize-SeedProject.ps1 nach dem Umschalten); dazu
-         Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
-         Administrators und die Build-Service-Identitäten), außer mit -AllowTagCreation
+         nur Läufe von -AllowedBranches (Standard main) bekommen die Identität, und mit der
+         Prüfung „Required template“: nur Läufe, die templates/web-app.yml aus seed-pipelines an
+         einem erlaubten Tag einbinden (-RequiredTemplateRefs, Standard -SeedPipelinesVersion und
+         die Tags der berechtigten Pipelines; seed-scaffold mit templates/scaffold.yml). Beides
+         nicht mit -SkipScaffold, dort setzt es Initialize-SeedProject.ps1 nach dem Umschalten.
+         Dazu Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
+         Administrators und die Build-Service-Identitäten, danach für jede weitere Identität, der
+         es in den Zugriffslisten des Projekts und seiner Repos ausdrücklich erlaubt ist, außer den
+         Administratorengruppen), außer mit -AllowTagCreation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
       7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
          (entfällt mit -SkipScaffold). Mit -CentralScaffold als zentrales Scaffold für andere
@@ -80,6 +85,19 @@
     Projekte über einen Tag einbinden. Ein Tag v… in einem Projekt-Repo und ein Lauf darauf kämen
     deshalb ebenfalls durch: In den Repos des Azure-DevOps-Projekts dürfen deshalb nur
     Administratoren Tags anlegen (Schritt 5, README, Branch-Prüfung).
+
+.PARAMETER RequiredTemplateRefs
+    Refs von seed-pipelines, an denen Läufe templates/web-app.yml einbinden müssen (Prüfung
+    „Required template“ an der Azure-Service-Connection), etwa v0.19.0 oder refs/tags/v0.19.0;
+    mehrere erlaubt. Ohne Angabe: -SeedPipelinesVersion und die Tags, die die für die Service
+    Connection berechtigten Pipelines einbinden, zusätzlich zu den vorhandenen Einträgen. Mit
+    Angabe ersetzen genau diese Refs die Einträge für web-app.yml. Vor jedem Versionswechsel den
+    neuen Tag ergänzen (README, Release).
+
+.PARAMETER SkipRequiredTemplate
+    Prüfung „Required template“ nicht anlegen, etwa weil die Service Connection auch Pipelines
+    außerhalb von Seed dient. Dann kommt jede Pipeline-Datei auf einem erlaubten Branch an die
+    Deployment-Identität, auch ohne web-app.yml; das Skript warnt.
 
 .PARAMETER AllowTagCreation
     Tags im Azure-DevOps-Projekt nicht auf Administratoren beschränken, etwa weil andere Repos dort
@@ -147,6 +165,8 @@ param(
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [string[]] $RequiredTemplateRefs = @(),
+    [switch] $SkipRequiredTemplate,
     [switch] $AllowTagCreation,
     [string] $Pool = '',
     [switch] $SkipScaffold,
@@ -164,6 +184,10 @@ param(
 if ($CentralScaffold -and $SkipScaffold) {
     throw '-CentralScaffold und -SkipScaffold schließen sich aus.'
 }
+# v0.19.0 oder refs/tags/v0.19.0
+$RequiredTemplateRefs = @($RequiredTemplateRefs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+        ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/tags/$_" } })
+if ($PSBoundParameters.ContainsKey('RequiredTemplateRefs') -and -not $RequiredTemplateRefs) { throw 'RequiredTemplateRefs: mindestens ein Ref.' }
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
@@ -328,6 +352,96 @@ function Set-BranchControl([object] $Endpoint, [string] $ProjectId) {
     } | Out-Null
 }
 
+# Prüfung „Required template“ (ExtendsCheck) an einer Service Connection: Die Branch-Prüfung lässt
+# jede Pipeline-Datei auf main durch, auch eine, die die Service Connection direkt nutzt statt über
+# web-app.yml (etwa ein AzureCLI@2, der das Token ausgibt). Mit der Prüfung bekommen nur Läufe die
+# Identität, die ein Template aus seed-pipelines an einem erlaubten Tag per extends einbinden. Die
+# Tags sind unveränderlich; ein neuer kommt mit jedem Versionswechsel hinzu (README, Release).
+$RequiredTemplateCheckType = '4020e66e-b0f3-47e1-bc88-48f3cc59b5f3'
+$SeedPipelinesRepository = 'blackforestsentinel/seed-pipelines'
+$WebAppTemplate = 'templates/web-app.yml'
+$ScaffoldTemplate = 'templates/scaffold.yml'
+
+# Template und Tag von seed-pipelines, die eine Pipeline-Datei per extends einbindet, oder nichts.
+# Nur feste Tags vX.Y.Z der Repository-Ressource seed; einen Branch von seed-pipelines nimmt die
+# Prüfung nie von selbst auf.
+function Get-SeedTemplateUse([string] $Content) {
+    if (-not $Content -or -not $Content.Contains($SeedPipelinesRepository)) { return }
+    if ($Content -notmatch '(?m)^\s*template:\s*[''"]?(templates/[A-Za-z0-9._/-]+\.yml)@seed[''"]?\s*$') { return }
+    $template = $Matches[1]
+    # ref innerhalb des Eintrags "- repository: seed", vor dem nächsten Eintrag
+    if ($Content -notmatch '(?ms)^\s*-\s*repository:\s*seed\s*$(?:(?!^\s*-\s*repository:).)*?^\s*ref:\s*[''"]?(refs/tags/v\d+\.\d+\.\d+)[''"]?\s*$') { return }
+    [pscustomobject] @{ Template = $template; Ref = $Matches[1] }
+}
+
+# Für die Service Connection berechtigte Pipelines des Projekts und was sie aus seed-pipelines
+# einbinden (YAML-Datei auf ihrem Default-Branch). Nur lesend.
+function Find-SeedTemplateUses([string] $ProjectId, [string] $EndpointId) {
+    $api = "$Org/$ProjectId/_apis"
+    $permissions = Get-OrNull { Invoke-AzDevOps get "$api/pipelines/pipelinePermissions/endpoint/$($EndpointId)?api-version=7.1-preview.1" $null }
+    foreach ($entry in @($permissions.pipelines | Where-Object authorized)) {
+        $pipeline = Get-OrNull { Invoke-AzDevOps get "$api/build/definitions/$($entry.id)?api-version=7.1" $null }
+        if (-not $pipeline -or $pipeline.repository.type -ne 'TfsGit' -or -not $pipeline.process.yamlFilename) { continue }
+        $branchName = "$($pipeline.repository.defaultBranch)" -replace '^refs/heads/', ''
+        $content = Get-OrNull {
+            (Invoke-AzDevOps get "$api/git/repositories/$($pipeline.repository.id)/items?path=$([uri]::EscapeDataString($pipeline.process.yamlFilename))&versionDescriptor.version=$([uri]::EscapeDataString($branchName))&versionDescriptor.versionType=branch&includeContent=true&`$format=json&api-version=7.1" $null).content
+        }
+        $use = Get-SeedTemplateUse $content
+        if ($use) { [pscustomobject] @{ Pipeline = $pipeline.name; Template = $use.Template; Ref = $use.Ref } }
+    }
+}
+
+function New-TemplateEntry([string] $Template, [string] $Ref) {
+    [pscustomobject] @{ repositoryType = 'github'; repositoryName = $SeedPipelinesRepository; repositoryRef = $Ref; templatePath = $Template }
+}
+
+# Einträge der Prüfung als Text, sortiert und ohne Doppelte, zum Vergleichen und Anzeigen.
+function Format-TemplateEntries([object[]] $Entries) {
+    (@($Entries | Where-Object { $_ } | ForEach-Object {
+                $name = if ($_.repositoryName -eq $SeedPipelinesRepository) { '' } else { "$($_.repositoryType):$($_.repositoryName)/" }
+                "$name$($_.templatePath)@$($_.repositoryRef)"
+            }) | Sort-Object -Unique) -join ', '
+}
+
+# Legt die Prüfung an der Service Connection an oder gleicht sie an. Ohne -Replace kommen $Wanted zu
+# den vorhandenen Einträgen hinzu; mit -Replace ersetzen sie die Einträge für $Managed aus
+# seed-pipelines, alle übrigen Einträge bleiben.
+function Set-RequiredTemplate([object] $Endpoint, [string] $ProjectId, [object[]] $Wanted, [string[]] $Managed, [switch] $Replace) {
+    $checks = "$Org/$ProjectId/_apis/pipelines/checks/configurations"
+    $existing = (Invoke-AzDevOps get "$checks`?resourceType=endpoint&resourceId=$($Endpoint.id)&`$expand=settings&api-version=7.1-preview.1" $null).value |
+        Where-Object { $_.type.id -eq $RequiredTemplateCheckType } | Select-Object -First 1
+    $current = @($existing.settings.extendsChecks | Where-Object { $_ })
+    $keep = if ($Replace) { @($current | Where-Object { -not ($_.repositoryName -eq $SeedPipelinesRepository -and $_.templatePath -in $Managed) }) } else { $current }
+    $final = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($keep) + @($Wanted)) {
+        if ($entry -and $seen.Add("$($entry.repositoryType)|$($entry.repositoryName)|$($entry.templatePath)|$($entry.repositoryRef)")) { $final.Add($entry) }
+    }
+    $wantedText = Format-TemplateEntries $final
+    $title = "Required template an $($Endpoint.name): $wantedText"
+    $body = @{
+        type     = @{ id = $RequiredTemplateCheckType; name = 'ExtendsCheck' }
+        resource = @{ type = 'endpoint'; id = "$($Endpoint.id)"; name = $Endpoint.name }
+        settings = @{ extendsChecks = @($final) }
+        timeout  = 1440
+    }
+    $currentText = Format-TemplateEntries $current
+    if ($existing -and $currentText -ne $wantedText) {
+        if ($DryRun) {
+            Write-Host "  [alt]   $title (bisher $currentText)" -ForegroundColor Yellow
+            $missing.Add($title)
+            return
+        }
+        $body.id = $existing.id
+        Invoke-AzDevOps patch "$checks/$($existing.id)?api-version=7.1-preview.1" $body | Out-Null
+        Write-Host "  [neu]   $title (bisher $currentText)" -ForegroundColor Green
+        return
+    }
+    Invoke-Step $title { $existing } {
+        Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
+    } | Out-Null
+}
+
 # Tags nur für Administratoren: Die Branch-Prüfung lässt refs/tags/v* für jedes Repo des Laufs
 # durch. Wer sonst Tags anlegen könnte: Contributors, Build Administrators und die Job-Tokens der
 # Pipelines (Build-Service-Identitäten des Projekts und der Organisation).
@@ -366,6 +480,59 @@ function Set-TagDeny([string] $SecurityToken, [object[]] $Creators) {
                 token                = $SecurityToken
                 merge                = $true
                 accessControlEntries = @(@{ descriptor = $creator.Descriptor; allow = 0; deny = $CreateTagBit })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
+}
+
+# Weitere Identitäten mit "Create tag": Set-TagDeny trifft nur die vier Gruppen und Identitäten aus
+# Get-TagCreators. Wer das Recht im Projekt oder in einem seiner Repos ausdrücklich erlaubt hat, etwa
+# die Person, die ein Repo angelegt hat, oder eine eigene Gruppe, behielte es. Das Skript nennt jede
+# solche Identität und verbietet ihr "Create tag" dort, wo es erlaubt ist, außer im DryRun; die
+# übrigen Rechte des Eintrags bleiben. Ausgenommen sind die Administratorengruppen. Ein Deny gilt
+# auch für Administratoren, die die Identität selbst sind oder zu der Gruppe gehören.
+function Set-OtherTagDeny([object] $Project, [object[]] $Creators) {
+    $vssps = "https://vssps.dev.azure.com/$($Org.Split('/')[-1])"
+    $orgName = $Org.Split('/')[-1]
+    $projectToken = "repoV2/$($Project.id)"
+    # Projekt und Repos; Einträge für einzelne Branches (…/refs/…) betreffen keine Tags.
+    $acls = @((Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$GitNamespace`?token=$([uri]::EscapeDataString($projectToken))&recurse=true&api-version=7.1" $null).value |
+            Where-Object { $_.token -eq $projectToken -or $_.token -match "^$([regex]::Escape($projectToken))/[0-9a-fA-F-]{36}$" })
+    $handled = @($Creators | ForEach-Object Descriptor)
+    $allowed = @(foreach ($acl in $acls) {
+            foreach ($ace in @($acl.acesDictionary.PSObject.Properties.Value)) {
+                if (($ace.allow -band $CreateTagBit) -and -not ($ace.deny -band $CreateTagBit) -and $ace.descriptor -notin $handled) {
+                    [pscustomobject] @{ Token = $acl.token; Ace = $ace }
+                }
+            }
+        })
+    if (-not $allowed) {
+        Write-Host '  [ok]    Create tag für keine weitere Identität ausdrücklich erlaubt'
+        return
+    }
+    $descriptors = @($allowed | ForEach-Object { $_.Ace.descriptor } | Select-Object -Unique)
+    $names = @{}
+    foreach ($identity in (Invoke-AzDevOps get "$vssps/_apis/identities?descriptors=$(($descriptors | ForEach-Object { [uri]::EscapeDataString($_) }) -join ',')&api-version=7.1" $null).value) {
+        $names[$identity.descriptor] = if ($identity.customDisplayName) { $identity.customDisplayName } else { $identity.providerDisplayName }
+    }
+    $admins = @("[$($Project.name)]\Project Administrators", "[$orgName]\Project Collection Administrators", "[$orgName]\Project Collection Service Accounts")
+    $repoNames = @{}
+    (Invoke-AzDevOps get "$Org/$($Project.id)/_apis/git/repositories?api-version=7.1" $null).value | ForEach-Object { $repoNames[$_.id] = $_.name }
+    foreach ($item in $allowed) {
+        $name = if ($names[$item.Ace.descriptor]) { $names[$item.Ace.descriptor] } else { $item.Ace.descriptor }
+        $repoId = $item.Token.Split('/')[-1]
+        $scope = if ($item.Token -eq $projectToken) { "Projekt $($Project.name)" } else { "Repo $(if ($repoNames[$repoId]) { $repoNames[$repoId] } else { $repoId })" }
+        if ($name -in $admins) {
+            Write-Host "  [info]  Create tag bleibt für $name in $scope (Administratoren)"
+            continue
+        }
+        Invoke-Step "Create tag verboten für $name in $scope (ausdrücklich erlaubt)" { $false } {
+            # merge = false ersetzt nur den Eintrag dieser Identität; ihre übrigen Rechte bleiben.
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$GitNamespace`?api-version=7.1" @{
+                token                = $item.Token
+                merge                = $false
+                accessControlEntries = @(@{ descriptor = $item.Ace.descriptor; allow = [int] $item.Ace.allow -band -bnot $CreateTagBit; deny = [int] $item.Ace.deny -bor $CreateTagBit })
             } | Out-Null
             $true
         } | Out-Null
@@ -638,13 +805,39 @@ try {
         } | Out-Null
     }
     if ($SkipScaffold) {
-        Write-Host '          Branch-Prüfung folgt mit Initialize-SeedProject.ps1 nach dem Umschalten: bis dahin'
-        Write-Host '          testet die Migration auf einem eigenen Branch.'
+        Write-Host '          Branch-Prüfung und Required template folgen mit Initialize-SeedProject.ps1 nach dem'
+        Write-Host '          Umschalten: bis dahin testet die Migration auf einem eigenen Branch.'
     } elseif ($endpoint) {
         Set-BranchControl $endpoint $project.id
     } else {
         Write-Host "  [fehlt] Branch-Prüfung an $ServiceConnectionName" -ForegroundColor Yellow
         $missing.Add("Branch-Prüfung an $ServiceConnectionName")
+    }
+    # Required template: web-app.yml an den erlaubten Tags; seed-scaffold mit PAT nutzt dieselbe
+    # Service Connection über templates/scaffold.yml (das zentrale Scaffold hat eine eigene).
+    if ($SkipScaffold) {
+        # siehe oben
+    } elseif ($SkipRequiredTemplate) {
+        Write-Host '  [warn]  -SkipRequiredTemplate: Jede Pipeline-Datei auf einem erlaubten Branch bekommt die Deployment-Identität, auch ohne web-app.yml.' -ForegroundColor Yellow
+    } elseif (-not $endpoint) {
+        Write-Host "  [fehlt] Required template an $ServiceConnectionName" -ForegroundColor Yellow
+        $missing.Add("Required template an $ServiceConnectionName")
+    } else {
+        $explicitRefs = $PSBoundParameters.ContainsKey('RequiredTemplateRefs')
+        $uses = @(Find-SeedTemplateUses $project.id $endpoint.id)
+        $webAppUses = @($uses | Where-Object Template -eq $WebAppTemplate)
+        $refs = if ($explicitRefs) { $RequiredTemplateRefs }
+            else { @(@("refs/tags/$SeedPipelinesVersion") + @($webAppUses | ForEach-Object Ref)) | Sort-Object -Unique }
+        # Berechtigte Pipelines mit einem anderen Tag scheiterten an der Prüfung.
+        foreach ($use in $webAppUses | Where-Object { $_.Ref -notin $refs }) {
+            Write-Host "  [warn]  Pipeline $($use.Pipeline) bindet $WebAppTemplate auf $($use.Ref) ein, nicht in -RequiredTemplateRefs: Ihre Läufe scheitern an der Prüfung." -ForegroundColor Yellow
+        }
+        $wanted = @($refs | ForEach-Object { New-TemplateEntry $WebAppTemplate $_ })
+        if (-not $CentralScaffold) {
+            $scaffoldRefs = @(@("refs/tags/$SeedPipelinesVersion") + @($uses | Where-Object Template -eq $ScaffoldTemplate | ForEach-Object Ref)) | Sort-Object -Unique
+            $wanted += @($scaffoldRefs | ForEach-Object { New-TemplateEntry $ScaffoldTemplate $_ })
+        }
+        Set-RequiredTemplate $endpoint $project.id $wanted @($WebAppTemplate) -Replace:$explicitRefs
     }
     # Gilt für alle Repos des Projekts, auch für Projekte, die seed-scaffold später anlegt.
     if ($SkipScaffold) {
@@ -652,7 +845,9 @@ try {
     } elseif ($AllowTagCreation) {
         Write-Host "  [warn]  -AllowTagCreation: Wer in $($project.name) Tags anlegen darf, bekommt über einen Tag v… die Deployment-Identität." -ForegroundColor Yellow
     } else {
-        Set-TagDeny "repoV2/$($project.id)" @(Get-TagCreators $project)
+        $creators = @(Get-TagCreators $project)
+        Set-TagDeny "repoV2/$($project.id)" $creators
+        Set-OtherTagDeny $project $creators
     }
 
     # --- 6. GitHub-Service-Connection ------------------------------------------------------

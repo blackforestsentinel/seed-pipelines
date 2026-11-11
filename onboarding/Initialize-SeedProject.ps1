@@ -19,21 +19,31 @@
       5. Branch-Prüfung an der Azure-Service-Connection, nur Läufe von -AllowedBranches
          (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs (Standard
          refs/tags/v*) bekommen die Deployment-Identität
-         4 und 5 (Branch-Schutz) setzt das Skript standardmäßig, sobald die YAML-Datei auf dem
+      6. Prüfung „Required template“ (ExtendsCheck) an der Azure-Service-Connection: Nur Läufe,
+         die templates/web-app.yml aus blackforestsentinel/seed-pipelines an einem der erlaubten
+         Tags per extends einbinden, bekommen die Deployment-Identität. Erlaubt sind der Tag, den
+         die YAML-Datei auf dem Default-Branch nennt, und die Tags der übrigen für die Service
+         Connection berechtigten Pipelines; vorhandene Einträge bleiben. -RequiredTemplateRefs
+         ersetzt die Einträge für web-app.yml durch genau diese Refs.
+         4 bis 6 (Branch-Schutz) setzt das Skript standardmäßig, sobald die YAML-Datei auf dem
          Default-Branch web-app.yml ab v0.5.0 einbindet, also nach dem Umschalten. Vorher sperrten
          sie direkte Pushes und Testläufe der Migration; dann übergeht das Skript sie mit einem
          Hinweis, und ein erneuter Lauf nach dem Umschalten holt sie nach. -SkipBranchPolicy lässt
          sie ausdrücklich weg, -EnableBranchPolicy verlangt sie.
-      6. Tags im Repo nur für Administratoren: Deny "Create tag" für Contributors, Build
+      7. Tags im Repo nur für Administratoren: Deny "Create tag" für Contributors, Build
          Administrators und die Build-Service-Identitäten, weil die Branch-Prüfung refs/tags/v*
-         auch für das Projekt-Repo durchlässt (nicht mit -SkipBranchControl oder -AllowTagCreation)
+         auch für das Projekt-Repo durchlässt (nicht mit -SkipBranchControl oder -AllowTagCreation).
+         Danach liest das Skript die Zugriffslisten von Projekt und Repo und verbietet "Create tag"
+         auch jeder weiteren Identität, der es dort ausdrücklich erlaubt ist (etwa der Person, die
+         das Repo angelegt hat), außer den Administratorengruppen; im DryRun nennt es sie nur.
 
     Mit -Pool prüft das Skript außerdem die Agent-Queue und warnt, wenn sie ohne Freigabe oder
     Branch-Prüfung ist, allen Pipelines offensteht oder der Pool in jedes neue Projekt kommt.
 
-    Einstellungen wie in ado-project: Freigabe durch eine der genannten Personen, auch durch
-    die, die den Lauf gestartet hat, 30 Tage Zeit; Policy blockierend, Ergebnis 12 Stunden
-    gültig, neuer PR-Lauf nur bei Änderungen am PR.
+    Einstellungen wie in ado-project: Freigabe durch eine der genannten Personen, 30 Tage Zeit;
+    Policy blockierend, Ergebnis 12 Stunden gültig, neuer PR-Lauf nur bei Änderungen am PR. Wer
+    den Lauf gestartet hat, gibt seine Infrastruktur-Änderung nicht selbst frei (außer mit
+    -RequesterCanApprove); vorhandene Freigaben mit anderer Einstellung werden angeglichen.
 
     Vorher: Initialize-SeedTenant.ps1 mit -SkipScaffold für das Azure-DevOps-Projekt (Service
     Connections). Ausführen mit einem Konto, das Projektadministrator in Azure DevOps ist und
@@ -42,8 +52,8 @@
     Das zentrale Scaffold (templates/scaffold.yml, mode migrate und enableBranchPolicy) ruft das
     Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI, die
     Service Connections hat es vorher ins Projekt geteilt, und mit -SkipBranchControl bleibt die
-    Branch-Prüfung unberührt; sie hängt zentral an der geteilten Service Connection. Fehlen am
-    Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
+    Branch-Prüfung und Required template unberührt; sie hängen zentral an der geteilten Service
+    Connection. Fehlen am Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
 
 .PARAMETER SeedProjectName
     Projektname wie in project.yaml und im Parameter project von web-app.yml, Präfix der
@@ -60,8 +70,12 @@
     Gruppen der Organisation (Anzeigename), deren Mitglieder Infrastruktur-Änderungen ebenfalls
     freigeben, zusätzlich zu -Approvers.
 
+.PARAMETER RequesterCanApprove
+    Auch wer einen Lauf ausgelöst hat, darf dessen Infrastruktur-Änderung freigeben. Ohne den
+    Schalter darf er es nicht, und ein erneuter Lauf setzt das an vorhandenen Freigaben wieder.
+
 .PARAMETER RequesterCannotApprove
-    Wer einen Lauf ausgelöst hat, darf dessen Infrastruktur-Änderung nicht selbst freigeben.
+    Veraltet, das ist jetzt der Standard. Bleibt für ältere Aufrufe (templates/scaffold.yml).
 
 .PARAMETER AppApprovalEnvironments
     Umgebungen, in denen auch der App-Deploy eine Freigabe braucht, z. B. prod.
@@ -109,10 +123,23 @@
     Die Prüfung vergleicht jedes Repo des Laufs mit derselben Liste, auch das Template-Repo, das
     Projekte über einen Tag einbinden. Ein Tag v… im Projekt-Repo und ein Lauf darauf kämen
     deshalb ebenfalls durch: Im Projekt-Repo dürfen deshalb nur Administratoren Tags anlegen
-    (Schritt 6, README, Branch-Prüfung).
+    (Schritt 7, README, Branch-Prüfung).
+
+.PARAMETER RequiredTemplateRefs
+    Refs von seed-pipelines, an denen Läufe templates/web-app.yml einbinden müssen (Prüfung
+    „Required template“, Schritt 6), etwa v0.19.0 oder refs/tags/v0.19.0; mehrere erlaubt. Ohne
+    Angabe: der Tag aus der YAML-Datei auf dem Default-Branch und die Tags der übrigen berechtigten
+    Pipelines, zusätzlich zu den vorhandenen Einträgen. Mit Angabe ersetzen genau diese Refs die
+    Einträge für web-app.yml, etwa um alte Tags zu entfernen. Vor jedem Versionswechsel den neuen
+    Tag ergänzen (README, Release).
+
+.PARAMETER SkipRequiredTemplate
+    Prüfung „Required template“ nicht anlegen, etwa weil die Service Connection auch Pipelines
+    außerhalb von Seed dient. Dann kommt jede Pipeline-Datei auf einem erlaubten Branch an die
+    Deployment-Identität, auch ohne web-app.yml; das Skript warnt.
 
 .PARAMETER AllowTagCreation
-    Tags im Repo nicht auf Administratoren beschränken (Schritt 6 entfällt, mit Warnung). Dann
+    Tags im Repo nicht auf Administratoren beschränken (Schritt 7 entfällt, mit Warnung). Dann
     kann jede Person mit Schreibrecht über einen Tag v… die Deployment-Identität bekommen.
 
 .PARAMETER DryRun
@@ -132,6 +159,7 @@ param(
     [string[]] $Environments = @('dev'),
     [string[]] $Approvers = @(),
     [string[]] $ApproverGroups = @(),
+    [switch] $RequesterCanApprove,
     [switch] $RequesterCannotApprove,
     [string[]] $AppApprovalEnvironments = @(),
     [string] $ServiceConnectionName = 'sc-seed',
@@ -146,6 +174,8 @@ param(
     [switch] $SkipBranchControl,
     [string[]] $AllowedBranches = @(),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
+    [string[]] $RequiredTemplateRefs = @(),
+    [switch] $SkipRequiredTemplate,
     [switch] $AllowTagCreation,
     [switch] $DryRun
 )
@@ -171,6 +201,12 @@ if ($SeedProjectName -cnotmatch '^[a-z][a-z0-9-]{1,18}[a-z0-9]$') {
 }
 if (-not $Environments) { throw 'Environments: mindestens eine Umgebung.' }
 if ($EnableBranchPolicy -and $SkipBranchPolicy) { throw '-EnableBranchPolicy und -SkipBranchPolicy schließen sich aus.' }
+if ($RequesterCanApprove -and $RequesterCannotApprove) { throw '-RequesterCanApprove und -RequesterCannotApprove schließen sich aus.' }
+# Wer einen Lauf startet, gibt ihn standardmäßig nicht selbst frei.
+$RequesterCannot = -not $RequesterCanApprove
+# v0.19.0 oder refs/tags/v0.19.0
+$RequiredTemplateRefs = @(Split-List $RequiredTemplateRefs | ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/tags/$_" } })
+if ($PSBoundParameters.ContainsKey('RequiredTemplateRefs') -and -not $RequiredTemplateRefs) { throw 'RequiredTemplateRefs: mindestens ein Ref.' }
 # ado-project übergeht unbekannte Umgebungen; hier wäre das meist ein Tippfehler und die Freigabe fehlte.
 $unknown = $AppApprovalEnvironments | Where-Object { $_ -notin $Environments }
 if ($unknown) { throw "AppApprovalEnvironments: $($unknown -join ', ') steht nicht in Environments." }
@@ -188,6 +224,9 @@ $ApprovalCheckType = '8c6f20a7-a545-4486-9777-f762fafe0d4d'
 $BuildPolicyType = '0609b952-1397-4640-95ec-e00a01b2c241'
 $BranchControlCheckType = 'fe1de3ee-a436-41b4-bb20-f6eb4cb879a7'
 $BranchControlDefinition = '86b05a0c-73e6-4f7d-b3cf-e38f3b39a75b'
+$RequiredTemplateCheckType = '4020e66e-b0f3-47e1-bc88-48f3cc59b5f3'
+$SeedPipelinesRepository = 'blackforestsentinel/seed-pipelines'
+$WebAppTemplate = 'templates/web-app.yml'
 $GitNamespace = '2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87'
 $CreateTagBit = 32   # Recht "Create tag" (CreateTag) im Namespace Git Repositories
 $BranchRef = "refs/heads/$DefaultBranch"
@@ -310,6 +349,53 @@ function Set-TagDeny([string] $SecurityToken, [object[]] $Creators) {
     }
 }
 
+# Weitere Identitäten mit "Create tag": Set-TagDeny trifft nur die vier Gruppen und Identitäten aus
+# Get-TagCreators. Wer das Recht in einer Zugriffsliste auf $Tokens ausdrücklich erlaubt hat, etwa
+# die Person, die das Repo angelegt hat, oder eine eigene Gruppe, behielte es. Das Skript nennt jede
+# solche Identität und verbietet ihr "Create tag" auf $DenyToken, außer im DryRun; die übrigen Rechte
+# des Eintrags bleiben. Ausgenommen sind die Administratorengruppen. Ein Deny gilt auch für
+# Administratoren, die die Identität selbst sind oder zu der Gruppe gehören.
+function Set-OtherTagDeny([string[]] $Tokens, [string] $DenyToken, [object[]] $Creators) {
+    $acls = @(foreach ($securityToken in $Tokens) {
+            (Invoke-AzDevOps get "$Org/_apis/accesscontrollists/$GitNamespace`?token=$([uri]::EscapeDataString($securityToken))&api-version=7.1").value
+        })
+    $handled = @($Creators | ForEach-Object Descriptor)
+    $allowed = @(foreach ($acl in $acls) {
+            foreach ($ace in @($acl.acesDictionary.PSObject.Properties.Value)) {
+                if (($ace.allow -band $CreateTagBit) -and -not ($ace.deny -band $CreateTagBit) -and $ace.descriptor -notin $handled) { $ace.descriptor }
+            }
+        }) | Select-Object -Unique
+    if (-not $allowed) {
+        Write-Host '  [ok]    Create tag für keine weitere Identität ausdrücklich erlaubt'
+        return
+    }
+    $names = @{}
+    foreach ($identity in (Invoke-AzDevOps get "$Identities`?descriptors=$(($allowed | ForEach-Object { [uri]::EscapeDataString($_) }) -join ',')&api-version=7.1").value) {
+        $names[$identity.descriptor] = if ($identity.customDisplayName) { $identity.customDisplayName } else { $identity.providerDisplayName }
+    }
+    $admins = @("[$($project.name)]\Project Administrators", "[$orgName]\Project Collection Administrators", "[$orgName]\Project Collection Service Accounts")
+    $current = (@($acls | Where-Object token -eq $DenyToken))[0].acesDictionary
+    foreach ($descriptor in $allowed) {
+        $name = if ($names[$descriptor]) { $names[$descriptor] } else { $descriptor }
+        if ($name -in $admins) {
+            Write-Host "  [info]  Create tag bleibt für $name (Administratoren)"
+            continue
+        }
+        $ace = @($current.PSObject.Properties.Value | Where-Object descriptor -eq $descriptor)[0]
+        Invoke-Step "Create tag verboten für $name (ausdrücklich erlaubt)" {
+            $ace -and ($ace.deny -band $CreateTagBit)
+        } {
+            # merge = false ersetzt nur den Eintrag dieser Identität; ihre übrigen Rechte bleiben.
+            Invoke-AzDevOps post "$Org/_apis/accesscontrolentries/$GitNamespace`?api-version=7.1" @{
+                token                = $DenyToken
+                merge                = $false
+                accessControlEntries = @(@{ descriptor = $descriptor; allow = [int] $ace.allow -band -bnot $CreateTagBit; deny = [int] $ace.deny -bor $CreateTagBit })
+            } | Out-Null
+            $true
+        } | Out-Null
+    }
+}
+
 # Wie die Vorbedingung in ado-project: PR-Läufe ohne Deploy kennt web-app.yml erst ab
 # seed-pipelines v0.5.0; Branches (Tests) gelten als neu. Liefert den Grund oder nichts.
 function Test-SeedYaml([string] $Content) {
@@ -319,6 +405,85 @@ function Test-SeedYaml([string] $Content) {
         $version = [version]::new([int] $Matches[1], [int] $Matches[2], [int] $Matches[3])
         if ($version -lt [version] '0.5.0') { return "seed-pipelines v$version, PR-Läufe ohne Deploy erst ab v0.5.0" }
     }
+}
+
+# Template und Tag von seed-pipelines, die eine Pipeline-Datei per extends einbindet, oder nichts.
+# Nur feste Tags vX.Y.Z der Repository-Ressource seed; einen Branch von seed-pipelines nimmt die
+# Prüfung „Required template“ nie von selbst auf.
+function Get-SeedTemplateUse([string] $Content) {
+    if (-not $Content -or -not $Content.Contains($SeedPipelinesRepository)) { return }
+    if ($Content -notmatch '(?m)^\s*template:\s*[''"]?(templates/[A-Za-z0-9._/-]+\.yml)@seed[''"]?\s*$') { return }
+    $template = $Matches[1]
+    # ref innerhalb des Eintrags "- repository: seed", vor dem nächsten Eintrag
+    if ($Content -notmatch '(?ms)^\s*-\s*repository:\s*seed\s*$(?:(?!^\s*-\s*repository:).)*?^\s*ref:\s*[''"]?(refs/tags/v\d+\.\d+\.\d+)[''"]?\s*$') { return }
+    [pscustomobject] @{ Template = $template; Ref = $Matches[1] }
+}
+
+# Für die Service Connection berechtigte Pipelines dieses Projekts und was sie aus seed-pipelines
+# einbinden (YAML-Datei auf ihrem Default-Branch). Nur lesend.
+function Find-SeedTemplateUses([string] $EndpointId) {
+    $permissions = Get-OrNull { Invoke-AzDevOps get "$api/pipelines/pipelinePermissions/endpoint/$($EndpointId)?api-version=7.1-preview.1" }
+    foreach ($entry in @($permissions.pipelines | Where-Object authorized)) {
+        $pipeline = Get-OrNull { Invoke-AzDevOps get "$api/build/definitions/$($entry.id)?api-version=7.1" }
+        if (-not $pipeline -or $pipeline.repository.type -ne 'TfsGit' -or -not $pipeline.process.yamlFilename) { continue }
+        $branchName = "$($pipeline.repository.defaultBranch)" -replace '^refs/heads/', ''
+        $content = Get-OrNull {
+            (Invoke-AzDevOps get "$api/git/repositories/$($pipeline.repository.id)/items?path=$([uri]::EscapeDataString($pipeline.process.yamlFilename))&versionDescriptor.version=$([uri]::EscapeDataString($branchName))&versionDescriptor.versionType=branch&includeContent=true&`$format=json&api-version=7.1").content
+        }
+        $use = Get-SeedTemplateUse $content
+        if ($use) { [pscustomobject] @{ Pipeline = $pipeline.name; Template = $use.Template; Ref = $use.Ref } }
+    }
+}
+
+function New-TemplateEntry([string] $Template, [string] $Ref) {
+    [pscustomobject] @{ repositoryType = 'github'; repositoryName = $SeedPipelinesRepository; repositoryRef = $Ref; templatePath = $Template }
+}
+
+# Einträge der Prüfung als Text, sortiert und ohne Doppelte, zum Vergleichen und Anzeigen.
+function Format-TemplateEntries([object[]] $Entries) {
+    (@($Entries | Where-Object { $_ } | ForEach-Object {
+                $name = if ($_.repositoryName -eq $SeedPipelinesRepository) { '' } else { "$($_.repositoryType):$($_.repositoryName)/" }
+                "$name$($_.templatePath)@$($_.repositoryRef)"
+            }) | Sort-Object -Unique) -join ', '
+}
+
+# Legt die Prüfung „Required template“ an der Service Connection an oder gleicht sie an. Ohne
+# -Replace kommen $Wanted zu den vorhandenen Einträgen hinzu; mit -Replace ersetzen sie die Einträge
+# für $Managed aus seed-pipelines, alle übrigen Einträge bleiben.
+function Set-RequiredTemplate([object] $Endpoint, [object[]] $Wanted, [string[]] $Managed, [switch] $Replace) {
+    $checks = "$api/pipelines/checks/configurations"
+    $existing = (Invoke-AzDevOps get "$checks`?resourceType=endpoint&resourceId=$($Endpoint.id)&`$expand=settings&api-version=7.1-preview.1").value |
+        Where-Object { $_.type.id -eq $RequiredTemplateCheckType } | Select-Object -First 1
+    $current = @($existing.settings.extendsChecks | Where-Object { $_ })
+    $keep = if ($Replace) { @($current | Where-Object { -not ($_.repositoryName -eq $SeedPipelinesRepository -and $_.templatePath -in $Managed) }) } else { $current }
+    $final = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($keep) + @($Wanted)) {
+        if ($entry -and $seen.Add("$($entry.repositoryType)|$($entry.repositoryName)|$($entry.templatePath)|$($entry.repositoryRef)")) { $final.Add($entry) }
+    }
+    $wantedText = Format-TemplateEntries $final
+    $title = "Required template an $($Endpoint.name): $wantedText"
+    $body = @{
+        type     = @{ id = $RequiredTemplateCheckType; name = 'ExtendsCheck' }
+        resource = @{ type = 'endpoint'; id = "$($Endpoint.id)"; name = $Endpoint.name }
+        settings = @{ extendsChecks = @($final) }
+        timeout  = 1440
+    }
+    $currentText = Format-TemplateEntries $current
+    if ($existing -and $currentText -ne $wantedText) {
+        if ($DryRun) {
+            Write-Host "  [alt]   $title (bisher $currentText)" -ForegroundColor Yellow
+            $missing.Add($title)
+            return
+        }
+        $body.id = $existing.id
+        Invoke-AzDevOps patch "$checks/$($existing.id)?api-version=7.1-preview.1" $body | Out-Null
+        Write-Host "  [neu]   $title (bisher $currentText)" -ForegroundColor Green
+        return
+    }
+    Invoke-Step $title { $existing } {
+        Invoke-AzDevOps post "$checks`?api-version=7.1-preview.1" $body
+    } | Out-Null
 }
 
 try {
@@ -363,12 +528,26 @@ try {
         }
         $environmentIds[$spec.Name] = if ($environment) { $environment.id }
         if (-not $spec.Approval) { continue }
-        Invoke-Step "Freigabe an $($spec.Name)" {
-            if ($environment) {
-                (Invoke-AzDevOps get "$api/pipelines/checks/configurations?resourceType=environment&resourceId=$($environment.id)&api-version=7.1-preview.1").value |
-                    Where-Object { $_.type.id -eq $ApprovalCheckType }
+        $approval = if ($environment) {
+            (Invoke-AzDevOps get "$api/pipelines/checks/configurations?resourceType=environment&resourceId=$($environment.id)&`$expand=settings&api-version=7.1-preview.1").value |
+                Where-Object { $_.type.id -eq $ApprovalCheckType } | Select-Object -First 1
+        }
+        $approvalTitle = "Freigabe an $($spec.Name)$(if ($RequesterCannot) { ', nicht durch die startende Person' } else { ', auch durch die startende Person' })"
+        if ($approval -and [bool] $approval.settings.requesterCannotBeApprover -ne $RequesterCannot) {
+            # Nur diese Einstellung ändert sich; Freigebende und Zeit bleiben, wie sie sind.
+            if ($DryRun) {
+                Write-Host "  [alt]   $approvalTitle" -ForegroundColor Yellow
+                $missing.Add($approvalTitle)
+            } else {
+                $approval.settings | Add-Member -NotePropertyName requesterCannotBeApprover -NotePropertyValue $RequesterCannot -Force
+                Invoke-AzDevOps patch "$api/pipelines/checks/configurations/$($approval.id)?api-version=7.1-preview.1" @{
+                    id = $approval.id; type = $approval.type; resource = $approval.resource; settings = $approval.settings; timeout = $approval.timeout
+                } | Out-Null
+                Write-Host "  [neu]   $approvalTitle" -ForegroundColor Green
             }
-        } {
+            continue
+        }
+        Invoke-Step $approvalTitle { $approval } {
             Invoke-AzDevOps post "$api/pipelines/checks/configurations?api-version=7.1-preview.1" @{
                 type     = @{ id = $ApprovalCheckType; name = 'Approval' }
                 resource = @{ type = 'environment'; id = "$($environment.id)"; name = $environment.name }
@@ -376,7 +555,7 @@ try {
                     approvers                 = @($approverIds | ForEach-Object { @{ id = $_ } })
                     executionOrder            = 'anyOrder'
                     minRequiredApprovers      = 1
-                    requesterCannotBeApprover = [bool] $RequesterCannotApprove
+                    requesterCannotBeApprover = $RequesterCannot
                     instructions              = 'Plan im Log der Stage Plan prüfen, dann freigeben.'
                     blockedApprovers          = @()
                 }
@@ -631,17 +810,52 @@ try {
         }
     }
 
-    # --- 6. Tags ----------------------------------------------------------------------------
+    # --- 6. Required template ------------------------------------------------------------------
+    # Die Branch-Prüfung lässt jede Pipeline-Datei auf main an die Service Connection, auch eine,
+    # die sie direkt nutzt statt über web-app.yml (etwa ein AzureCLI@2, der das Token ausgibt). Die
+    # Prüfung „Required template“ lässt nur Läufe durch, die web-app.yml aus seed-pipelines an einem
+    # erlaubten Tag einbinden. Die Tags sind unveränderlich; ein neuer Tag kommt mit jedem
+    # Versionswechsel hinzu (README, Release). Wie die Branch-Prüfung erst nach dem Umschalten.
+    Write-Host '6. Required template an der Azure-Service-Connection'
+    $ownUse = Get-SeedTemplateUse $yaml
+    $requiredTitle = "Required template an ${ServiceConnectionName}"
+    if ($SkipBranchControl) {
+        Write-Host '          entfällt (-SkipBranchControl): Sie hängt zentral an der Service Connection.'
+    } elseif ($SkipRequiredTemplate) {
+        Write-Host "  [warn]  -SkipRequiredTemplate: Jede Pipeline-Datei auf einem erlaubten Branch bekommt die Deployment-Identität, auch ohne web-app.yml." -ForegroundColor Yellow
+    } elseif (-not $protectBranch) {
+        Write-Host "          $protectSkipped"
+    } elseif (-not $azure) {
+        Write-Missing $requiredTitle 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.'
+    } else {
+        $explicitRefs = $PSBoundParameters.ContainsKey('RequiredTemplateRefs')
+        $uses = @(Find-SeedTemplateUses $azure.id | Where-Object Template -eq $WebAppTemplate)
+        $refs = if ($explicitRefs) { $RequiredTemplateRefs }
+            else { @(@($(if ($ownUse.Template -eq $WebAppTemplate) { $ownUse.Ref })) + @($uses | ForEach-Object Ref)) | Where-Object { $_ } | Sort-Object -Unique }
+        # Berechtigte Pipelines mit einem anderen Tag scheiterten an der Prüfung.
+        foreach ($use in $uses | Where-Object { $_.Ref -notin $refs }) {
+            Write-Host "  [warn]  Pipeline $($use.Pipeline) bindet $WebAppTemplate auf $($use.Ref) ein, nicht in -RequiredTemplateRefs: Ihre Läufe scheitern an der Prüfung." -ForegroundColor Yellow
+        }
+        if (-not $refs) {
+            Write-Missing $requiredTitle "$YamlPath auf $DefaultBranch bindet $WebAppTemplate nicht über einen Tag vX.Y.Z von seed-pipelines ein; die Refs mit -RequiredTemplateRefs angeben."
+        } else {
+            Set-RequiredTemplate $azure @($refs | ForEach-Object { New-TemplateEntry $WebAppTemplate $_ }) @($WebAppTemplate) -Replace:$explicitRefs
+        }
+    }
+
+    # --- 7. Tags ----------------------------------------------------------------------------
     # Die Branch-Prüfung erlaubt refs/tags/v* für jedes Repo des Laufs, weil Projekte
     # seed-pipelines über einen Tag einbinden. Ein Tag v… im Projekt-Repo, von einer Person oder
     # per Job-Token einer Pipeline angelegt, bekäme sonst die Deployment-Identität, ohne Review.
-    Write-Host '6. Tags im Repo nur für Administratoren'
+    Write-Host '7. Tags im Repo nur für Administratoren'
     if ($SkipBranchControl) {
         Write-Host '          entfällt (-SkipBranchControl): zentral sperrt Grant-SeedScaffoldAccess.ps1 Tags im ganzen Projekt.'
     } elseif ($AllowTagCreation) {
         Write-Host "  [warn]  -AllowTagCreation: Wer in $($repo.name) Tags anlegen darf, bekommt über einen Tag v… die Deployment-Identität." -ForegroundColor Yellow
     } else {
-        Set-TagDeny "repoV2/$($project.id)/$($repo.id)" @(Get-TagCreators)
+        $creators = @(Get-TagCreators)
+        Set-TagDeny "repoV2/$($project.id)/$($repo.id)" $creators
+        Set-OtherTagDeny @("repoV2/$($project.id)", "repoV2/$($project.id)/$($repo.id)") "repoV2/$($project.id)/$($repo.id)" $creators
     }
 
     # --- Ergebnis ---------------------------------------------------------------------------
