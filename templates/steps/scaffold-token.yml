@@ -1,0 +1,32 @@
+# Token für Azure DevOps in die geheime Variable seedAzdoToken des Jobs (seed-scaffold).
+#   jobToken          das Job-Token, also die Build-Service-Identität des zentralen Projekts
+#   servicePrincipal  ein Entra-Token der Scaffold-Identität über ihre Service Connection; die
+#                     Identität ist in Azure DevOps Benutzer mit Zugriffsstufe Basic
+# Schritte reichen das Token als SEED_AZDO_TOKEN an scripts/scaffold/scaffold.py,
+# Initialize-SeedProject.ps1 und git weiter. Ein Entra-Token gilt etwa eine Stunde; der Schritt
+# steht deshalb vor jedem längeren Abschnitt erneut.
+parameters:
+  - name: azureDevOpsAuth
+    type: string
+  - name: serviceConnection
+    type: string
+
+steps:
+  - ${{ if eq(parameters.azureDevOpsAuth, 'servicePrincipal') }}:
+      - task: AzureCLI@2
+        displayName: Token für Azure DevOps (Scaffold-Identität)
+        inputs:
+          azureSubscription: ${{ parameters.serviceConnection }}
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            token="$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)"
+            echo "##vso[task.setvariable variable=seedAzdoToken;issecret=true]$token"
+  - ${{ else }}:
+      - bash: |
+          set -euo pipefail
+          echo "##vso[task.setvariable variable=seedAzdoToken;issecret=true]$SYSTEM_ACCESSTOKEN"
+        displayName: Token für Azure DevOps (Job-Token)
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)

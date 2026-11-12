@@ -4,6 +4,12 @@
     Sentinel Seed: zentrales Scaffold in einem Azure-DevOps-Projekt freischalten (einmal je Projekt).
 
 .DESCRIPTION
+    Optional, ab v0.20.0: Der einfache Weg ist ein Klick eines Projektadmins (Project settings,
+    Permissions, Project Administrators, Mitglied "<zentrales Projekt> Build Service (<org>)"
+    hinzufügen; README, Scaffold). Dieses Skript ist die engere Variante: eigene Gruppe mit genau
+    den Rechten unten. Projekte, die das Scaffold selbst anlegt (createProject), brauchen beides
+    nicht.
+
     Das zentrale Scaffold (seed-scaffold mit -CentralScaffold aus Initialize-SeedTenant.ps1) legt
     Seed-Projekte mit seinem Job-Token an. Dahinter steht die Build-Service-Identität des
     zentralen Projekts, etwa "Sentinel-Seed Build Service (org)". Sie braucht keine Lizenz, aber
@@ -13,21 +19,28 @@
       1. Gruppe "Sentinel Seed Scaffold" im Projekt, Mitglied: die Build-Service-Identität;
          Recht View project-level information (ohne es sieht ein Token aus einem anderen
          Projekt hier gar nichts)
-      2. Git (alle Repos des Projekts): Read, Contribute, Create branch, Edit policies
+      2. Git (alle Repos des Projekts): Read, Contribute, Create branch, Edit policies, Manage
+         permissions (Git-Rechte des Seed-Repos aus ado-project: Deny Create tag, Force push,
+         Bypass policies, Edit policies für Contributors und Build Service)
       3. Pipelines (alle des Projekts): View, Create und Edit build pipeline, Queue builds;
          Agent-Queues des Projekts: Rolle User (eine neue Pipeline-Definition braucht "Use" an
          ihrer Standard-Queue)
       4. Environments: Rolle Creator (wer ein Environment anlegt, wird dessen Administrator)
-      5. Service Connections: Rolle Creator (nötig, um Service Connections ins Projekt zu teilen;
-         wer teilt, wird dort Administrator der Service Connection)
+      5. Service Connections: Rolle Creator (nötig, um die Service Connection sc-<name> des
+         Projekts anzulegen und die GitHub-Service-Connection ins Projekt zu teilen; wer anlegt
+         oder teilt, wird dort Administrator und darf die neue Pipeline berechtigen)
+    Mitglieder aufnehmen (contributors, projectAdministrators des Scaffolds) kann die Gruppe nicht;
+    in vorhandenen Projekten ist die startende Person schon Contributor (das prüft das Scaffold),
+    Projektadministratoren nimmt dort ein Projektadmin auf.
       6. Mit -AllowContributorsToCreateRepositories: Contributors dürfen Repos anlegen. Für neue
          Seed-Projekte legt die Person das Repo selbst an; das Scaffold darf es nicht.
       7. Mit -AgentPool: die Gruppe wird Administrator der Agent-Queue, damit das Scaffold neue
          Pipelines für einen eigenen Pool berechtigen kann
       8. Tags im Projekt nur für Administratoren: Deny "Create tag" für Contributors, Build
          Administrators und die Build-Service-Identitäten (nicht mit -AllowTagCreation). Die
-         Branch-Prüfung der geteilten Service Connection lässt refs/tags/v* für jedes Repo des Laufs
-         durch; ein Tag v… im Repo eines Seed-Projekts bekäme sonst die Deployment-Identität.
+         Branch-Prüfung lässt Tags von seed-pipelines für jedes Repo des Laufs durch; ein solcher
+         Tag im Repo eines Seed-Projekts bekäme sonst dessen Identität (bei Projekten bis v0.19.0
+         die geteilte Deployment-Identität).
 
     Repos legt die Identität nicht an, und sie sieht nur die Repos, die ein Lauf des Scaffolds
     auscheckt ("Protect access to repositories in YAML pipelines"). Weitere Rechte, etwa
@@ -222,8 +235,8 @@ if ($group) {
     Set-Allow 'View project-level information' $ProjectNamespace "`$PROJECT:vstfs:///Classification/TeamProject/$($project.id)" $groupIdentity `
         (Get-ActionBits $ProjectNamespace @('GENERIC_READ'))
     Write-Host '2. Git'
-    Set-Allow 'Read, Contribute, Create branch, Edit policies' $GitNamespace "repoV2/$($project.id)" $groupIdentity `
-        (Get-ActionBits $GitNamespace @('GenericRead', 'GenericContribute', 'CreateBranch', 'EditPolicies'))
+    Set-Allow 'Read, Contribute, Create branch, Edit policies, Manage permissions' $GitNamespace "repoV2/$($project.id)" $groupIdentity `
+        (Get-ActionBits $GitNamespace @('GenericRead', 'GenericContribute', 'CreateBranch', 'EditPolicies', 'ManagePermissions'))
     Write-Host '3. Pipelines'
     Set-Allow 'View, Create und Edit build pipeline, Queue builds' $BuildNamespace $project.id $groupIdentity `
         (Get-ActionBits $BuildNamespace @('ViewBuilds', 'ViewBuildDefinition', 'CreateBuildDefinition', 'EditBuildDefinition', 'QueueBuilds'))

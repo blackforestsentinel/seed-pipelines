@@ -1,16 +1,13 @@
 # Schreibt die Terraform-Konfiguration für seed-scaffold: das Modul seed-terraform//ado-project
-# und die Werte als JSON, nicht als HCL-Text, damit Sonderzeichen nichts aufbrechen.
-# adoProject darf ein Makro wie $(System.TeamProject) sein, aber nie eine Eingabe der startenden
-# Person: Makros landen als Text im Skript.
+# (ab v0.20.0) und die Werte als JSON, nicht als HCL-Text, damit Sonderzeichen nichts aufbrechen.
+# Werte, die erst der Lauf kennt (Name des Zielprojekts aus der API, Projektidentität aus dem
+# Schritt identity, startende Person), kommen über die Umgebung dazu, nie als Text im Skript.
+#
+# Das Modul legt die Service Connection sc-<name> per Workload Identity Federation für die
+# Projektidentität an, mit Branch-Prüfung und Required template, dazu Environments mit Freigaben,
+# Pipeline, Branch-Policies und Git-Rechte. Die Pipeline berechtigt es nicht für die Service
+# Connections: Das macht scaffold.py run erst nach verify.
 parameters:
-  - name: adoProject
-    type: string
-  - name: createRepository
-    type: boolean
-  - name: repository
-    type: string
-  - name: authorizeServiceConnections
-    type: boolean
   - name: name
     type: string
   - name: sso
@@ -27,14 +24,10 @@ parameters:
     type: object
   - name: approverGroups
     type: object
-  - name: requesterCanApprove
-    type: boolean
   - name: minReviewers
     type: number
   - name: appApprovalEnvironments
     type: object
-  - name: serviceConnection
-    type: string
   - name: githubConnection
     type: string
   - name: terraformState
@@ -42,6 +35,10 @@ parameters:
   - name: pipelinesVersion
     type: string
   - name: projectPool
+    type: string
+  - name: projectAdministrators
+    type: object
+  - name: templateUrl
     type: string
   - name: terraformModuleVersion
     type: string
@@ -72,8 +69,10 @@ steps:
         source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
 
         ado_project                   = var.project.ado_project
+        create_project                = var.project.create_project
         create_repository             = var.project.create_repository
         repository                    = var.project.repository
+        template_url                  = var.project.template_url
         authorize_service_connections = var.project.authorize_service_connections
         name                          = var.project.name
         features                      = var.project.features
@@ -84,39 +83,69 @@ steps:
         requester_can_approve         = var.project.requester_can_approve
         min_reviewers                 = var.project.min_reviewers
         app_approval_environments     = var.project.app_approval_environments
+        create_service_connection     = var.project.create_service_connection
         service_connection            = var.project.service_connection
+        service_connection_identity   = var.project.service_connection_identity
+        required_template_repository  = var.project.required_template_repository
         github_connection             = var.project.github_connection
+        contributors                  = var.project.contributors
+        project_administrators        = var.project.project_administrators
+        create_resource_groups        = var.project.create_resource_groups
         terraform_state               = var.project.terraform_state
         pipelines_version             = var.project.pipelines_version
         pool                          = var.project.pool
       }
 
-      output "repository_web_url" {
-        value = module.project.repository_web_url
+      output "project_id" {
+        value = module.project.project_id
+      }
+
+      output "repository_url" {
+        value = module.project.repository_url
       }
 
       output "pipeline_id" {
         value = module.project.pipeline_id
       }
+
+      output "environments" {
+        value = module.project.environments
+      }
+
+      output "service_connection_id" {
+        value = module.project.service_connection_id
+      }
+
+      output "workload_identity_federation_issuer" {
+        value = module.project.workload_identity_federation_issuer
+      }
+
+      output "workload_identity_federation_subject" {
+        value = module.project.workload_identity_federation_subject
+      }
       EOF
-      cat > "$dir/terraform.tfvars.json" <<'EOF'
+      cat > "$dir/static.json" <<'EOF'
       {
         "project": {
-          "ado_project": ${{ convertToJson(parameters.adoProject) }},
-          "create_repository": ${{ lower(parameters.createRepository) }},
-          "repository": ${{ convertToJson(parameters.repository) }},
-          "authorize_service_connections": ${{ lower(parameters.authorizeServiceConnections) }},
+          "create_project": false,
+          "create_repository": false,
+          "template_url": ${{ convertToJson(parameters.templateUrl) }},
+          "authorize_service_connections": false,
           "name": ${{ convertToJson(parameters.name) }},
           "features": { "sso": ${{ lower(parameters.sso) }}, "mcp": ${{ lower(parameters.mcp) }}, "storage": ${{ lower(parameters.storage) }} },
           "frontend": ${{ lower(parameters.frontend) }},
           "environments": ${{ convertToJson(parameters.environments) }},
           "approvers": ${{ convertToJson(parameters.approvers) }},
           "approver_groups": ${{ convertToJson(parameters.approverGroups) }},
-          "requester_can_approve": ${{ lower(parameters.requesterCanApprove) }},
+          "requester_can_approve": false,
           "min_reviewers": ${{ parameters.minReviewers }},
           "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
-          "service_connection": ${{ convertToJson(parameters.serviceConnection) }},
+          "create_service_connection": true,
+          "service_connection": ${{ convertToJson(format('sc-{0}', parameters.name)) }},
+          "required_template_repository": "blackforestsentinel/seed-pipelines",
           "github_connection": ${{ convertToJson(parameters.githubConnection) }},
+          "project_administrators": ${{ convertToJson(parameters.projectAdministrators) }},
+          "create_resource_groups": false,
           "terraform_state": {
             "resource_group": ${{ convertToJson(parameters.terraformState.resourceGroup) }},
             "storage_account": ${{ convertToJson(parameters.terraformState.storageAccount) }},
@@ -127,6 +156,60 @@ steps:
         }
       }
       EOF
-      sed -i 's/^      //' "$dir/main.tf" "$dir/terraform.tfvars.json"
-      python3 -m json.tool "$dir/terraform.tfvars.json"
+      sed -i 's/^      //' "$dir/main.tf" "$dir/static.json"
+      python3 - "$dir/static.json" "$dir/terraform.tfvars.json" <<'PY'
+      # scaffold-tfvars
+      """Laufzeitwerte aus der Umgebung in die Terraform-Werte von seed-scaffold."""
+      import json
+      import os
+      import sys
+
+      IDENTITY = {
+          "tenant_id": "SEED_TENANT_ID",
+          "subscription_id": "SEED_SUBSCRIPTION_ID",
+          "subscription_name": "SEED_SUBSCRIPTION_NAME",
+          "client_id": "SEED_IDENTITY_CLIENT_ID",
+      }
+
+
+      def value(env, name):
+          text = env.get(name, "")
+          # Eine nicht gesetzte Pipeline-Variable bleibt als "$(name)" stehen.
+          return "" if text.startswith("$(") else text
+
+
+      def merge(static, env):
+          project = dict(static["project"])
+          missing = [name for name in ("SEED_PROJECT_NAME", "SEED_REPOSITORY", *IDENTITY.values()) if not value(env, name)]
+          if missing:
+              raise ValueError("Es fehlen Werte aus früheren Schritten: " + ", ".join(missing))
+          project["ado_project"] = value(env, "SEED_PROJECT_NAME")
+          project["repository"] = value(env, "SEED_REPOSITORY")
+          project["service_connection_identity"] = {key: value(env, name) for key, name in IDENTITY.items()}
+          # Die startende Person wird Contributor im Projekt, nicht Administrator.
+          email = value(env, "SEED_REQUESTER_EMAIL")
+          project["contributors"] = [email] if "@" in email else []
+          return {"project": project}
+
+
+      if __name__ == "__main__":
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              static = json.load(handle)
+          try:
+              result = merge(static, os.environ)
+          except ValueError as error:
+              print(f"##vso[task.logissue type=error]{error}")
+              sys.exit(1)
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              json.dump(result, handle, indent=2)
+          print(json.dumps(result, indent=2))
+      PY
     displayName: Terraform-Konfiguration schreiben
+    env:
+      SEED_PROJECT_NAME: $(seedProjectName)
+      SEED_REPOSITORY: $(seedRepository)
+      SEED_TENANT_ID: $(seedTenantId)
+      SEED_SUBSCRIPTION_ID: $(seedSubscriptionId)
+      SEED_SUBSCRIPTION_NAME: $(seedSubscriptionName)
+      SEED_IDENTITY_CLIENT_ID: $(seedIdentityClientId)
+      SEED_REQUESTER_EMAIL: $(Build.RequestedForEmail)
