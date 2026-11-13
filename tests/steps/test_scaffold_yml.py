@@ -41,7 +41,7 @@ class OrderTests(unittest.TestCase):
         self.assertIn('"authorize_service_connections": false', config)
         self.assertIn('"create_project": false', config)
         self.assertIn('"create_service_connection": true', config)
-        self.assertIn('"requester_can_approve": false', config)
+        self.assertIn('"requester_can_approve": ${{ lower(parameters.requesterCanApprove) }}', config)
         self.assertIn('"create_resource_groups": false', config)
 
     def test_zielrepo_nur_referenziert(self):
@@ -55,7 +55,7 @@ class OrderTests(unittest.TestCase):
         self.assertNotIn("SeedScaffoldPat", SCAFFOLD)
 
     def test_versionen(self):
-        for name, version in (("terraformModuleVersion", "v0.20.0"), ("pipelinesVersion", "v0.20.0"), ("templateRef", "v0.19.0")):
+        for name, version in (("terraformModuleVersion", "v0.20.0"), ("pipelinesVersion", "v0.21.0"), ("templateRef", "v0.19.0")):
             with self.subTest(name=name):
                 self.assertIn(f"  - name: {name}\n    type: string\n    default: {version}\n", SCAFFOLD)
 

@@ -24,6 +24,8 @@ parameters:
     type: object
   - name: approverGroups
     type: object
+  - name: requesterCanApprove
+    type: boolean
   - name: minReviewers
     type: number
   - name: appApprovalEnvironments
@@ -137,7 +139,7 @@ steps:
           "environments": ${{ convertToJson(parameters.environments) }},
           "approvers": ${{ convertToJson(parameters.approvers) }},
           "approver_groups": ${{ convertToJson(parameters.approverGroups) }},
-          "requester_can_approve": false,
+          "requester_can_approve": ${{ lower(parameters.requesterCanApprove) }},
           "min_reviewers": ${{ parameters.minReviewers }},
           "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
           "create_service_connection": true,

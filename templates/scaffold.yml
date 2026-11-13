@@ -67,19 +67,20 @@ parameters:
   - name: approvers
     type: object
     default: []
-  # Gruppen der Organisation (Name), deren Mitglieder ebenfalls freigeben; zentral eine feste
-  # Pflichtgruppe.
+  # Gruppen der Organisation (Name), deren Mitglieder ebenfalls freigeben; zentral optional eine
+  # feste Gruppe (Onboarding -ApproverGroups).
   - name: approverGroups
     type: object
     default: []
-  # Ab v0.20.0 immer false: Niemand gibt die Infrastruktur seines eigenen Laufs frei.
+  # Darf die startende Person die Infrastruktur ihres eigenen Laufs freigeben? Standard ja
+  # (Einzelpersonen); Teams setzen false und nennen approvers oder approverGroups.
   - name: requesterCanApprove
     type: boolean
-    default: false
-  # Pflicht-Reviewer für Pull Requests auf main, ohne die eigene Stimme; 0: keine.
+    default: true
+  # Pflicht-Reviewer für Pull Requests auf main, ohne die eigene Stimme; 0 (Standard): keine.
   - name: minReviewers
     type: number
-    default: 1
+    default: 0
   # Umgebungen, in denen auch der App-Deploy eine Freigabe braucht.
   - name: appApprovalEnvironments
     type: object
@@ -159,7 +160,7 @@ parameters:
     default: v0.20.0
   - name: pipelinesVersion
     type: string
-    default: v0.20.0
+    default: v0.21.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
@@ -210,11 +211,6 @@ stages:
                   echo "##vso[task.logissue type=error]azureDevOpsAuth pat gibt es ab v0.20.0 nicht mehr: jobToken (Standard) oder servicePrincipal, siehe README, Scaffold, Umstieg."
                   exit 1
                 displayName: Anmeldung prüfen
-          - ${{ if parameters.requesterCanApprove }}:
-              - bash: |
-                  echo "##vso[task.logissue type=error]requesterCanApprove: ab v0.20.0 immer false; niemand gibt die Infrastruktur seines eigenen Laufs frei."
-                  exit 1
-                displayName: Freigaben prüfen
           - ${{ if eq(coalesce(parameters.scaffoldServiceConnection, parameters.stateServiceConnection), '') }}:
               - bash: |
                   echo "##vso[task.logissue type=error]scaffoldServiceConnection fehlt: Service Connection der Scaffold-Identität (onboarding/Initialize-SeedTenant.ps1 -CentralScaffold)."
@@ -383,6 +379,7 @@ stages:
                       environments: ${{ parameters.environments }}
                       approvers: ${{ parameters.approvers }}
                       approverGroups: ${{ parameters.approverGroups }}
+                      requesterCanApprove: ${{ parameters.requesterCanApprove }}
                       minReviewers: ${{ parameters.minReviewers }}
                       appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
                       githubConnection: ${{ parameters.githubConnection }}
@@ -557,6 +554,7 @@ stages:
                       # Branch-Prüfung und Required template hat scaffold.py connection gesetzt.
                       SkipBranchControl       = $true
                   }
+                  if ($env:SEED_REQUESTER_CAN_APPROVE -eq 'true') { $arguments.RequesterCanApprove = $true }
                   if ($env:SEED_MODE -eq 'enableBranchPolicy') { $arguments.EnableBranchPolicy = $true }
                   if ($env:SEED_DRY_RUN -eq 'true') { $arguments.DryRun = $true }
                   & "$(Pipeline.Workspace)/seed/onboarding/Initialize-SeedProject.ps1" @arguments
@@ -574,5 +572,6 @@ stages:
                   SEED_APP_APPROVAL_ENVIRONMENTS: ${{ convertToJson(parameters.appApprovalEnvironments) }}
                   SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
                   SEED_MIN_REVIEWERS: ${{ parameters.minReviewers }}
+                  SEED_REQUESTER_CAN_APPROVE: ${{ lower(parameters.requesterCanApprove) }}
                   SEED_PROJECT_POOL: ${{ parameters.projectPool }}
                   SEED_DRY_RUN: ${{ lower(parameters.dryRun) }}
