@@ -139,8 +139,9 @@
     Nur mit -CentralScaffold: Tag von seed-template, das neue Projekte bekommen, Standard v0.19.0.
 
 .PARAMETER AllowedProjects
-    Nur mit -CentralScaffold: regulärer Ausdruck für erlaubte Zielprojekte, auch für neue
-    Azure-DevOps-Projekte (createProject); leer: alle.
+    Nur mit -CentralScaffold: regulärer Ausdruck, den der ganze Name eines Zielprojekts
+    erfüllen muss (etwa 'Apps-.+', nicht nur '^Apps-'), auch für neue Azure-DevOps-Projekte
+    (createProject); leer: alle.
 
 .PARAMETER MemberGroup
     Nur mit -CentralScaffold: Gruppe im Zielprojekt, in der die startende Person Mitglied sein

@@ -136,8 +136,9 @@ parameters:
   - name: dryRun
     type: boolean
     default: false
-  # Erlaubte Zielprojekte (regulärer Ausdruck, auch für neue Projekte; leer: alle) und die Gruppe
-  # im Zielprojekt, in der die startende Person Mitglied sein muss.
+  # Erlaubte Zielprojekte (regulärer Ausdruck für den ganzen Projektnamen, etwa 'Apps-.+', auch
+  # für neue Projekte; leer: alle) und die Gruppe im Zielprojekt, in der die startende Person
+  # Mitglied sein muss.
   - name: allowedProjects
     type: string
     default: ''
