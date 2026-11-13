@@ -148,12 +148,18 @@
 
 .PARAMETER ApproverGroups
     Nur mit -CentralScaffold: Gruppen der Organisation, deren Mitglieder Infrastruktur-Änderungen
-    jedes Projekts freigeben. Die auslösende Person gibt nie selbst frei (requesterCanApprove:
-    false). Ohne Gruppe geben nur die Personen frei, die sie beim Start einträgt; trägt sie
-    niemanden ein, hat das neue Projekt keine Freigabe. Das Skript warnt deshalb.
+    jedes Projekts freigeben, zusätzlich zu den Personen, die die startende Person beim Start
+    einträgt (approvers). Ohne Gruppe und ohne Personen hat ein Projekt keine Freigabe; das
+    Skript weist darauf hin.
+
+.PARAMETER RequesterCanApprove
+    Nur mit -CentralScaffold: Standardwert beim Start, ob die startende Person die Infrastruktur
+    ihres eigenen Laufs freigeben darf. Standard $true (Einzelpersonen); Teams setzen
+    -RequesterCanApprove:$false und nennen -ApproverGroups. Beim Start je Projekt änderbar.
 
 .PARAMETER MinReviewers
-    Nur mit -CentralScaffold: Pflicht-Reviewer für Pull Requests auf main, Standard 1.
+    Nur mit -CentralScaffold: Standardwert beim Start für Pflicht-Reviewer auf Pull Requests nach
+    main (die eigene Stimme zählt nicht), Standard 0. Beim Start je Projekt änderbar.
 
 .PARAMETER ProjectPool
     Nur mit -CentralScaffold: Agent-Pool, den neue Projekte in azure-pipelines.yml bekommen.
@@ -184,7 +190,7 @@ param(
     [string] $StateStorageAccount = '',
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
-    [string] $SeedPipelinesVersion = 'v0.20.0',
+    [string] $SeedPipelinesVersion = 'v0.21.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
@@ -199,7 +205,8 @@ param(
     [string] $AllowedProjects = '',
     [string] $MemberGroup = 'Contributors',
     [string[]] $ApproverGroups = @(),
-    [ValidateRange(0, 10)] [int] $MinReviewers = 1,
+    [bool] $RequesterCanApprove = $true,
+    [ValidateRange(0, 10)] [int] $MinReviewers = 0,
     [string] $ProjectPool = '',
     [ValidateSet('jobToken', 'servicePrincipal')] [string] $AzureDevOpsAuth = 'jobToken',
     [string] $IdentityResourceGroup = 'rg-seed-identities',
@@ -1121,13 +1128,14 @@ try {
             Invoke-Step 'azure-pipelines.yml in seed-scaffold' {
                 (Invoke-AzDevOps get "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/refs?filter=heads/main&api-version=7.1" $null).count -gt 0
             } {
-                # Zentral steht requesterCanApprove fest auf false (central-pipelines.yml), auch ohne
-                # Freigabe-Gruppe; ohne sie warnt das Skript unten.
+                # requesterCanApprove und minReviewers sind Standardwerte beim Start, je Projekt
+                # änderbar; ohne Freigabe-Gruppe weist das Skript unten darauf hin.
                 $content = (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'central-pipelines.yml')).
                     Replace('__ALLOWED_PROJECTS__', $AllowedProjects.Replace("'", "''")).
                     Replace('__MEMBER_GROUP__', $MemberGroup.Replace("'", "''")).
                     Replace('__APPROVER_GROUPS__', (ConvertTo-YamlList $ApproverGroups)).
                     Replace('__PROJECT_ADMINISTRATORS__', (ConvertTo-YamlList $ProjectAdministrators)).
+                    Replace('__REQUESTER_CAN_APPROVE__', $RequesterCanApprove.ToString().ToLower()).
                     Replace('__MIN_REVIEWERS__', "$MinReviewers").
                     Replace('__AZURE_DEVOPS_AUTH__', $AzureDevOpsAuth).
                     Replace('__TEMPLATE_REF__', $TemplateRef).
@@ -1186,7 +1194,7 @@ try {
                     Where-Object { if ($pipeline) { $_.id -ne $pipeline.id } else { $_.name -ne 'seed-scaffold' } } | ForEach-Object name)
             $warnings = @(
                 if (-not $ApproverGroups) {
-                    'Ohne -ApproverGroups bestimmt die startende Person selbst, wer Infrastruktur-Änderungen ihres neuen Projekts freigibt (approvers); trägt sie niemanden ein, gibt es keine Freigabe. Sie selbst darf nicht freigeben (requesterCanApprove: false).'
+                    "Ohne -ApproverGroups bestimmt die startende Person selbst, wer Infrastruktur-Änderungen ihres neuen Projekts freigibt (approvers)$(if ($RequesterCanApprove) { ', sich selbst eingeschlossen (-RequesterCanApprove)' }); trägt sie niemanden ein, gibt es keine Freigabe."
                 }
                 if ($Pool) {
                     "-Pool $Pool für das zentrale Scaffold: Sein Job-Token erreicht alle freigeschalteten Projekte, und was ein Lauf auf einem eigenen Agent hinterlässt, trifft die folgenden. Empfohlen sind Microsoft-gehostete Agents."

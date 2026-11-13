@@ -47,9 +47,17 @@ parameters:
     type: object
     default: [dev]
   - name: approvers
-    displayName: Weitere Freigabe für Infrastruktur-Änderungen (E-Mail-Adressen)
+    displayName: Freigabe für Infrastruktur-Änderungen (E-Mail-Adressen; leer und ohne Gruppe = keine Freigabe)
     type: object
     default: []
+  - name: requesterCanApprove
+    displayName: Wer den Lauf startet, darf seine Infrastruktur-Änderungen selbst freigeben
+    type: boolean
+    default: __REQUESTER_CAN_APPROVE__
+  - name: minReviewers
+    displayName: Pflicht-Reviewer für Pull Requests auf main (eigene Stimme zählt nicht; 0 = keine)
+    type: number
+    default: __MIN_REVIEWERS__
   - name: appApprovalEnvironments
     displayName: Umgebungen, in denen auch der App-Deploy eine Freigabe braucht
     type: object
@@ -85,6 +93,8 @@ extends:
     frontend: ${{ parameters.frontend }}
     environments: ${{ parameters.environments }}
     approvers: ${{ parameters.approvers }}
+    requesterCanApprove: ${{ parameters.requesterCanApprove }}
+    minReviewers: ${{ parameters.minReviewers }}
     appApprovalEnvironments: ${{ parameters.appApprovalEnvironments }}
     startFirstRun: ${{ parameters.startFirstRun }}
     dryRun: ${{ parameters.dryRun }}
@@ -92,9 +102,6 @@ extends:
     allowedProjects: '__ALLOWED_PROJECTS__'
     memberGroup: '__MEMBER_GROUP__'
     approverGroups: __APPROVER_GROUPS__
-    # Niemand gibt die Infrastruktur seines eigenen Laufs frei, auch ohne approverGroups.
-    requesterCanApprove: false
-    minReviewers: __MIN_REVIEWERS__
     # Projektadministratoren neuer Projekte (Principal Names, E-Mail); Standard niemand aus dem Team.
     projectAdministrators: __PROJECT_ADMINISTRATORS__
     pipelinesVersion: __SEED_PIPELINES_VERSION__
