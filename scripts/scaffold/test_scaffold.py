@@ -756,8 +756,15 @@ class FakeAzure:
         if a[:2] == ["identity", "show"]:
             return ok(self.identity) if self.identity else missing
         if a[:2] == ["identity", "create"]:
-            self.identity = {"principalId": "pid", "clientId": "cid", "tags": {"seed:project": value("--name")[3:]}}
+            assert "--tags" not in a, a
+            self.identity = {"id": f"/subscriptions/s1/resourceGroups/{value('--resource-group')}/providers/"
+                                   f"Microsoft.ManagedIdentity/userAssignedIdentities/{value('--name')}",
+                             "principalId": "pid", "clientId": "cid", "tags": {}}
             return ok(self.identity)
+        if a[:2] == ["resource", "tag"]:
+            assert value("--ids") == self.identity["id"], a
+            self.identity["tags"] = dict(t.split("=", 1) for t in a[a.index("--tags") + 1:])
+            return ok()
         if a[:2] == ["group", "show"]:
             return ok(self.groups[value("--name")]) if value("--name") in self.groups else missing
         if a[:2] == ["group", "create"]:
@@ -821,6 +828,7 @@ class IdentityTest(unittest.TestCase):
         create = next(c for c in az.calls if c[:2] == ["identity", "create"])
         self.assertEqual((create[create.index("--name") + 1], create[create.index("--resource-group") + 1]),
                          ("id-kundenportal", "rg-seed-identities"))
+        self.assertEqual(az.identity["tags"], {"seed:project": "kundenportal", "seed:purpose": "project-identity"})
         self.assertEqual(sorted(az.groups), ["rg-kundenportal-dev", "rg-kundenportal-prod"])
         self.assertEqual(az.groups["rg-kundenportal-prod"]["tags"], {"seed:project": "kundenportal", "seed:environment": "prod"})
         roles = {(x["scope"].rsplit("/", 1)[-1], x["role"]) for x in az.assignments}

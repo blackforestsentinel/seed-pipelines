@@ -1127,9 +1127,13 @@ def run_identity(options: IdentityOptions, runner: Runner = az_runner, sleep: Ca
     elif options.dry_run:
         log(f"  [fehlt] Managed Identity {identity_name}")
     else:
+        # Tags getrennt: az identity create (Azure CLI ab 2.9x, Shorthand-Syntax) nimmt Tag-Namen mit
+        # Doppelpunkt nicht mehr an; az resource tag versteht sie weiter.
         identity = az.json("identity", "create", "--name", identity_name, "--resource-group", options.identity_resource_group,
-                           "--location", options.location, "--tags", f"seed:project={options.name}",
-                           "seed:purpose=project-identity")
+                           "--location", options.location)
+        az.run("resource", "tag", "--ids", identity["id"], "--tags", f"seed:project={options.name}",
+               "seed:purpose=project-identity")
+        identity["tags"] = {"seed:project": options.name, "seed:purpose": "project-identity"}
         log(f"  [neu]   Managed Identity {identity_name}")
 
     groups = []
