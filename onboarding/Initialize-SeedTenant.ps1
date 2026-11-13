@@ -20,23 +20,35 @@
          nur Läufe von -AllowedBranches (Standard main) bekommen die Identität, und mit der
          Prüfung „Required template“: nur Läufe, die templates/web-app.yml aus seed-pipelines an
          einem erlaubten Tag einbinden (-RequiredTemplateRefs, Standard -SeedPipelinesVersion und
-         die Tags der berechtigten Pipelines; seed-scaffold mit templates/scaffold.yml). Beides
-         nicht mit -SkipScaffold, dort setzt es Initialize-SeedProject.ps1 nach dem Umschalten.
+         die Tags der berechtigten Pipelines). Beides nicht mit -SkipScaffold, dort setzt es
+         Initialize-SeedProject.ps1 nach dem Umschalten.
          Dazu Tags im Projekt nur für Administratoren (Deny "Create tag" für Contributors, Build
          Administrators und die Build-Service-Identitäten, danach für jede weitere Identität, der
          es in den Zugriffslisten des Projekts und seiner Repos ausdrücklich erlaubt ist, außer den
          Administratorengruppen), außer mit -AllowTagCreation
       6. Azure DevOps: GitHub-Service-Connection für die Pipeline-Templates
-      7. Azure DevOps: Repo und Pipeline seed-scaffold zum Anlegen neuer Projekte
-         (entfällt mit -SkipScaffold). Mit -CentralScaffold als zentrales Scaffold für andere
-         Azure-DevOps-Projekte, ohne PAT: eigene Managed Identity nur für den State (Storage Blob
-         Data Contributor auf dem Container, per Bedingung nur für Blobs unter scaffold/; Reader
-         auf der Subscription) mit Service Connection, dazu für die Build-Service-Identität dieses
-         Projekts die Rolle Administrator auf Organisationsebene an den Service Connections aus 5
-         und 6, damit sie sie teilen kann. Danach Warnungen, ohne etwas zu ändern: ohne
-         -ApproverGroups, mit -Pool, Job-Scope nicht auf das Projekt beschränkt, Repos nicht
-         geschützt, Variablen beim Start frei setzbar, klassische Pipelines erlaubt, weitere
-         Pipelines im Projekt, kein Pflicht-Reviewer im Repo seed-scaffold
+      7. Nur mit -CentralScaffold: Repo und Pipeline seed-scaffold als zentrales Scaffold, das
+         Azure-DevOps-Projekte und Seed-Projekte anlegt, jedes mit eigener Identität (ab v0.20.0;
+         seed-scaffold mit PAT gibt es nicht mehr). Dazu die Scaffold-Identität, eine Managed
+         Identity (-ScaffoldIdentityName) mit genau diesen Rechten:
+           - eigene Rolle "Sentinel Seed Resource Group Creator" (nur Resource Groups lesen und
+             anlegen) und Reader auf der Subscription
+           - Managed Identity Contributor auf -IdentityResourceGroup (Identitäten der Projekte)
+           - Role Based Access Control Administrator auf der Subscription, per Bedingung nur für
+             Contributor, Role Based Access Control Administrator, Storage Blob Data Contributor
+             und "Sentinel Seed Lock Contributor", nur an Service Principals
+           - Storage Blob Data Contributor auf dem State-Container, per Bedingung nur für Blobs
+             unter scaffold/ (Registry und eigener State)
+           - Microsoft Graph Application.Read.All und AppRoleAssignment.ReadWrite.All
+         Service Connection (-ScaffoldConnectionName) nur für seed-scaffold, mit Branch-Prüfung
+         (main) und Required template (templates/scaffold.yml am Tag). Die Build-Service-Identität
+         dieses Projekts bekommt die Rolle Administrator an der GitHub-Service-Connection (sie
+         teilt sie in die Zielprojekte) und verliert sie an der Service Connection aus 5. Danach
+         Warnungen bzw. fehlende Schritte: ohne -ApproverGroups, mit -Pool, Job-Scope nicht auf das
+         Projekt beschränkt und Repos nicht geschützt (beides fehlt), Variablen beim Start frei
+         setzbar, klassische Pipelines erlaubt, weitere Pipelines im Projekt, kein Pflicht-Reviewer
+         im Repo seed-scaffold. "Create new projects" für die Build-Service-Identität geht nur in
+         der Oberfläche; das Skript nennt den Schritt.
       8. Azure DevOps: GitHub-Service-Connection für alle Pipelines
       9. Power Platform (nur mit -PowerPlatformEnvironmentUrl): die Deployment-Identität als
          Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Umgebung, damit
@@ -49,14 +61,8 @@
     Tenant eindeutig benannt; das Skript sucht sie in allen sichtbaren Subscriptions und
     ergänzt die neue Subscription in ihren assignableScopes. Andere Identitäten fasst es nicht an.
 
-    Danach einmalig (nicht mit -SkipScaffold oder -CentralScaffold): PAT für seed-scaffold anlegen und als geheime
-    Variable SeedScaffoldPat an der Pipeline seed-scaffold hinterlegen (Scopes: Code
-    read/write/manage, Build read/execute, Environment read/manage, Graph read, Project and
-    Team read, Pipeline Resources use/manage). Das Job-Token der Pipeline darf keine Repos
-    anlegen, solange "Protect access to repositories in YAML pipelines" an ist. Die Person
-    hinter dem PAT braucht "Edit policies" an den Repos (Branch-Policy der PR-Validierung).
-    Die Azure-Service-Connection gibt beim ersten Lauf jedes neuen Projekts eine
-    Administratorin oder ein Administrator frei.
+    Ohne -CentralScaffold und ohne -SkipScaffold legt das Skript ab v0.20.0 kein seed-scaffold
+    mehr an (der PAT-Modus entfällt) und weist darauf hin; ein vorhandenes bleibt unverändert.
 
     Ausführen mit einem Konto, das Owner der Subscription, Global Administrator (oder
     Privileged Role Administrator) im Tenant und Projektadministrator in Azure DevOps ist; mit
@@ -110,14 +116,31 @@
     -CentralScaffold warnt das Skript: Dessen Job-Token erreicht alle freigeschalteten Projekte.
 
 .PARAMETER CentralScaffold
-    seed-scaffold als zentrales Scaffold (README, Zentrales Scaffold): Es legt Seed-Projekte auch
-    in anderen Azure-DevOps-Projekten an, mit dem Job-Token statt eines PATs. Je Zielprojekt
-    schaltet ein Projektadmin es einmal frei (Grant-SeedScaffoldAccess.ps1). Nicht zusammen mit
-    -SkipScaffold.
+    seed-scaffold als zentrales Scaffold (README, Scaffold): Es legt Azure-DevOps-Projekte und
+    Seed-Projekte an, jedes mit eigener Identität in Azure, angemeldet mit dem Job-Token
+    (-AzureDevOpsAuth jobToken) oder der Scaffold-Identität (servicePrincipal). In vorhandenen
+    Projekten braucht es einmal das Opt-in eines Projektadmins (README). Braucht seed-pipelines ab
+    v0.20.0 (-SeedPipelinesVersion). Nicht zusammen mit -SkipScaffold.
+
+.PARAMETER AzureDevOpsAuth
+    Nur mit -CentralScaffold: jobToken (Standard, ohne Lizenz) oder servicePrincipal (die
+    Scaffold-Identität ist Benutzer in Azure DevOps mit Zugriffsstufe Basic; README, Weg S).
+
+.PARAMETER IdentityResourceGroup
+    Nur mit -CentralScaffold: Resource Group für die Identitäten der Projekte (id-<name>), Standard
+    rg-seed-identities. Die Scaffold-Identität ist dort Managed Identity Contributor.
+
+.PARAMETER ProjectAdministrators
+    Nur mit -CentralScaffold: Principal Names (E-Mail), die in jedem neuen Projekt
+    Projektadministratoren werden; Standard niemand. Ein Projektadmin kann Policies, Prüfungen
+    und Freigaben seines Projekts aufheben.
+
+.PARAMETER TemplateRef
+    Nur mit -CentralScaffold: Tag von seed-template, das neue Projekte bekommen, Standard v0.19.0.
 
 .PARAMETER AllowedProjects
-    Nur mit -CentralScaffold: regulärer Ausdruck für erlaubte Zielprojekte, leer: alle
-    freigeschalteten.
+    Nur mit -CentralScaffold: regulärer Ausdruck für erlaubte Zielprojekte, auch für neue
+    Azure-DevOps-Projekte (createProject); leer: alle.
 
 .PARAMETER MemberGroup
     Nur mit -CentralScaffold: Gruppe im Zielprojekt, in der die startende Person Mitglied sein
@@ -161,7 +184,7 @@ param(
     [string] $StateStorageAccount = '',
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
-    [string] $SeedPipelinesVersion = 'v0.19.0',
+    [string] $SeedPipelinesVersion = 'v0.20.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
@@ -178,11 +201,19 @@ param(
     [string[]] $ApproverGroups = @(),
     [ValidateRange(0, 10)] [int] $MinReviewers = 1,
     [string] $ProjectPool = '',
+    [ValidateSet('jobToken', 'servicePrincipal')] [string] $AzureDevOpsAuth = 'jobToken',
+    [string] $IdentityResourceGroup = 'rg-seed-identities',
+    [string[]] $ProjectAdministrators = @(),
+    [ValidatePattern('^v\d+\.\d+\.\d+$')] [string] $TemplateRef = 'v0.19.0',
     [switch] $DryRun
 )
 
 if ($CentralScaffold -and $SkipScaffold) {
     throw '-CentralScaffold und -SkipScaffold schließen sich aus.'
+}
+# Das zentrale Scaffold mit eigener Identität je Projekt gibt es ab seed-pipelines v0.20.0.
+if ($CentralScaffold -and $SeedPipelinesVersion -match '^v(\d+)\.(\d+)\.' -and [int] $Matches[1] -eq 0 -and [int] $Matches[2] -lt 20) {
+    throw '-CentralScaffold braucht -SeedPipelinesVersion ab v0.20.0.'
 }
 # v0.19.0 oder refs/tags/v0.19.0
 $RequiredTemplateRefs = @($RequiredTemplateRefs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
@@ -225,6 +256,31 @@ $LockRoleName = 'Sentinel Seed Lock Contributor'
 # Rechte nur auf Ebene Basic (eigene Datensätze); die Prüfung sähe sonst fast nichts.
 $FlowReaderRoleName = 'Sentinel Seed Flow Reader'
 $FlowReaderPrivileges = @('prvReadWorkflow', 'prvReadconnectionreference')
+
+# Zentrales Scaffold: Resource Groups anlegen, ohne Contributor auf der Subscription. Die Rolle ist
+# wie die für Löschsperren im Tenant eindeutig benannt.
+$ResourceGroupCreatorRoleName = 'Sentinel Seed Resource Group Creator'
+$ManagedIdentityContributor = 'e40ec5ca-96e0-45a2-b4ff-59039f2c2b59'
+$RbacAdministrator = 'f58310d9-a9f6-439a-9e8d-f62e7b41a168'
+$ContributorRole = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
+$BlobDataContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+# Graph-Rechte der Scaffold-Identität: Rollen von Graph lesen und Application.ReadWrite.OwnedBy an
+# die Identität eines Projekts mit sso vergeben (Entscheidung: das Scaffold vergibt sie selbst).
+$ScaffoldGraphRoles = @('Application.Read.All', 'AppRoleAssignment.ReadWrite.All')
+
+# Role Based Access Control Administrator der Scaffold-Identität: nur die Rollen, die eine
+# Projektidentität bekommt, und nur an Service Principals (Managed Identities). Dass es Identitäten
+# aus -IdentityResourceGroup sind, lässt sich als Bedingung nicht ausdrücken; das stellt
+# scaffold.py sicher, das nur id-<name> aus dieser Resource Group berechtigt.
+function Get-ScaffoldRbacCondition([string[]] $RoleIds) {
+    $ids = $RoleIds -join ', '
+    "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
+    "(@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$ids} AND " +
+    "@Request[Microsoft.Authorization/roleAssignments:PrincipalType] StringEqualsIgnoreCase 'ServicePrincipal')) AND " +
+    "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})) OR " +
+    "(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$ids} AND " +
+    "@Resource[Microsoft.Authorization/roleAssignments:PrincipalType] StringEqualsIgnoreCase 'ServicePrincipal'))"
+}
 
 # Die Identität des zentralen Scaffolds liest, schreibt und löscht im State-Container nur Blobs unter
 # scaffold/ (Registry und eigener State, scaffold/<projekt-id>/<name>.tfstate). Im selben Container
@@ -813,8 +869,8 @@ try {
         Write-Host "  [fehlt] Branch-Prüfung an $ServiceConnectionName" -ForegroundColor Yellow
         $missing.Add("Branch-Prüfung an $ServiceConnectionName")
     }
-    # Required template: web-app.yml an den erlaubten Tags; seed-scaffold mit PAT nutzt dieselbe
-    # Service Connection über templates/scaffold.yml (das zentrale Scaffold hat eine eigene).
+    # Required template: web-app.yml an den erlaubten Tags (das zentrale Scaffold hat eine eigene
+    # Service Connection).
     if ($SkipScaffold) {
         # siehe oben
     } elseif ($SkipRequiredTemplate) {
@@ -832,11 +888,8 @@ try {
         foreach ($use in $webAppUses | Where-Object { $_.Ref -notin $refs }) {
             Write-Host "  [warn]  Pipeline $($use.Pipeline) bindet $WebAppTemplate auf $($use.Ref) ein, nicht in -RequiredTemplateRefs: Ihre Läufe scheitern an der Prüfung." -ForegroundColor Yellow
         }
+        # Nur web-app.yml: seed-scaffold nutzt diese Service Connection ab v0.20.0 nicht mehr.
         $wanted = @($refs | ForEach-Object { New-TemplateEntry $WebAppTemplate $_ })
-        if (-not $CentralScaffold) {
-            $scaffoldRefs = @(@("refs/tags/$SeedPipelinesVersion") + @($uses | Where-Object Template -eq $ScaffoldTemplate | ForEach-Object Ref)) | Sort-Object -Unique
-            $wanted += @($scaffoldRefs | ForEach-Object { New-TemplateEntry $ScaffoldTemplate $_ })
-        }
         Set-RequiredTemplate $endpoint $project.id $wanted @($WebAppTemplate) -Replace:$explicitRefs
     }
     # Gilt für alle Repos des Projekts, auch für Projekte, die seed-scaffold später anlegt.
@@ -872,30 +925,104 @@ try {
     # --- 7. seed-scaffold -----------------------------------------------------------------
     if ($SkipScaffold) {
         Write-Host '7. Azure DevOps: seed-scaffold entfällt (-SkipScaffold)'
+    } elseif (-not $CentralScaffold) {
+        # Ab v0.20.0 gibt es kein seed-scaffold mit PAT mehr; ein vorhandenes bleibt unverändert.
+        Write-Host '7. Azure DevOps: seed-scaffold'
+        Write-Host '  [warn]  seed-scaffold mit PAT gibt es ab v0.20.0 nicht mehr. Neue Projekte legt das zentrale Scaffold an (-CentralScaffold, auch für dieses Projekt); README, Scaffold, Umstieg.' -ForegroundColor Yellow
     } else {
-        Write-Host "7. Azure DevOps: seed-scaffold$(if ($CentralScaffold) { ' (zentral, Job-Token)' })"
+        Write-Host "7. Azure DevOps: seed-scaffold (zentral, $AzureDevOpsAuth)"
         $scaffoldEndpoint = $null
         if ($CentralScaffold) {
-            # Eigene Identität nur für den State und die Namensprüfung: Das zentrale Scaffold
-            # nutzt die Deployment-Identität nicht, es teilt deren Service Connection nur weiter.
+            # Scaffold-Identität: legt je Projekt Identität, Resource Groups und Rollen an. Die
+            # Deployment-Identität nutzt das Scaffold nicht und teilt sie auch nicht mehr.
             $scaffoldIdentity = Invoke-Step "Managed Identity $ScaffoldIdentityName" {
                 Get-OrNull { az identity show --name $ScaffoldIdentityName --resource-group $StateResourceGroup -o json 2>$null | ConvertFrom-Json }
             } {
                 az identity create --name $ScaffoldIdentityName --resource-group $StateResourceGroup --location $Location `
                     --tags 'seed:purpose=scaffold' -o json | ConvertFrom-Json
             }
+            # Resource Group der Projektidentitäten
+            Invoke-Step "Resource Group $IdentityResourceGroup" {
+                (az group exists --name $IdentityResourceGroup) -eq 'true'
+            } {
+                az group create --name $IdentityResourceGroup --location $Location --tags 'seed:purpose=project-identities' -o none
+                $true
+            } | Out-Null
+            # Eigene Rolle: nur Resource Groups lesen und anlegen. Wie die Rolle für Löschsperren im
+            # Tenant eindeutig; fehlt diese Subscription in ihren assignableScopes, kommt sie dazu.
+            $rgRole = Find-CustomRole $ResourceGroupCreatorRoleName
+            $rgScopes = if ($rgRole) { @($rgRole.properties.assignableScopes) } else { @() }
+            if ($rgRole -and -not ($rgScopes | Where-Object { $_ -eq $Subscription -or $_ -eq '/' })) {
+                if ($DryRun) {
+                    Write-Host "  [alt]   Rolle ${ResourceGroupCreatorRoleName}: Subscription wird in assignableScopes ergänzt" -ForegroundColor Yellow
+                    $missing.Add("Rolle $ResourceGroupCreatorRoleName (assignableScopes)")
+                } else {
+                    $definition = $rgRole.properties
+                    $file = Save-Json @{ properties = @{
+                            roleName = $definition.roleName; description = $definition.description; type = $definition.type
+                            permissions = $definition.permissions; assignableScopes = @($rgScopes) + $Subscription
+                        } } 'rg-role-scopes.json'
+                    Invoke-Arm put "https://management.azure.com$($rgRole.id)?api-version=2022-04-01" $file | Out-Null
+                    Write-Host "  [neu]   Rolle ${ResourceGroupCreatorRoleName}: Subscription in assignableScopes ergänzt" -ForegroundColor Green
+                }
+            } else {
+                $rgRole = Invoke-Step "Rolle $ResourceGroupCreatorRoleName" { $rgRole } {
+                    $file = Save-Json @{
+                        Name             = $ResourceGroupCreatorRoleName
+                        Description      = 'Sentinel Seed: Resource Groups lesen und anlegen (zentrales Scaffold).'
+                        Actions          = @('Microsoft.Resources/subscriptions/resourceGroups/read', 'Microsoft.Resources/subscriptions/resourceGroups/write')
+                        NotActions       = @()
+                        AssignableScopes = @($Subscription)
+                    } 'rg-role.json'
+                    az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+                }
+            }
             if ($scaffoldIdentity) {
-                foreach ($role in @(
-                        @{ Scope = $StateContainerScope; RoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'; Condition = $ScaffoldBlobCondition
-                            Name = "Storage Blob Data Contributor auf Container $StateContainer (nur scaffold/) für $ScaffoldIdentityName" }
-                        @{ Scope = $Subscription; RoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-                            Name = "Reader auf der Subscription (Namensprüfung) für $ScaffoldIdentityName" })) {
+                $rgRoleId = if ($rgRole.name) { $rgRole.name } else { $null }
+                $lockRoleId = if ($lockRole.name) { $lockRole.name } else { $null }
+                $scaffoldRoles = @(
+                    @{ Scope = $StateContainerScope; RoleId = $BlobDataContributor; Condition = $ScaffoldBlobCondition
+                        Name = "Storage Blob Data Contributor auf Container $StateContainer (nur scaffold/) für $ScaffoldIdentityName" }
+                    @{ Scope = $Subscription; RoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+                        Name = "Reader auf der Subscription (Namensprüfung) für $ScaffoldIdentityName" }
+                    @{ Scope = "$Subscription/resourceGroups/$IdentityResourceGroup"; RoleId = $ManagedIdentityContributor
+                        Name = "Managed Identity Contributor auf $IdentityResourceGroup für $ScaffoldIdentityName" }
+                )
+                if ($rgRoleId) {
+                    $scaffoldRoles += @{ Scope = $Subscription; RoleId = $rgRoleId; Name = "$ResourceGroupCreatorRoleName auf der Subscription für $ScaffoldIdentityName" }
+                } else {
+                    Write-Host "  [fehlt] $ResourceGroupCreatorRoleName für $ScaffoldIdentityName (nach der Rolle)" -ForegroundColor Yellow
+                    $missing.Add("$ResourceGroupCreatorRoleName für $ScaffoldIdentityName")
+                }
+                if ($lockRoleId) {
+                    $scaffoldRoles += @{ Scope = $Subscription; RoleId = $RbacAdministrator
+                        Condition = Get-ScaffoldRbacCondition @($ContributorRole, $RbacAdministrator, $BlobDataContributor, $lockRoleId)
+                        Name = "Role Based Access Control Administrator (nur Rollen der Projektidentitäten) für $ScaffoldIdentityName" }
+                } else {
+                    Write-Host "  [fehlt] Role Based Access Control Administrator für $ScaffoldIdentityName (nach der Rolle $LockRoleName)" -ForegroundColor Yellow
+                    $missing.Add("Role Based Access Control Administrator für $ScaffoldIdentityName")
+                }
+                foreach ($role in $scaffoldRoles) {
                     # Nach Principal-ID filtern statt --assignee: Das sucht im Verzeichnis, und eine
                     # frisch angelegte Managed Identity ist dort oft noch nicht angekommen.
                     $role.PrincipalId = $scaffoldIdentity.principalId
-                    $role.Existing = @(az role assignment list --scope $role.Scope -o json | ConvertFrom-Json |
+                    $role.Existing = @(Get-OrNull { az role assignment list --scope $role.Scope -o json 2>$null | ConvertFrom-Json } |
                             Where-Object principalId -eq $scaffoldIdentity.principalId)
                     Set-RoleAssignment $role
+                }
+                # Microsoft Graph: Application.Read.All und AppRoleAssignment.ReadWrite.All, damit das
+                # Scaffold Application.ReadWrite.OwnedBy an die Identität eines Projekts mit sso vergibt.
+                $scaffoldGraphUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$($scaffoldIdentity.principalId)/appRoleAssignments"
+                foreach ($value in $ScaffoldGraphRoles) {
+                    $appRole = $graph.appRoles | Where-Object value -eq $value
+                    Invoke-Step "Graph $value für $ScaffoldIdentityName" {
+                        (Get-OrNull { az rest --method get --url $scaffoldGraphUrl -o json 2>$null | ConvertFrom-Json }).value |
+                            Where-Object { $_.appRoleId -eq $appRole.id -and $_.resourceId -eq $graph.id }
+                    } {
+                        $file = Save-Json @{ principalId = $scaffoldIdentity.principalId; resourceId = $graph.id; appRoleId = $appRole.id } "graph-$value.json"
+                        az rest --method post --url $scaffoldGraphUrl --body "@$file" -o none
+                        $true
+                    } | Out-Null
                 }
                 $scaffoldEndpoint = Invoke-Step "Service Connection $ScaffoldConnectionName (Workload Identity Federation)" {
                     Get-Endpoint $ScaffoldConnectionName
@@ -904,7 +1031,7 @@ try {
                         name                             = $ScaffoldConnectionName
                         type                             = 'AzureRM'
                         url                              = 'https://management.azure.com/'
-                        description                      = "Sentinel Seed: zentrales Scaffold, Managed Identity $ScaffoldIdentityName (State und Lesen)"
+                        description                      = "Sentinel Seed: zentrales Scaffold, Managed Identity $ScaffoldIdentityName (nur seed-scaffold)"
                         authorization                    = @{ scheme = 'WorkloadIdentityFederation'; parameters = @{ tenantid = $tenantId; serviceprincipalid = $scaffoldIdentity.clientId } }
                         data                             = @{ environment = 'AzureCloud'; scopeLevel = 'Subscription'; subscriptionId = $SubscriptionId; subscriptionName = $subscriptionName; creationMode = 'Manual' }
                         isShared                         = $false
@@ -934,23 +1061,54 @@ try {
                 } | Out-Null
             }
 
-            # Die Build-Service-Identität dieses Projekts teilt die Service Connections in die
-            # Zielprojekte; dafür braucht sie die Rolle Administrator auf Organisationsebene.
+            # Nur seed-scaffold bekommt die Scaffold-Identität: Läufe von main des Repos seed-scaffold
+            # (und seed-pipelines an einem Tag), die templates/scaffold.yml am Tag einbinden.
+            if ($scaffoldEndpoint) {
+                Set-BranchControl $scaffoldEndpoint $project.id
+                $scaffoldUses = @(Find-SeedTemplateUses $project.id $scaffoldEndpoint.id | Where-Object Template -eq $ScaffoldTemplate)
+                $scaffoldRefs = @(@("refs/tags/$SeedPipelinesVersion") + @($scaffoldUses | ForEach-Object Ref)) | Sort-Object -Unique
+                Set-RequiredTemplate $scaffoldEndpoint $project.id @($scaffoldRefs | ForEach-Object { New-TemplateEntry $ScaffoldTemplate $_ }) @($ScaffoldTemplate)
+            } else {
+                Write-Host "  [fehlt] Branch-Prüfung und Required template an $ScaffoldConnectionName" -ForegroundColor Yellow
+                $missing.Add("Branch-Prüfung und Required template an $ScaffoldConnectionName")
+            }
+
+            # Die Build-Service-Identität dieses Projekts teilt die GitHub-Service-Connection in die
+            # Zielprojekte; dafür braucht sie dort die Rolle Administrator auf Organisationsebene. An
+            # der Deployment-Service-Connection (Schritt 5) hat sie ab v0.20.0 nichts mehr zu suchen:
+            # Jedes Projekt bekommt seine eigene.
             $buildIdentityName = "$($project.name) Build Service ($($Org.Split('/')[-1]))"
             $buildIdentity = Find-BuildIdentity $buildIdentityName
             if (-not $buildIdentity) {
                 Write-Host "  [fehlt] $buildIdentityName" -ForegroundColor Yellow
                 $missing.Add($buildIdentityName)
             }
-            foreach ($connection in @($endpoint, $github)) {
-                if (-not ($buildIdentity -and $connection)) { continue }
-                $roles = "$Org/_apis/securityroles/scopes/distributedtask.collection.serviceendpointrole/roleassignments/resources/collection_$($connection.id)?api-version=7.1-preview.1"
-                Invoke-Step "Administrator (Organisation) an $($connection.name) für $buildIdentityName" {
+            $roleUrl = { param($connection) "$Org/_apis/securityroles/scopes/distributedtask.collection.serviceendpointrole/roleassignments/resources/collection_$($connection.id)?api-version=7.1-preview.1" }
+            if ($buildIdentity -and $github) {
+                $roles = & $roleUrl $github
+                Invoke-Step "Administrator (Organisation) an $($github.name) für $buildIdentityName" {
                     (Invoke-AzDevOps get $roles $null).value | Where-Object { $_.identity.id -eq $buildIdentity.Id -and $_.role.name -eq 'Administrator' }
                 } {
                     Invoke-AzDevOps put $roles @(@{ roleName = 'Administrator'; userId = $buildIdentity.Id }) | Out-Null
                     $true
                 } | Out-Null
+            }
+            if ($buildIdentity -and $endpoint) {
+                $roles = & $roleUrl $endpoint
+                $granted = (Invoke-AzDevOps get $roles $null).value | Where-Object { $_.identity.id -eq $buildIdentity.Id -and $_.access -ne 'inherited' }
+                if (-not $granted) {
+                    Write-Host "  [ok]    $buildIdentityName ohne Rolle an $($endpoint.name)"
+                } elseif ($DryRun) {
+                    Write-Host "  [alt]   $buildIdentityName ist $($granted[0].role.name) an $($endpoint.name): Rolle wird entfernt" -ForegroundColor Yellow
+                    $missing.Add("Rolle von $buildIdentityName an $($endpoint.name) entfernen")
+                } else {
+                    # Entfernt die Rollenzuweisung dieser Identität (Liste von Identitäts-IDs).
+                    Invoke-AzDevOps patch $roles @($buildIdentity.Id) | Out-Null
+                    Write-Host "  [neu]   $buildIdentityName ohne Rolle an $($endpoint.name)" -ForegroundColor Green
+                }
+            }
+            if ($AzureDevOpsAuth -eq 'servicePrincipal') {
+                Write-Host "  [info]  servicePrincipal: $ScaffoldIdentityName als Benutzer in Azure DevOps aufnehmen (Zugriffsstufe Basic), mit `"Create new projects`" und der Rolle Administrator an $GitHubConnectionName (README, Weg S)."
             }
         }
 
@@ -965,22 +1123,20 @@ try {
             } {
                 # Zentral steht requesterCanApprove fest auf false (central-pipelines.yml), auch ohne
                 # Freigabe-Gruppe; ohne sie warnt das Skript unten.
-                $content = if ($CentralScaffold) {
-                    (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'central-pipelines.yml')).
-                        Replace('__ALLOWED_PROJECTS__', $AllowedProjects.Replace("'", "''")).
-                        Replace('__MEMBER_GROUP__', $MemberGroup.Replace("'", "''")).
-                        Replace('__APPROVER_GROUPS__', (ConvertTo-YamlList $ApproverGroups)).
-                        Replace('__MIN_REVIEWERS__', "$MinReviewers").
-                        Replace('__SCAFFOLD_CONNECTION__', $ScaffoldConnectionName).
-                        Replace('__PROJECT_POOL__', $ProjectPool.Replace("'", "''"))
-                } else {
-                    (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'azure-pipelines.yml')).
-                        Replace('__APPROVERS__', (ConvertTo-YamlList $Approvers))
-                }
-                $content = $content.
+                $content = (Get-Content -Raw (Join-Path $PSScriptRoot '..' 'scaffold' 'central-pipelines.yml')).
+                    Replace('__ALLOWED_PROJECTS__', $AllowedProjects.Replace("'", "''")).
+                    Replace('__MEMBER_GROUP__', $MemberGroup.Replace("'", "''")).
+                    Replace('__APPROVER_GROUPS__', (ConvertTo-YamlList $ApproverGroups)).
+                    Replace('__PROJECT_ADMINISTRATORS__', (ConvertTo-YamlList $ProjectAdministrators)).
+                    Replace('__MIN_REVIEWERS__', "$MinReviewers").
+                    Replace('__AZURE_DEVOPS_AUTH__', $AzureDevOpsAuth).
+                    Replace('__TEMPLATE_REF__', $TemplateRef).
+                    Replace('__SCAFFOLD_CONNECTION__', $ScaffoldConnectionName).
+                    Replace('__IDENTITY_RESOURCE_GROUP__', $IdentityResourceGroup).
+                    Replace('__LOCATION__', $Location).
+                    Replace('__PROJECT_POOL__', $ProjectPool.Replace("'", "''")).
                     Replace('__SEED_PIPELINES_VERSION__', $SeedPipelinesVersion).
                     Replace('__GITHUB_CONNECTION__', $GitHubConnectionName).
-                    Replace('__SERVICE_CONNECTION__', $ServiceConnectionName).
                     Replace('__STATE_RESOURCE_GROUP__', $StateResourceGroup).
                     Replace('__STATE_STORAGE_ACCOUNT__', $StateStorageAccount).
                     Replace('__STATE_CONTAINER__', $StateContainer).
@@ -1038,12 +1194,6 @@ try {
                 if (-not $settings) {
                     "Pipeline-Einstellungen von $($project.name) nicht lesbar; Job-Scope, Repo-Schutz, Variablen beim Start und klassische Pipelines ungeprüft."
                 } else {
-                    if (-not $settings.enforceJobAuthScope) {
-                        'Job-Scope nicht auf das Projekt beschränkt („Limit job authorization scope to current project for non-release pipelines“ aus): Pipelines laufen dann als Project Collection Build Service, mit dessen Rechten in allen Projekten der Organisation.'
-                    }
-                    if (-not $settings.enforceReferencedRepoScopedToken) {
-                        '„Protect access to repositories in YAML pipelines“ aus: Das Job-Token sieht dann alle Repos der freigeschalteten Projekte, nicht nur das ausgecheckte.'
-                    }
                     if (-not $settings.enforceSettableVar) {
                         'Beim Start sind beliebige Variablen setzbar („Limit variables that can be set at queue time“ aus): Wer seed-scaffold starten darf, setzt damit Umgebungsvariablen in jedem Schritt.'
                     }
@@ -1071,6 +1221,22 @@ try {
                 }
             )
             foreach ($warning in $warnings) { Write-Host "  [warn]  $warning" -ForegroundColor Yellow }
+            # Ohne diese beiden Einstellungen trägt das Sicherheitsmodell nicht (Job-Token nur für
+            # dieses Projekt und nur für referenzierte Repos): fehlende Schritte statt Warnungen.
+            if ($settings) {
+                if (-not $settings.enforceJobAuthScope) {
+                    Write-Host '  [fehlt] „Limit job authorization scope to current project for non-release pipelines“ (Project settings, Pipelines, Settings): sonst laufen Pipelines als Project Collection Build Service, mit Rechten in allen Projekten.' -ForegroundColor Yellow
+                    $missing.Add('Job-Scope auf das Projekt beschränken')
+                }
+                if (-not $settings.enforceReferencedRepoScopedToken) {
+                    Write-Host '  [fehlt] „Protect access to repositories in YAML pipelines“ (Project settings, Pipelines, Settings): sonst sieht das Job-Token alle Repos der Zielprojekte.' -ForegroundColor Yellow
+                    $missing.Add('Repos in YAML-Pipelines schützen')
+                }
+            }
+            # Per API nicht möglich: Projekte anlegen darf die Build-Service-Identität erst nach
+            # diesem Klick (Modus createProject). Ohne ihn gehen nur vorhandene Projekte.
+            $creator = if ($AzureDevOpsAuth -eq 'servicePrincipal') { $ScaffoldIdentityName } else { "$($project.name) Build Service ($($Org.Split('/')[-1]))" }
+            Write-Host "  [info]  Einmal in der Oberfläche: Organization settings, Security, Permissions, Users, $creator, „Create new projects“ = Allow."
         }
     }
 
@@ -1164,12 +1330,13 @@ try {
         Write-Host 'Fertig. Bestehendes Repo als Seed-Projekt einrichten: onboarding/Initialize-SeedProject.ps1.' -ForegroundColor Green
         Write-Host 'Werte für azure-pipelines.yml des Projekts:'
     } elseif ($CentralScaffold) {
-        Write-Host 'Fertig, ohne PAT. Noch offen (README, Zentrales Scaffold):' -ForegroundColor Green
+        Write-Host 'Fertig. Noch offen (README, Scaffold):' -ForegroundColor Green
+        Write-Host '  - Organization settings, Security, Permissions: „Create new projects“ für die Identität oben (einmal, nur in der Oberfläche)'
         Write-Host '  - in diesem Projekt: Entwicklerinnen und Entwickler als Readers, an der Pipeline seed-scaffold "Queue builds"'
-        Write-Host '  - je Zielprojekt einmal, durch einen Projektadmin: onboarding/Grant-SeedScaffoldAccess.ps1'
-        Write-Host 'Werte für azure-pipelines.yml eines Projekts:'
+        Write-Host '  - je vorhandenem Zielprojekt einmal, durch einen Projektadmin: Build-Service-Identität dieses Projekts in Project Administrators (oder onboarding/Grant-SeedScaffoldAccess.ps1)'
+        Write-Host 'Werte für azure-pipelines.yml eines bestehenden Projekts mit der geteilten Identität:'
     } else {
-        Write-Host 'Fertig. Noch offen: PAT als geheime Variable SeedScaffoldPat an der Pipeline seed-scaffold (siehe Hilfe).' -ForegroundColor Green
+        Write-Host 'Fertig. Neue Projekte legt das zentrale Scaffold an (-CentralScaffold).' -ForegroundColor Green
         Write-Host 'Werte für azure-pipelines.yml eines Projekts:'
     }
     Write-Host "  serviceConnection: $ServiceConnectionName"

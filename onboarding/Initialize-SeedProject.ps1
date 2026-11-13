@@ -50,10 +50,11 @@
     die Service Connections verwalten darf.
 
     Das zentrale Scaffold (templates/scaffold.yml, mode migrate und enableBranchPolicy) ruft das
-    Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI, die
-    Service Connections hat es vorher ins Projekt geteilt, und mit -SkipBranchControl bleibt die
-    Branch-Prüfung und Required template unberührt; sie hängen zentral an der geteilten Service
-    Connection. Fehlen am Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
+    Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI. Ab v0.20.0
+    hat es vorher die Service Connection sc-<name> der Projektidentität angelegt, samt
+    Branch-Prüfung und Required template (scaffold.py connection), und die GitHub-Service-Connection
+    ins Projekt geteilt; mit -SkipBranchControl bleiben die Prüfungen deshalb unberührt. Fehlen am
+    Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
 
 .PARAMETER SeedProjectName
     Projektname wie in project.yaml und im Parameter project von web-app.yml, Präfix der

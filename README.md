@@ -644,7 +644,7 @@ cd seed-pipelines
 4. Terraform-State: Storage Account ohne Shared Key, `Storage Blob Data Contributor` nur auf dem Container
 5. Service Connection per Workload Identity Federation, mit Branch-Prüfung und Required template (siehe unten)
 6. GitHub-Service-Connection (Token aus `$env:SEED_GITHUB_TOKEN`, sonst Hinweis)
-7. Repo und Pipeline `seed-scaffold` (entfällt mit `-SkipScaffold`)
+7. Nur mit `-CentralScaffold`: Scaffold-Identität, Repo und Pipeline `seed-scaffold` (siehe [Scaffold](#scaffold-seed-projekte-in-selbstbedienung))
 8. GitHub-Service-Connection für alle Pipelines
 9. Nur mit `-PowerPlatformEnvironmentUrl <url>[,<url>]`: die Deployment-Identität als Anwendungsbenutzer mit der Rolle Environment Maker in jeder genannten Power-Platform-Umgebung (Umgebungs-URL aus dem Power Platform Admin Center, die Umgebung braucht Dataverse), für den Custom Connector. Dazu je Umgebung die eigene Sicherheitsrolle `Sentinel Seed Flow Reader` in der Root-Business-Unit, nur mit `prvReadWorkflow` und `prvReadconnectionreference` auf Ebene Global, für die [Prüfung des Custom Connectors](#prüfung-des-custom-connectors): Environment Maker liest Flows nur auf Ebene Basic, also eigene. Fehlt der Rolle ein Recht oder hat es eine kleinere Tiefe, ergänzt das Skript es; weitere Rechte, die jemand ergänzt hat, bleiben. Das Konto braucht dort System Administrator. Weitere Umgebungen später: Skript erneut mit allen URLs ausführen; bestehende Umgebungen bekommen die Rolle ebenso.
 
@@ -656,7 +656,7 @@ Die Prüfung vergleicht **jedes** Repo des Laufs mit derselben Liste, auch `seed
 
 Das Verbot trifft auch jede weitere Identität, der „Create tag“ in den Zugriffslisten ausdrücklich erlaubt ist: Nach den vier Denies liest das Skript die Liste des Projekts und seiner Repos (`Initialize-SeedProject.ps1`: des Projekts und des Repos) und verbietet das Recht dort, wo es erlaubt ist, etwa der Person, die ein Repo angelegt hat (sie bekommt das Recht beim Anlegen ausdrücklich), oder einer eigenen Gruppe. Die übrigen Rechte des Eintrags bleiben. Ausgenommen sind Project Administrators, Project Collection Administrators und Project Collection Service Accounts. `-DryRun` nennt die Identitäten nur. Ein Deny für eine Person gilt auch, wenn sie Administratorin ist; Tags legt sie dann nach einer Änderung der Rechte von Hand an.
 
-**Required template:** Die Branch-Prüfung lässt jede Pipeline-Datei auf `main` an die Service Connection, auch eine, die sie direkt nutzt statt über `web-app.yml` (etwa ein `AzureCLI@2`, der das Token ausgibt). Deshalb hängt an der Azure-Service-Connection zusätzlich die Prüfung „Required template“ (ExtendsCheck): Nur Läufe, die `templates/web-app.yml` aus `blackforestsentinel/seed-pipelines` an einem erlaubten Tag per `extends` einbinden, bekommen die Deployment-Identität. Erlaubt sind ohne weitere Angabe `-SeedPipelinesVersion` und die Tags, die die für die Service Connection berechtigten Pipelines auf ihrem Default-Branch einbinden; vorhandene Einträge bleiben. `seed-scaffold` (PAT) nutzt dieselbe Service Connection und bekommt `templates/scaffold.yml` am selben Tag und an dem Tag, den sein `azure-pipelines.yml` nennt. `-RequiredTemplateRefs v0.19.0[,v0.18.1]` ersetzt die Einträge für `web-app.yml` durch genau diese Tags, etwa um alte zu entfernen; das Skript warnt, wenn eine berechtigte Pipeline dann scheitern würde. `-SkipRequiredTemplate` lässt die Prüfung weg, etwa wenn die Service Connection auch Pipelines außerhalb von Seed dient; das Skript warnt dann. Branches von seed-pipelines nimmt die Prüfung nie von selbst auf; wer vor dem Release in einem Testprojekt prüft, nennt sie in `-RequiredTemplateRefs` (etwa `refs/heads/feat/x`) und entfernt sie danach wieder.
+**Required template:** Die Branch-Prüfung lässt jede Pipeline-Datei auf `main` an die Service Connection, auch eine, die sie direkt nutzt statt über `web-app.yml` (etwa ein `AzureCLI@2`, der das Token ausgibt). Deshalb hängt an der Azure-Service-Connection zusätzlich die Prüfung „Required template“ (ExtendsCheck): Nur Läufe, die `templates/web-app.yml` aus `blackforestsentinel/seed-pipelines` an einem erlaubten Tag per `extends` einbinden, bekommen die Deployment-Identität. Erlaubt sind ohne weitere Angabe `-SeedPipelinesVersion` und die Tags, die die für die Service Connection berechtigten Pipelines auf ihrem Default-Branch einbinden; vorhandene Einträge bleiben. `-RequiredTemplateRefs v0.19.0[,v0.18.1]` ersetzt die Einträge für `web-app.yml` durch genau diese Tags, etwa um alte zu entfernen; das Skript warnt, wenn eine berechtigte Pipeline dann scheitern würde. `-SkipRequiredTemplate` lässt die Prüfung weg, etwa wenn die Service Connection auch Pipelines außerhalb von Seed dient; das Skript warnt dann. Branches von seed-pipelines nimmt die Prüfung nie von selbst auf; wer vor dem Release in einem Testprojekt prüft, nennt sie in `-RequiredTemplateRefs` (etwa `refs/heads/feat/x`) und entfernt sie danach wieder.
 
 **Versionswechsel mit Required template:** Die Prüfung kennt nur die Tags, die sie nennt. Vor dem Merge eines Pull Requests, der `ref` eines Projekts auf einen neuen Tag hebt, den Tag deshalb ergänzen, sonst scheitert der erste Lauf auf `main` an der Prüfung (PR-Läufe nicht, sie nutzen die Service Connection nicht):
 
@@ -671,97 +671,97 @@ Ohne `-DryRun` wiederholen, dann mergen. Sind alle Projekte umgestellt, entfernt
 
 Mit `-SkipScaffold` setzt das Skript sie nicht, weil eine Migration vor dem Umschalten auf einem eigenen Branch testet; das übernimmt `Initialize-SeedProject.ps1`, sobald das Projekt umgestellt ist. Für bestehende Installationen genügt es, `Initialize-SeedProject.ps1` (nach dem Umschalten) bzw. `Initialize-SeedTenant.ps1` erneut auszuführen.
 
-`-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)); der PAT entfällt dann.
+`-SkipScaffold` lässt Repo und Pipeline `seed-scaffold` weg, für Projekte, die migriert statt neu angelegt werden (siehe [Bestehendes Projekt migrieren](#bestehendes-projekt-migrieren)).
 
-`-CentralScaffold` richtet `seed-scaffold` als zentrales Scaffold für andere Azure-DevOps-Projekte ein, ohne PAT (siehe [Zentrales Scaffold](#zentrales-scaffold-selbstbedienung-über-projektgrenzen)).
+`-CentralScaffold` richtet `seed-scaffold` als zentrales Scaffold ein, mit Scaffold-Identität und eigener Identität je Projekt (siehe [Scaffold](#scaffold-seed-projekte-in-selbstbedienung)). Ohne `-CentralScaffold` und ohne `-SkipScaffold` legt das Skript ab v0.20.0 kein `seed-scaffold` mehr an (der PAT-Modus entfällt) und weist darauf hin.
 
 `-Pool <Name>` lässt `seed-scaffold` auf eigenen Agents laufen (siehe [Eigene Agents](#eigene-agents)); ohne den Parameter nutzt es Microsoft-gehostete Agents. Mit `-CentralScaffold` warnt das Skript dabei.
 
-Danach einmalig einen PAT anlegen und als geheime Variable `SeedScaffoldPat` an der Pipeline `seed-scaffold` hinterlegen. Scopes: Code (Read, write & manage), Build (Read & execute), Environment (Read & manage), Graph (Read), Project and Team (Read), Pipeline Resources (Use and manage). Das Job-Token der Pipeline reicht nicht, solange „Protect access to repositories in YAML pipelines“ an ist; dann darf es keine Repos anlegen. Die Person, deren PAT es ist, braucht außerdem „Edit policies“ an den Repos des Projekts (Branch-Policy der PR-Validierung).
 
-## templates/scaffold.yml: neues Projekt anlegen
+## Scaffold: Seed-Projekte in Selbstbedienung
 
-Die Pipeline `seed-scaffold` (Vorlage: [`scaffold/azure-pipelines.yml`](scaffold/azure-pipelines.yml)) fragt beim Start Name, `sso`, `mcp`, `storage`, Frontend, Umgebungen und Freigebende ab und legt über das Terraform-Modul `seed-terraform//ado-project` an:
+Ab v0.20.0 legt ein zentrales Scaffold (`seed-scaffold` in einem zentralen Azure-DevOps-Projekt) Seed-Projekte an: auf Wunsch das Azure-DevOps-Projekt selbst, das Repo mit seed-template, Environments mit Freigaben, Pipeline und Policies, und in Azure eine **eigene Identität je Projekt**. Entwicklerinnen und Entwickler brauchen dafür keine Admin-Rechte, keinen PAT und kein Skript.
 
-- Repo aus `seed-template` mit `project.yaml` und `azure-pipelines.yml` (ohne Frontend: `hosting.staticWebApp: none` und `frontend: false`)
-- Environments `<name>-<env>` (Freigabe für Infrastruktur) und `<name>-<env>-app`
-- Pipeline, berechtigt für die Environments; auf Wunsch startet sie den ersten Lauf
-- Branch-Policy auf `main`: Pull Requests brauchen einen erfolgreichen PR-Lauf dieser Pipeline (siehe PR-Validierung). Die Policy ist Pflicht und sperrt damit direkte Pushes auf `main`.
+Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml) mit [`templates/scaffold.yml`](templates/scaffold.yml), Logik in [`scripts/scaffold/scaffold.py`](scripts/scaffold/scaffold.py) (Tests in `test_scaffold.py`), Terraform-Modul `seed-terraform//ado-project` ab v0.20.0.
 
-Die Azure-Service-Connection berechtigt `seed-scaffold` bewusst nicht selbst: Im ersten Lauf eines neuen Projekts gibt eine Administratorin oder ein Administrator sie einmal frei („Permit“). PR-Läufe brauchen keine Freigabe, weil sie die Service Connection nicht verwenden. Der State liegt unter `scaffold/<name>.tfstate`; ein erneuter Lauf ergänzt nur, was fehlt.
+### Zielbild
 
-Für die Branch-Policy reicht der Scope Code (Read, write & manage) des PATs; die Person, deren PAT es ist, braucht am Repo die Berechtigung „Edit policies“ (Projektadministratoren haben sie). Die Policy setzt voraus, dass das neue Projekt seed-pipelines ab v0.5.0 einbindet (`pipelinesVersion`); ältere Versionen würden in PR-Läufen deployen, `ado-project` bricht dann ab.
+| Wer | Rechte |
+|---|---|
+| Entwicklerin oder Entwickler | Mitglied der Organisation; im zentralen Projekt Readers und „Queue builds“ an `seed-scaffold`; im Zielprojekt Contributor. Keine Azure-Rechte, keine Admin-Rechte. |
+| Scaffold in Azure DevOps (Build-Service-Identität des zentralen Projekts, ohne Lizenz) | Organisation: „Create new projects“ (einmal, nur in der Oberfläche). In selbst angelegten Projekten Projektadministrator (ergibt sich aus der Anlage). In vorhandenen Projekten: Opt-in, ein Klick (unten). |
+| Scaffold-Identität in Azure (`id-seed-scaffold`, Managed Identity; Service Connection nur für `seed-scaffold`, mit Branch-Prüfung `main` und Required template `templates/scaffold.yml` am Tag) | Resource Groups anlegen (eigene Rolle „Sentinel Seed Resource Group Creator“), Reader auf der Subscription, Managed Identity Contributor auf `rg-seed-identities`, Role Based Access Control Administrator mit Bedingung (nur die Rollen der Projektidentitäten, nur an Service Principals), Storage Blob Data Contributor auf dem State-Container nur unter `scaffold/`, Microsoft Graph `Application.Read.All` und `AppRoleAssignment.ReadWrite.All`. |
+| Projektidentität (`id-<name>` in `rg-seed-identities`, Service Connection `sc-<name>` im Zielprojekt per Workload Identity Federation) | Contributor, Role Based Access Control Administrator (nur Seed-Rollen) und „Sentinel Seed Lock Contributor“ **nur auf `rg-<name>-<env>`**; Storage Blob Data Contributor auf dem State-Container **nur unter `<name>/` und `plans/<name>/`** (State und Pläne, siehe [Plan neben dem State](#plan-neben-dem-state)); Graph `Application.ReadWrite.OwnedBy` nur mit `sso`. |
+| Freigebende | Environments des Projekts: die beim Start genannten Personen plus die zentrale Pflichtgruppe (`approverGroups`); wer einen Lauf startet, gibt ihn nie selbst frei (`requesterCanApprove: false`). |
 
-Optional, auch ohne zentrales Scaffold: `approverGroups` (Gruppen der Organisation als Freigebende), `requesterCanApprove`, `minReviewers` (Pflicht-Reviewer auf `main`) und `projectPool` (eigener Agent-Pool des neuen Projekts).
+Das Scaffold ist ein Makler: Es führt nie Code aus dem Zielrepo oder aus seed-template aus, und die neue Pipeline bekommt ihre Service Connection erst, wenn Policies, Prüfungen und ein bekannter Inhalt stehen. Die geteilte Deployment-Identität aus dem Onboarding bleibt für bestehende Projekte, bekommt aber keine neuen Pipelines mehr.
 
-## Zentrales Scaffold: Selbstbedienung über Projektgrenzen
+### Reihenfolge eines Laufs
 
-Ein zentrales Azure-DevOps-Projekt legt Seed-Projekte in anderen Projekten der Organisation an, etwa wenn jedes Vorhaben ein eigenes Projekt hat. Wer ein Projekt anlegt, braucht im Zielprojekt nur Contributors-Rechte und im zentralen Projekt Readers und „Queue builds“ an `seed-scaffold`. Dafür braucht es weder Admin-Rechte noch einen PAT noch eine zusätzliche Lizenz.
+1. **Prüfen** (`scaffold.py check`, `reserve`): Eingaben, Zielprojekt (`allowedProjects`), Mitgliedschaft der startenden Person in `memberGroup`, Repo (bei `new` darf `main` nur README, LICENSE und `.gitignore` enthalten, Baum per API; sonst Abbruch mit Hinweis auf `migrate`), Name frei (Registry `scaffold/registry/<name>.json`, kein State unter `<name>/`, keine Resource Group `rg-<name>-*`). Die Namen `plans`, `scaffold` und `registry` sind reserviert.
+2. **Identität** (`scaffold.py identity`, Azure): `id-<name>`, Resource Groups `rg-<name>-<env>` mit den Tags `seed:project` und `seed:environment`, Rollen darauf, State-Pfad, Graph-Rolle (nur `sso`). Das Projekt legt seine Resource Groups dann nicht selbst an (`createResourceGroups: false` in `project.yaml`).
+3. **Template** (`scaffold.py fill`): seed-template am Tag `templateRef` als **ein** Commit auf `main`, ohne Merge; README, LICENSE und `.gitignore` aus der Initialisierung bleiben, wo seed-template keine eigenen hat.
+4. **Terraform** (`ado-project`): Service Connection `sc-<name>` für `id-<name>` mit Branch-Prüfung und Required template am Tag `pipelinesVersion`, Environments mit Freigaben, Reviewer-Policy (mindestens eine Zustimmung, die eigene zählt nicht), PR-Validierung, Git-Rechte (Deny Create tag, Force push, Bypass policies, Edit policies), `project.yaml` und `azure-pipelines.yml`, die startende Person als Contributor, optional `projectAdministrators`. Danach `scaffold.py identity federate`: das Federated Credential an `id-<name>` mit Issuer und Subject von `sc-<name>`.
+5. **Verifizieren** (`scaffold.py verify`): `main` zeigt auf den Scaffold-Commit oder auf Commits von Terraform danach (nur `project.yaml` und `azure-pipelines.yml`), jeder Push auf `main` seitdem kam vom Scaffold. Sonst Abbruch, bevor die Pipeline etwas bekommt.
+6. **Berechtigen und starten** (`scaffold.py run`): Pipeline für `sc-<name>` und die GitHub-Service-Connection berechtigen, ersten Lauf starten; er wartet auf die Freigabe der Infrastruktur.
 
-Vorlage: [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml), `templates/scaffold.yml` mit `azureDevOpsAuth: jobToken`.
+Die Service Connection entsteht also erst, wenn Policies, Prüfungen und ein bekannter Inhalt da sind, und sie reicht nur bis `rg-<name>-*`. Ein erneuter Lauf ergänzt nur, was fehlt. State des Scaffolds: `scaffold/<projekt-id>/<name>.tfstate`.
 
-### Wie es funktioniert
+**Versionswechsel:** Branch-Prüfung und Required template an `sc-<name>` nennen genau einen Tag von seed-pipelines. Hebt ein Projekt `ref` später an, braucht es dafür einen erneuten Scaffold-Lauf oder eine Anpassung der Prüfung durch einen Admin; vorher scheitert der erste Lauf auf dem neuen Tag an der Prüfung.
 
-- **Anmeldung:** mit dem Job-Token. Dahinter steht die Build-Service-Identität des zentralen Projekts, „<Projekt> Build Service (<Organisation>)“. Sie entsteht mit dem Projekt und zählt nicht als Benutzer mit Zugriffsstufe. Ein eigener Service Principal bräuchte für Repos die Zugriffsstufe Basic, die je Organisation kostet.
-- **Freischalten:** Ein Projektadmin schaltet jedes Zielprojekt einmal frei (`onboarding/Grant-SeedScaffoldAccess.ps1`). Ein nicht freigeschaltetes Projekt sieht das Scaffold gar nicht.
-- **Repos:** Die Identität legt keine Repos an. Unter „Protect access to repositories in YAML pipelines“ sieht ihr Token nur Repos, die der Lauf auscheckt. Bei `new` legt die Person das Repo vorher an, mit README.
-  - Das Scaffold referenziert es per Inline-Checkout (`git://<projekt>/<repo>`); in `resources.repositories` sind Template-Ausdrücke nicht erlaubt. Die Referenz gibt dem Token schon ab Start des Jobs Zugriff; ausgecheckt wird das Repo (mit `persistCredentials`) aber erst nach den Prüfungen unten.
-  - seed-template führt es per Merge unabhängiger Historien ein; bei gleichen Dateien wie `README.md` gewinnt seed-template.
-- **Service Connections:**
-  - Das Scaffold teilt die Azure- und die GitHub-Service-Connection des zentralen Projekts ins Zielprojekt, unter demselben Namen.
-  - Wer teilt, wird dort Administrator der Service Connection; so berechtigt das Scaffold die neue Pipeline selbst, und der erste Lauf braucht kein „Permit“.
-  - Bei Workload Identity Federation hängt der Subject an der ID der Service Connection (`…/sc/<org-id>/<sc-id>`), nicht am Projekt. Ein weiterer Federated Credential ist deshalb nicht nötig.
-- **Branch-Prüfung:** Checks an einer geteilten Service Connection gelten in allen Projekten, und Projektadmins der Zielprojekte können sie nicht ändern. Das Onboarding setzt sie einmal im zentralen Projekt; das Scaffold fasst sie nicht an.
-- **Prüfungen vor jeder Änderung** (`scripts/scaffold/scaffold.py`, Tests in `test_scaffold.py`):
-  - die Eingaben;
-  - das Zielprojekt (`allowedProjects`);
-  - die Mitgliedschaft der startenden Person in `memberGroup` (Standard Contributors, auch über Teams und Gruppen);
-  - das Repo: bei `new` Default-Branch `main` und kein fremdes `project.yaml`;
-  - die Namen der Service Connections im Zielprojekt;
-  - ob der Projektname frei ist: kein Terraform-State unter `<name>/`, kein `scaffold/<name>.tfstate`, keine Resource Group mit Tag `seed:project=<name>`. Freie Namen trägt das Scaffold atomar in die Registry ein (`scaffold/registry/<name>.json`, `If-None-Match: *`). Ein erneuter Lauf für dasselbe Zielprojekt ist in Ordnung.
-- **Eingaben in Skripten:** Eingaben der startenden Person erreichen Skripte nur über die Umgebung.
-- **Freigabe und Review:**
-  - `approverGroups`: eine feste Gruppe der Organisation als Freigebende;
-  - `requesterCanApprove: false`, fest in der Vorlage: Niemand gibt seine eigene Infrastruktur allein frei. Ohne `approverGroups` bestimmt die startende Person die Freigebenden selbst (`approvers`), und ohne Eintrag hat das neue Projekt keine Freigabe; das Onboarding warnt dann. In bestehenden `seed-scaffold`-Repos den Wert in `azure-pipelines.yml` per Hand setzen; das Onboarding legt die Datei nur einmal an;
-  - `minReviewers` (Standard 1 im Onboarding): Pull Requests auf `main` brauchen eine Zustimmung, die eigene zählt nicht. Die Stage Plan nutzt die Service Connection schon vor jeder Freigabe; ohne Review könnte eine Person ihre eigene Pipeline-Änderung mergen.
-- **State:** unter `scaffold/<projekt-id>/<name>.tfstate`. Eigene Azure-Identität des Scaffolds: Managed Identity mit Storage Blob Data Contributor auf dem State-Container und Reader auf der Subscription. Die Deployment-Identität teilt das Scaffold nur weiter, es nutzt sie nicht selbst.
-  - Im selben Container liegen State und Pläne aller Projekte, mit sensiblen Werten wie den Deployment-Tokens der Static Web Apps. Eine Bedingung an der Rolle (ABAC, `blobs:path StringStartsWith 'scaffold/'`) lässt die Identität deshalb nur Blobs unter `scaffold/` lesen, schreiben und löschen: die Registry und ihren eigenen State.
-  - Auflisten darf sie den ganzen Container: Die Namensprüfung sucht State unter `<name>/`, und eine Liste nennt nur Namen.
-  - Bestehende Installationen: `Initialize-SeedTenant.ps1 -CentralScaffold` erneut ausführen; es ergänzt die Bedingung an der vorhandenen Zuweisung (im DryRun `[alt]`).
+### Weg J: neues Azure-DevOps-Projekt mit dem Job-Token (Standard)
+
+1. `seed-scaffold` starten mit `mode: createProject`, `adoProject: <neues Projekt>` und den Angaben zum Seed-Projekt. Das Scaffold legt das Projekt an (es wird dort Projektadministrator), nimmt die startende Person als Contributor auf und endet mit einem Link auf das Repo.
+2. **Ein Klick:** Im Repo des neuen Projekts auf *Initialize* klicken (mit README). Unter „Protect access to repositories in YAML pipelines“ sieht das Job-Token nur Repos, die ein Lauf referenziert, und einen Lauf, der ein leeres Repo referenziert, weist Azure DevOps schon bei der Validierung ab. Anlegen darf das Token Repos ebenfalls nicht.
+3. `seed-scaffold` erneut starten, mit `mode: new` und `adoProject: <neues Projekt>` (`repository` leer: das Repo heißt wie das Projekt). Der Lauf füllt und richtet ein, Schritte 1 bis 6 oben.
+
+Lizenz und Org-Einstellungen bleiben dabei, wie sie sind.
+
+### Weg S: Service Principal (Option)
+
+`azureDevOpsAuth: servicePrincipal` (Onboarding `-AzureDevOpsAuth servicePrincipal`): Das Scaffold meldet sich bei Azure DevOps mit einem Entra-Token der Scaffold-Identität an (`az account get-access-token` über `scaffoldServiceConnection`), Terraform per OIDC mit derselben Identität. Der Code ist sonst derselbe. Das Token unterliegt dem Repo-Schutz nicht: `createProject` füllt das leere Standard-Repo im selben Lauf, bei `new` legt das Scaffold ein fehlendes Repo selbst an. Der Klick auf *Initialize* entfällt.
+
+Dafür ist die Scaffold-Identität Benutzer in Azure DevOps mit Zugriffsstufe Basic (je nach Organisation eine Lizenz), hat „Create new projects“ und die Rolle Administrator an der GitHub-Service-Connection des zentralen Projekts. In vorhandenen Projekten gilt das Opt-in für sie statt für die Build-Service-Identität.
+
+### Vorhandene Projekte: Opt-in mit einem Klick
+
+Die Rechte des Scaffolds in einem Projekt, das es nicht selbst angelegt hat, vergibt ein Projektadmin, einmal je Projekt: **Project settings → Permissions → Project Administrators → Members → Add → `<zentrales Projekt> Build Service (<Organisation>)`.** Ohne diesen Schritt sieht das Scaffold das Projekt nicht und nennt ihn in der Fehlermeldung. Wer es enger will, nimmt [`onboarding/Grant-SeedScaffoldAccess.ps1`](onboarding/Grant-SeedScaffoldAccess.ps1) (eigene Gruppe mit genau den nötigen Rechten; Mitglieder aufnehmen kann sie nicht, `projectAdministrators` nimmt dort ein Projektadmin auf).
+
+- **Neues Repo im vorhandenen Projekt:** Repo mit README anlegen (Repos, New repository), dann `seed-scaffold` mit `mode: new`, `adoProject` und `repository`.
+- **Vorhandenes Repo:** `mode: migrate` richtet es ein wie [`Initialize-SeedProject.ps1`](#bestehendes-projekt-migrieren), ohne Dateien zu schreiben, aber mit eigener Identität: `scaffold.py connection` legt `sc-<name>` mit Branch-Prüfung (Default-Branch) und Required template an. Danach stellt das Projekt `azure-pipelines.yml` (mit `serviceConnection: sc-<name>`) und `project.yaml` (mit `createResourceGroups: false`) per Pull Request um; anschließend folgt `mode: enableBranchPolicy`. Bis dahin läuft unreviewter Inhalt mit der Projektidentität; das trifft nur das eigene Projekt.
+- **`dryRun`:** nur prüfen, nichts ändern.
+
+### Was die Projektidentität nicht kann
+
+Andere Resource Groups lesen oder schreiben, fremde States oder Pläne lesen, fremde App-Registrierungen ändern, Rollen außerhalb der Seed-Rollen vergeben, Löschsperren außerhalb ihrer Resource Groups setzen. Power-Platform-Anwendungsbenutzer gibt es je Identität: Projekte mit Custom Connector brauchen dafür weiter das Onboarding mit `-PowerPlatformEnvironmentUrl` für ihre Identität. Features mit Graph-Berechtigungen über `Application.ReadWrite.OwnedBy` hinaus brauchen weiter Admin-Consent.
 
 ### Einrichten
 
 1. **Onboarding im zentralen Projekt**, mit denselben Rechten wie sonst:
    ```powershell
    ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> -AzureDevOpsOrganization https://dev.azure.com/<org> `
-       -AzureDevOpsProject Sentinel-Seed -CentralScaffold -AllowedProjects '^Apps-.+$' `
-       -ApproverGroups 'Seed Infrastruktur-Freigabe' -DryRun
+       -AzureDevOpsProject <zentrales Projekt> -CentralScaffold -AllowedProjects '^Apps-.+$' `
+       -ApproverGroups '<Freigabe-Gruppe>' -DryRun
    ```
-   `-Pool` und `-ProjectPool` für eigene Agents. Das Skript warnt, ohne etwas zu ändern, bei Einstellungen aus Punkt 2, die das Job-Token über das Scaffold hinaus öffnen, ohne `-ApproverGroups` und mit `-Pool`; nach Punkt 2 zeigt ein erneuter Lauf mit `-DryRun`, ob noch etwas offen ist.
-2. **Im zentralen Projekt per UI:**
-   - Entwicklerinnen und Entwickler als Readers aufnehmen;
-   - unter Pipelines, `seed-scaffold`, Manage security den Readers „Queue builds“ geben;
-   - das Repo `seed-scaffold` und Pipelines ändern nur Admins, denn jede Pipeline des Projekts bekäme dasselbe Token. Deshalb keine weiteren Pipelines im Projekt und am Repo `seed-scaffold` eine Branch-Policy mit Pflicht-Reviewer;
-   - unter Project settings, Pipelines, Settings: „Limit job authorization scope to current project for non-release pipelines“, „Protect access to repositories in YAML pipelines“, „Limit variables that can be set at queue time“ und „Disable creation of classic build pipelines“ bzw. „… classic release pipelines“ an. Sonst liefe das Token als Project Collection Build Service, sähe alle Repos der Zielprojekte, oder wer startet, setzte beliebige Umgebungsvariablen.
-3. **Je Zielprojekt einmal, durch einen Projektadmin:**
-   ```powershell
-   ./onboarding/Grant-SeedScaffoldAccess.ps1 -AzureDevOpsOrganization https://dev.azure.com/<org> `
-       -AzureDevOpsProject <ziel> -CentralProject Sentinel-Seed -AllowContributorsToCreateRepositories -Check
-   ```
-   Ohne `-Check` vergibt das Skript die Rechte (Skript-Hilfe). Mit `-AgentPool` gilt das auch für einen eigenen Pool der neuen Projekte.
-4. **Agents:** `migrate` und `enableBranchPolicy` rufen `Initialize-SeedProject.ps1` auf und brauchen PowerShell 7; Microsoft-gehostete Agents haben es. Für das zentrale Scaffold sind sie auch sonst die bessere Wahl: Sein Job-Token erreicht alle freigeschalteten Projekte, und auf einem eigenen Agent träfe, was ein Lauf hinterlässt, die folgenden.
+   Es legt die Scaffold-Identität mit den Rechten oben an, `rg-seed-identities`, die Service Connection `sc-seed-scaffold` mit Branch-Prüfung und Required template, Repo und Pipeline `seed-scaffold`, und entzieht der Build-Service-Identität die Rolle an der Deployment-Service-Connection (bis v0.19.0 teilte das Scaffold sie). `-ProjectAdministrators`, `-TemplateRef`, `-IdentityResourceGroup`, `-AzureDevOpsAuth`, `-Pool` und `-ProjectPool` sind optional.
+2. **Einmal in der Oberfläche:** Organization settings → Security → Permissions → Users → `<zentrales Projekt> Build Service (<Organisation>)` → „Create new projects“: Allow. Per API geht das nicht; das Skript nennt den Schritt.
+3. **Im zentralen Projekt:**
+   - Entwicklerinnen und Entwickler als Readers aufnehmen, an `seed-scaffold` (Manage security) „Queue builds“ geben;
+   - Repo `seed-scaffold` und Pipelines ändern nur Admins: keine weiteren Pipelines im Projekt, am Repo `seed-scaffold` eine Branch-Policy mit Pflicht-Reviewer;
+   - Project settings → Pipelines → Settings: „Limit job authorization scope to current project for non-release pipelines“ und „Protect access to repositories in YAML pipelines“ an (sonst endet das Onboarding mit fehlenden Schritten), dazu „Limit variables that can be set at queue time“ und „Disable creation of classic build/release pipelines“ (sonst Warnung).
+4. **Agents:** Microsoft-gehostete Agents sind die bessere Wahl; `migrate` und `enableBranchPolicy` brauchen PowerShell 7.
 
-### Ein Projekt anlegen oder einrichten
+### Umstieg von v0.19.0
 
-- **`new`:** Im Zielprojekt unter Repos, New repository das Repo mit README anlegen. Dann `seed-scaffold` starten, mit Zielprojekt, Repo, Projektname, Features, Umgebungen und Modus `new`. Der erste Lauf des neuen Projekts startet und wartet auf die Freigabe der Infrastruktur.
-- **`migrate`:** vorhandenes Repo einrichten wie mit `Initialize-SeedProject.ps1`, ohne Dateien zu schreiben. Danach stellt das Projekt `azure-pipelines.yml` und `project.yaml` per Pull Request um; anschließend folgt **`enableBranchPolicy`** für die Branch-Policies. Ist `main` beim Lauf mit `migrate` schon umgestellt, setzt bereits `migrate` sie, wie das Skript es standardmäßig tut.
-- **`dryRun`:** nur prüfen, nichts ändern.
+- **PAT-Modus entfällt.** `azureDevOpsAuth: pat` bricht mit einem Hinweis ab; der Standard ist jetzt `jobToken`. Ein PAT im Scaffold war für jede Person lesbar, die die Pipeline ändern kann. `Initialize-SeedTenant.ps1` ohne `-CentralScaffold` legt kein `seed-scaffold` mehr an. Wer bisher `seed-scaffold` mit PAT im eigenen Projekt nutzt, richtet das zentrale Scaffold ein (das eigene Projekt kann Zielprojekt sein) und löscht die geheime Variable `SeedScaffoldPat`.
+- **Zentrales Scaffold:** `Initialize-SeedTenant.ps1 -CentralScaffold -SeedPipelinesVersion v0.20.0` erneut ausführen. `azure-pipelines.yml` im Repo `seed-scaffold` legt das Skript nur einmal an; in bestehenden Repos die Datei nach [`scaffold/central-pipelines.yml`](scaffold/central-pipelines.yml) neu fassen (`scaffoldServiceConnection` statt `stateServiceConnection`, ohne `serviceConnection`, neu `mode: createProject`). Die alten Namen nimmt `scaffold.yml` übergangsweise noch an.
+- **Bestehende Projekte** behalten ihre geteilte Service Connection und Identität; das Scaffold fasst sie nicht an.
 
 ### Grenzen
 
-- **Reichweite der Deployment-Identität:** Alle Zielprojekte teilen sich die Deployment-Identität. Projektadmins eines Zielprojekts können eigene Pipelines für die geteilte Service Connection berechtigen und mit `main` eines eigenen Repos an der Branch-Prüfung vorbei. Pflicht-Reviewer schützen vor Contributors, nicht vor Projektadmins. Abhilfe wäre eine Identität je Zielprojekt mit Rechten nur auf dessen Resource Groups.
-- **Migration:** Weil die Branch-Prüfung global gilt, testet eine Migration vor dem Umschalten nicht mehr auf einem eigenen Branch mit der Service Connection, sondern per PR-Lauf.
-- **Admin-Consent:** Features mit Graph-Berechtigungen (`auth.directory`, `mcp`) brauchen weiter einmal Admin-Consent. Neue Power-Platform-Umgebungen brauchen das Onboarding mit `-PowerPlatformEnvironmentUrl`.
+- **Rollen weitergeben:** Die Bedingung am Role Based Access Control Administrator der Scaffold-Identität begrenzt Rollen und Art des Empfängers (Service Principal), nicht dessen Herkunft aus `rg-seed-identities` und nicht die Bedingung der weitergegebenen Rolle; das stellt `scaffold.py` sicher, das nur `id-<name>` berechtigt. Die Scaffold-Identität ist deshalb an `seed-scaffold` gebunden (Branch-Prüfung, Required template).
+- **Migration:** Weil die Branch-Prüfung an `sc-<name>` gleich gilt, testet eine Migration vor dem Umschalten per PR-Lauf statt auf einem eigenen Branch mit der Service Connection.
+- **Projektadministratoren** eines Projekts können Policies, Prüfungen und Freigaben ihres Projekts aufheben; mit eigener Identität trifft das nur ihr Projekt. Deshalb ist `projectAdministrators` standardmäßig leer.
 
 ## Bestehendes Projekt migrieren
 
@@ -803,7 +803,7 @@ Zwischen Schritt 2 und 6 liegt auf `main` noch die alte Datei. Hat sie denselben
 
 ### PR-Validierung als Standard
 
-Den Branch-Schutz (Branch-Policy mit Build-Validierung durch die Seed-Pipeline, Pflicht-Reviewer, Branch-Prüfung und Required template an der Service Connection) setzt `Initialize-SeedProject.ps1` ohne weiteren Schalter, sobald die YAML-Datei auf dem Default-Branch `web-app.yml` ab v0.5.0 einbindet. Neue Projekte aus `seed-scaffold` bekommen die Policy ohnehin (`seed-terraform//ado-project`, `pr_validation`, Standard `true`).
+Den Branch-Schutz (Branch-Policy mit Build-Validierung durch die Seed-Pipeline, Pflicht-Reviewer, Branch-Prüfung und Required template an der Service Connection) setzt `Initialize-SeedProject.ps1` ohne weiteren Schalter, sobald die YAML-Datei auf dem Default-Branch `web-app.yml` ab v0.5.0 einbindet. Neue Projekte aus dem Scaffold bekommen die Policy ohnehin (`seed-terraform//ado-project`, `pr_validation`, Standard `true`).
 
 - **Warum erst nach dem Umschalten:** Vorher sperrte die Pflicht-Policy direkte Pushes auf den Default-Branch, und die Branch-Prüfung hielte die Testläufe der Migration auf ihrem Branch auf; mit der alten YAML-Datei würden PR-Läufe sogar deployen. Bis dahin übergeht das Skript den Branch-Schutz mit einem Hinweis, ohne Fehler; ein erneuter Lauf nach dem Merge holt ihn nach.
 - **`-EnableBranchPolicy`** verlangt den Branch-Schutz: Ist der Default-Branch noch nicht umgestellt, fehlt die Policy, und das Skript endet mit Exit-Code 1 (außer im DryRun). So arbeitet der Modus `enableBranchPolicy` des zentralen Scaffolds.
@@ -938,13 +938,13 @@ Das Skript startet die Pipeline nicht; mit leerer Registerdatei hätte sie nicht
 Neue Projekte bekommen die Versionen, die hier als Standard stehen. Vor jedem Tag deshalb anheben:
 
 - `onboarding/Initialize-SeedTenant.ps1`: `$SeedPipelinesVersion`, landet im Repo `seed-scaffold` und damit in jedem neuen Projekt;
-- `templates/scaffold.yml`: `pipelinesVersion` und `terraformModuleVersion` (Modul `ado-project`);
+- `templates/scaffold.yml`: `pipelinesVersion`, `terraformModuleVersion` (Modul `ado-project`) und `templateRef` (Tag von seed-template), dazu `-TemplateRef` in `onboarding/Initialize-SeedTenant.ps1`;
 - `onboarding/Initialize-SeedIntune.ps1`: `$SeedPipelinesVersion`, bestimmt die Prüfung „Required template“ und den Startinhalt von `seed-tenant`;
 - die Beispiele in dieser README.
 
 Danach in jedem bestehenden `seed-scaffold`-Repo `ref` und `pipelinesVersion` in `azure-pipelines.yml` nachziehen und in seed-template den `ref` in `azure-pipelines.yml`. Für `seed-tenant` erst `Initialize-SeedIntune.ps1` mit dem neuen Tag ausführen, dann `ref` per Pull Request anheben (siehe Intune).
 
-Die Prüfung „Required template“ an den Deployment-Service-Connections kennt nur die Tags, die sie nennt. Vor dem Merge jedes Pull Requests, der ein Projekt oder `seed-scaffold` auf den neuen Tag hebt, den Tag dort ergänzen: `Initialize-SeedTenant.ps1` mit der neuen `-SeedPipelinesVersion` bzw. `Initialize-SeedProject.ps1` mit `-RequiredTemplateRefs <alt>,<neu>` (siehe [Versionswechsel mit Required template](#tenant-onboarding)). Sonst scheitert der erste Lauf auf `main` an der Prüfung. Alte Tags danach mit `-RequiredTemplateRefs <neu>` entfernen.
+Die Prüfung „Required template“ an den Deployment-Service-Connections kennt nur die Tags, die sie nennt. Vor dem Merge jedes Pull Requests, der ein Projekt oder `seed-scaffold` auf den neuen Tag hebt, den Tag dort ergänzen: `Initialize-SeedTenant.ps1` mit der neuen `-SeedPipelinesVersion` (mit `-CentralScaffold` auch an `sc-seed-scaffold`) bzw. `Initialize-SeedProject.ps1` mit `-RequiredTemplateRefs <alt>,<neu>` (siehe [Versionswechsel mit Required template](#tenant-onboarding)). Sonst scheitert der erste Lauf auf `main` an der Prüfung. Alte Tags danach mit `-RequiredTemplateRefs <neu>` entfernen.
 
 ## Sicherheit
 
