@@ -1070,12 +1070,14 @@ try {
             }
 
             # Nur seed-scaffold bekommt die Scaffold-Identität: Läufe von main des Repos seed-scaffold
-            # (und seed-pipelines an einem Tag), die templates/scaffold.yml am Tag einbinden.
+            # (und seed-pipelines an einem Tag), die templates/scaffold.yml am Tag einbinden. Die Prüfung
+            # nennt -SeedPipelinesVersion und die Tags, die berechtigte Pipelines noch einbinden; andere
+            # Einträge für scaffold.yml entfernt sie (-Replace), sonst sammelten sich alte Tags an.
             if ($scaffoldEndpoint) {
                 Set-BranchControl $scaffoldEndpoint $project.id
                 $scaffoldUses = @(Find-SeedTemplateUses $project.id $scaffoldEndpoint.id | Where-Object Template -eq $ScaffoldTemplate)
                 $scaffoldRefs = @(@("refs/tags/$SeedPipelinesVersion") + @($scaffoldUses | ForEach-Object Ref)) | Sort-Object -Unique
-                Set-RequiredTemplate $scaffoldEndpoint $project.id @($scaffoldRefs | ForEach-Object { New-TemplateEntry $ScaffoldTemplate $_ }) @($ScaffoldTemplate)
+                Set-RequiredTemplate $scaffoldEndpoint $project.id @($scaffoldRefs | ForEach-Object { New-TemplateEntry $ScaffoldTemplate $_ }) @($ScaffoldTemplate) -Replace
             } else {
                 Write-Host "  [fehlt] Branch-Prüfung und Required template an $ScaffoldConnectionName" -ForegroundColor Yellow
                 $missing.Add("Branch-Prüfung und Required template an $ScaffoldConnectionName")

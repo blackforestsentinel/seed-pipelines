@@ -234,7 +234,9 @@ stages:
           # repositories), ohne es auszuchecken: Inhalt und Token liegen nie gemeinsam auf dem Agent,
           # und nichts aus dem Repo läuft. Inline, weil resources.repositories keine
           # Template-Ausdrücke erlaubt. Ein leeres Repo lässt Azure DevOps hier nicht zu (Lauf wird
-          # schon bei der Validierung abgewiesen); deshalb bei new vorher Initialize.
+          # schon bei der Validierung abgewiesen); deshalb bei new vorher Initialize. Beim ersten
+          # Lauf je Repo hält Azure DevOps den Lauf an, bis die startende Person die Ressource
+          # freigibt (View, Permit); die Freigabe bleibt für das Repo bestehen.
           - ${{ if and(ne(parameters.mode, 'createProject'), eq(parameters.azureDevOpsAuth, 'jobToken'), ne(coalesce(parameters.repository, parameters.adoProject), '')) }}:
               - checkout: git://${{ coalesce(parameters.adoProject, variables['System.TeamProject']) }}/${{ coalesce(parameters.repository, parameters.adoProject) }}
                 condition: false
