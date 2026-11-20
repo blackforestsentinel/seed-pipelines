@@ -1,12 +1,14 @@
 # Schreibt die Terraform-Konfiguration für seed-scaffold: das Modul seed-terraform//ado-project
-# (ab v0.20.0) und die Werte als JSON, nicht als HCL-Text, damit Sonderzeichen nichts aufbrechen.
-# Werte, die erst der Lauf kennt (Name des Zielprojekts aus der API, Projektidentität aus dem
-# Schritt identity, startende Person), kommen über die Umgebung dazu, nie als Text im Skript.
+# (ab v0.21.0) und die Werte als JSON, nicht als HCL-Text, damit Sonderzeichen nichts aufbrechen.
+# Werte, die erst der Lauf kennt (Name des Zielprojekts aus der API, Identitäten je Umgebung aus
+# dem Schritt identity, startende Person), kommen über die Umgebung dazu, nie als Text im Skript.
 #
-# Das Modul legt die Service Connection sc-<name> per Workload Identity Federation für die
-# Projektidentität an, mit Branch-Prüfung und Required template, dazu Environments mit Freigaben,
-# Pipeline, Branch-Policies und Git-Rechte. Die Pipeline berechtigt es nicht für die Service
-# Connections: Das macht scaffold.py run erst nach verify.
+# Das Modul legt je Umgebung die Service Connection sc-<name>-<env> per Workload Identity
+# Federation für die Identität dieser Umgebung an (environment_service_connections, jede in der
+# Subscription ihrer Umgebung), mit Branch-Prüfung und Required template, dazu Environments mit
+# Freigaben, Pipeline, Branch-Policies und Git-Rechte; azure-pipelines.yml nennt die Service
+# Connection je Umgebung. Die Pipeline berechtigt es nicht für die Service Connections: Das macht
+# scaffold.py run erst nach verify.
 parameters:
   - name: name
     type: string
@@ -70,32 +72,32 @@ steps:
       module "project" {
         source = "git::https://github.com/blackforestsentinel/seed-terraform.git//ado-project?ref=${{ parameters.terraformModuleVersion }}"
 
-        ado_project                   = var.project.ado_project
-        create_project                = var.project.create_project
-        create_repository             = var.project.create_repository
-        repository                    = var.project.repository
-        template_url                  = var.project.template_url
-        authorize_service_connections = var.project.authorize_service_connections
-        name                          = var.project.name
-        features                      = var.project.features
-        frontend                      = var.project.frontend
-        environments                  = var.project.environments
-        approvers                     = var.project.approvers
-        approver_groups               = var.project.approver_groups
-        requester_can_approve         = var.project.requester_can_approve
-        min_reviewers                 = var.project.min_reviewers
-        app_approval_environments     = var.project.app_approval_environments
-        create_service_connection     = var.project.create_service_connection
-        service_connection            = var.project.service_connection
-        service_connection_identity   = var.project.service_connection_identity
-        required_template_repository  = var.project.required_template_repository
-        github_connection             = var.project.github_connection
-        contributors                  = var.project.contributors
-        project_administrators        = var.project.project_administrators
-        create_resource_groups        = var.project.create_resource_groups
-        terraform_state               = var.project.terraform_state
-        pipelines_version             = var.project.pipelines_version
-        pool                          = var.project.pool
+        ado_project                     = var.project.ado_project
+        create_project                  = var.project.create_project
+        create_repository               = var.project.create_repository
+        repository                      = var.project.repository
+        template_url                    = var.project.template_url
+        authorize_service_connections   = var.project.authorize_service_connections
+        name                            = var.project.name
+        features                        = var.project.features
+        frontend                        = var.project.frontend
+        environments                    = var.project.environments
+        approvers                       = var.project.approvers
+        approver_groups                 = var.project.approver_groups
+        requester_can_approve           = var.project.requester_can_approve
+        min_reviewers                   = var.project.min_reviewers
+        app_approval_environments       = var.project.app_approval_environments
+        create_service_connection       = var.project.create_service_connection
+        # Ab v0.21.0 je Umgebung; service_connection und service_connection_identity entfallen.
+        environment_service_connections = var.project.environment_service_connections
+        required_template_repository    = var.project.required_template_repository
+        github_connection               = var.project.github_connection
+        contributors                    = var.project.contributors
+        project_administrators          = var.project.project_administrators
+        create_resource_groups          = var.project.create_resource_groups
+        terraform_state                 = var.project.terraform_state
+        pipelines_version               = var.project.pipelines_version
+        pool                            = var.project.pool
       }
 
       output "project_id" {
@@ -114,16 +116,13 @@ steps:
         value = module.project.environments
       }
 
-      output "service_connection_id" {
-        value = module.project.service_connection_id
+      output "service_connection_ids" {
+        value = module.project.service_connection_ids
       }
 
-      output "workload_identity_federation_issuer" {
-        value = module.project.workload_identity_federation_issuer
-      }
-
-      output "workload_identity_federation_subject" {
-        value = module.project.workload_identity_federation_subject
+      # Umgebung => { issuer, subject } für die Federated Credentials (scaffold.py identity federate)
+      output "workload_identity_federation" {
+        value = module.project.workload_identity_federation
       }
       EOF
       cat > "$dir/static.json" <<'EOF'
@@ -143,7 +142,6 @@ steps:
           "min_reviewers": ${{ parameters.minReviewers }},
           "app_approval_environments": ${{ convertToJson(parameters.appApprovalEnvironments) }},
           "create_service_connection": true,
-          "service_connection": ${{ convertToJson(format('sc-{0}', parameters.name)) }},
           "required_template_repository": "blackforestsentinel/seed-pipelines",
           "github_connection": ${{ convertToJson(parameters.githubConnection) }},
           "project_administrators": ${{ convertToJson(parameters.projectAdministrators) }},
@@ -166,13 +164,6 @@ steps:
       import os
       import sys
 
-      IDENTITY = {
-          "tenant_id": "SEED_TENANT_ID",
-          "subscription_id": "SEED_SUBSCRIPTION_ID",
-          "subscription_name": "SEED_SUBSCRIPTION_NAME",
-          "client_id": "SEED_IDENTITY_CLIENT_ID",
-      }
-
 
       def value(env, name):
           text = env.get(name, "")
@@ -180,14 +171,39 @@ steps:
           return "" if text.startswith("$(") else text
 
 
+      def connections(project, tenant, identities):
+          """environment_service_connections: je Umgebung sc-<name>-<env> mit der Identität der
+          Umgebung aus seedEnvironmentIdentities (scaffold.py identity)."""
+          result = {}
+          for env in project["environments"]:
+              identity = identities.get(env) if isinstance(identities, dict) else None
+              if not isinstance(identity, dict) or not all(identity.get(k) for k in ("clientId", "subscriptionId", "subscriptionName")):
+                  raise ValueError(f"Identität der Umgebung {env} fehlt (Schritt identity, seedEnvironmentIdentities).")
+              result[env] = {
+                  "name": f"sc-{project['name']}-{env}",
+                  "identity": {
+                      "tenant_id": tenant,
+                      "subscription_id": identity["subscriptionId"],
+                      "subscription_name": identity["subscriptionName"],
+                      "client_id": identity["clientId"],
+                  },
+              }
+          return result
+
+
       def merge(static, env):
           project = dict(static["project"])
-          missing = [name for name in ("SEED_PROJECT_NAME", "SEED_REPOSITORY", *IDENTITY.values()) if not value(env, name)]
+          required = ("SEED_PROJECT_NAME", "SEED_REPOSITORY", "SEED_TENANT_ID", "SEED_ENVIRONMENT_IDENTITIES")
+          missing = [name for name in required if not value(env, name)]
           if missing:
               raise ValueError("Es fehlen Werte aus früheren Schritten: " + ", ".join(missing))
           project["ado_project"] = value(env, "SEED_PROJECT_NAME")
           project["repository"] = value(env, "SEED_REPOSITORY")
-          project["service_connection_identity"] = {key: value(env, name) for key, name in IDENTITY.items()}
+          try:
+              identities = json.loads(value(env, "SEED_ENVIRONMENT_IDENTITIES"))
+          except ValueError as error:
+              raise ValueError(f"seedEnvironmentIdentities ist kein JSON: {error}") from None
+          project["environment_service_connections"] = connections(project, value(env, "SEED_TENANT_ID"), identities)
           # Die startende Person wird Contributor im Projekt, nicht Administrator.
           email = value(env, "SEED_REQUESTER_EMAIL")
           project["contributors"] = [email] if "@" in email else []
@@ -211,7 +227,5 @@ steps:
       SEED_PROJECT_NAME: $(seedProjectName)
       SEED_REPOSITORY: $(seedRepository)
       SEED_TENANT_ID: $(seedTenantId)
-      SEED_SUBSCRIPTION_ID: $(seedSubscriptionId)
-      SEED_SUBSCRIPTION_NAME: $(seedSubscriptionName)
-      SEED_IDENTITY_CLIENT_ID: $(seedIdentityClientId)
+      SEED_ENVIRONMENT_IDENTITIES: $(seedEnvironmentIdentities)
       SEED_REQUESTER_EMAIL: $(Build.RequestedForEmail)

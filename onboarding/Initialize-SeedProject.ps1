@@ -13,8 +13,9 @@
       1. Environments <projekt>-<umgebung> (Infrastruktur, mit Freigabe) und
          <projekt>-<umgebung>-app (App-Deploy, mit Freigabe nur in -AppApprovalEnvironments)
       2. Pipeline-Definition für die YAML-Datei, ohne sie zu starten
-      3. Berechtigungen der Pipeline für die Environments, die Azure-Service-Connection und
-         die GitHub-Service-Connection
+      3. Berechtigungen der Pipeline für die Environments, die Azure-Service-Connection (mit
+         -EnvironmentServiceConnections für jede Service Connection je Umgebung) und die
+         GitHub-Service-Connection
       4. Branch-Policy für die PR-Validierung und Pflicht-Reviewer auf dem Default-Branch
       5. Branch-Prüfung an der Azure-Service-Connection, nur Läufe von -AllowedBranches
          (Standard der Default-Branch) mit seed-pipelines aus -TemplateRefs (Standard
@@ -50,10 +51,11 @@
     die Service Connections verwalten darf.
 
     Das zentrale Scaffold (templates/scaffold.yml, mode migrate und enableBranchPolicy) ruft das
-    Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI. Ab v0.20.0
-    hat es vorher die Service Connection sc-<name> der Projektidentität angelegt, samt
-    Branch-Prüfung und Required template (scaffold.py connection), und die GitHub-Service-Connection
-    ins Projekt geteilt; mit -SkipBranchControl bleiben die Prüfungen deshalb unberührt. Fehlen am
+    Skript in der Pipeline auf: Token aus $env:SEED_AZDO_TOKEN statt aus der Azure CLI. Ab v0.22.0
+    hat es vorher je Umgebung die Service Connection sc-<name>-<env> der Identität dieser Umgebung
+    angelegt, samt Branch-Prüfung und Required template (scaffold.py connection), und die
+    GitHub-Service-Connection ins Projekt geteilt; mit -SkipBranchControl bleiben die Prüfungen
+    deshalb unberührt, -EnvironmentServiceConnections nennt die Service Connections. Fehlen am
     Ende Schritte, endet das Skript außerhalb des DryRuns mit Exit-Code 1.
 
 .PARAMETER SeedProjectName
@@ -108,6 +110,14 @@
     Mit dem Branch-Schutz: Pull Requests brauchen so viele Zustimmungen anderer Personen, die
     eigene Stimme zählt nicht. Standard 1, weil die Stage Plan die Service Connection vor jeder
     Freigabe nutzt; 0: keine Pflicht.
+
+.PARAMETER EnvironmentServiceConnections
+    Service Connection je Umgebung (Umgebung => Name), wie environments[].serviceConnection in
+    azure-pipelines.yml; das zentrale Scaffold übergibt sc-<name>-<env>. Die Pipeline wird für jede
+    berechtigt, und die Ausgabe am Ende nennt sie je Umgebung. Branch-Prüfung und Required template
+    setzt das Skript nur an -ServiceConnectionName; die Service Connections je Umgebung bringen sie
+    vom Scaffold mit (scaffold.py connection). Deshalb nur zusammen mit -SkipBranchControl. Ohne
+    Angabe (Standard) gilt -ServiceConnectionName für alle Umgebungen wie bisher.
 
 .PARAMETER SkipBranchControl
     Branch-Prüfung an der Service Connection nicht anfassen, etwa weil sie zentral an einer
@@ -164,6 +174,7 @@ param(
     [switch] $RequesterCannotApprove,
     [string[]] $AppApprovalEnvironments = @(),
     [string] $ServiceConnectionName = 'sc-seed',
+    [System.Collections.IDictionary] $EnvironmentServiceConnections = @{},
     [string] $GitHubConnectionName = 'github-blackforestsentinel',
     [string] $YamlPath = 'azure-pipelines.yml',
     [string] $PipelineName = '',
@@ -212,6 +223,14 @@ if ($PSBoundParameters.ContainsKey('RequiredTemplateRefs') -and -not $RequiredTe
 $unknown = $AppApprovalEnvironments | Where-Object { $_ -notin $Environments }
 if ($unknown) { throw "AppApprovalEnvironments: $($unknown -join ', ') steht nicht in Environments." }
 if (-not $PipelineName) { $PipelineName = $SeedProjectName }
+if ($EnvironmentServiceConnections.Count) {
+    if (-not $SkipBranchControl) {
+        throw '-EnvironmentServiceConnections nur mit -SkipBranchControl: Branch-Prüfung und Required template an den Service Connections je Umgebung setzt das zentrale Scaffold (scaffold.py connection).'
+    }
+    $unmatched = @($Environments | Where-Object { -not $EnvironmentServiceConnections.Contains($_) }) +
+        @($EnvironmentServiceConnections.Keys | Where-Object { $_ -notin $Environments })
+    if ($unmatched) { throw "EnvironmentServiceConnections: genau ein Eintrag je Umgebung aus Environments ($($unmatched -join ', '))." }
+}
 
 $Org = $AzureDevOpsOrganization.TrimEnd('/')
 $orgName = if ($Org -match '^https://dev\.azure\.com/([^/]+)$') { $Matches[1] }
@@ -647,6 +666,10 @@ try {
     $resources = @(
         foreach ($name in $environmentIds.Keys) { @{ Title = "Environment $name"; Type = 'environment'; Id = $environmentIds[$name] } }
         @{ Title = "Service Connection $ServiceConnectionName"; Type = 'endpoint'; Id = $azure.id; Reason = 'Service Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
+        # Service Connections je Umgebung (zentrales Scaffold), ohne die schon genannte
+        foreach ($connectionName in @($EnvironmentServiceConnections.Values | Where-Object { $_ -ne $ServiceConnectionName } | Select-Object -Unique)) {
+            @{ Title = "Service Connection $connectionName"; Type = 'endpoint'; Id = (Get-ServiceEndpoint $connectionName).id; Reason = 'Service Connection fehlt im Projekt (zentrales Scaffold: scaffold.py connection).' }
+        }
         @{ Title = "GitHub-Service-Connection $GitHubConnectionName"; Type = 'endpoint'; Id = $github.id; Reason = 'GitHub-Service-Connection fehlt im Projekt: zuerst Initialize-SeedTenant.ps1 ausführen.' }
         if ($Pool) {
             $poolQueue = (Invoke-AzDevOps get "$api/distributedtask/queues?queueNames=$([uri]::EscapeDataString($Pool))&api-version=7.1").value | Select-Object -First 1
@@ -869,7 +892,11 @@ try {
     }
     Write-Host 'Werte für azure-pipelines.yml des Projekts:'
     Write-Host "  project: $SeedProjectName, serviceConnection: $ServiceConnectionName, endpoint: $GitHubConnectionName"
-    Write-Host "  environments: $($Environments -join ', ')"
+    if ($EnvironmentServiceConnections.Count) {
+        Write-Host "  environments: $(($Environments | ForEach-Object { "$_ (serviceConnection: $($EnvironmentServiceConnections[$_]))" }) -join ', ')"
+    } else {
+        Write-Host "  environments: $($Environments -join ', ')"
+    }
 }
 finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

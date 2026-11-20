@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Sentinel Seed: zentrales Scaffold, die Schritte gegen Azure DevOps, Azure und den Terraform-State.
 
-  check           prüft vor jeder Änderung die Eingaben, das Zielprojekt (Muster; erreichbar heißt
-                  freigeschaltet), die Mitgliedschaft der startenden Person, das Repo je Modus und
-                  die Namen der Service Connections im zentralen Projekt. Setzt in Azure Pipelines
-                  die Variablen seedProjectId, seedProjectName, seedRepository, seedRepositoryId
-                  und seedDefaultBranch.
+  check           prüft vor jeder Änderung die Eingaben (auch Umgebungen und environmentTargets),
+                  das Zielprojekt (Muster; erreichbar heißt freigeschaltet), die Mitgliedschaft der
+                  startenden Person, das Repo je Modus und die Namen der Service Connections im
+                  zentralen Projekt und im Zielprojekt. Setzt in Azure Pipelines die Variablen
+                  seedProjectId, seedProjectName, seedRepository, seedRepositoryId und
+                  seedDefaultBranch.
   create-project  legt ein Azure-DevOps-Projekt an (Modus createProject) und nimmt die startende
                   Person als Contributor auf; gibt es das Projekt schon, prüft es nur.
-  reserve         prüft, dass der Projektname frei ist, und trägt ihn in die Registry im Container
-                  des Terraform-States ein (scaffold/registry/<name>.json).
-  identity        legt in Azure die Identität des Projekts an: Managed Identity id-<name>, Resource
-                  Groups rg-<name>-<env>, Rollen nur darauf, State nur unter <name>/, Graph-Rolle
-                  nur mit sso. identity federate hängt danach das Federated Credential für die
-                  Service Connection des Projekts an.
+  reserve         prüft, dass der Projektname frei ist (auch in den Ziel-Subscriptions), und trägt
+                  ihn in die Registry im Container des Terraform-States ein
+                  (scaffold/registry/<name>.json).
+  identity        legt in Azure je Umgebung eine Identität des Projekts an: Managed Identity
+                  id-<name>-<env>, Resource Group rg-<name>-<env> in der Ziel-Subscription der
+                  Umgebung (environmentTargets, sonst die der Scaffold-Identität), Rollen nur
+                  darauf, State nur <name>/<env>.tfstate und plans/<name>/<env>/, Graph-Rolle nur
+                  mit sso. Setzt seedEnvironmentIdentities (JSON je Umgebung) und seedTenantId.
+                  identity federate hängt danach je Umgebung das Federated Credential für die
+                  Service Connection sc-<name>-<env> an.
   fill            bringt seed-template an einem Tag als einen Commit nach main des Zielrepos.
-  connection      legt im Modus migrate die Service Connection sc-<name> mit Prüfungen an (bei
-                  new übernimmt das Terraform).
+  connection      legt im Modus migrate je Umgebung die Service Connection sc-<name>-<env> mit
+                  Prüfungen an (bei new übernimmt das Terraform) und nennt den Ausschnitt für
+                  azure-pipelines.yml. Setzt seedFederation (JSON je Umgebung).
   verify          prüft vor dem Berechtigen, dass main nur den Scaffold-Commit und die Commits von
                   Terraform enthält.
   share           teilt die GitHub-Service-Connection des zentralen Projekts ins Zielprojekt.
-  run             berechtigt die neue Pipeline für ihre Service Connections und startet den ersten
-                  Lauf.
+  run             berechtigt die neue Pipeline für ihre Service Connections (je Umgebung und
+                  GitHub) und startet den ersten Lauf.
 
 Anmeldung bei Azure DevOps mit einem Bearer-Token aus SEED_AZDO_TOKEN (sonst SYSTEM_ACCESSTOKEN):
 dem Job-Token (azureDevOpsAuth jobToken) oder einem Entra-Token der Scaffold-Identität
@@ -64,6 +70,7 @@ REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 PROJECT_PATTERN = re.compile(r"[^\\/:*?\"<>;#${},+=\[\]|\x00-\x1f]{1,64}")
 TEMPLATE_REF_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+GUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 SCAFFOLD_MARKER = "seed-scaffold:"
 TEMPLATE_MARKER = "seed-scaffold: seed-template"
 # Was "Initialize" in Azure Repos anlegt (README, .gitignore) und eine Lizenz: Mehr darf main bei
@@ -133,6 +140,19 @@ def fail(*messages: str) -> None:
 def set_variable(name: str, value: str) -> None:
     if os.environ.get("TF_BUILD"):
         print(f"##vso[task.setvariable variable={name}]{clean(value)}", flush=True)
+
+
+def json_value(data: object) -> str:
+    """JSON in einer Zeile für eine Pipeline-Variable: ohne Zeilenumbrüche (json.dumps maskiert
+    Steuerzeichen), nur ASCII, und % als \\u0025, weil der Agent %0A, %5D und ähnliche Folgen im
+    Wert eines Logging-Befehls zurückübersetzt. Das Ergebnis liest json.loads unverändert."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=True).replace("%", "\\u0025")
+
+
+def set_json_variable(name: str, data: object) -> None:
+    """Wie set_variable, aber für JSON beliebiger Länge (clean kürzt auf 200 Zeichen)."""
+    if os.environ.get("TF_BUILD"):
+        print(f"##vso[task.setvariable variable={name}]{json_value(data)}", flush=True)
 
 
 def check_auth(auth: str) -> None:
@@ -214,6 +234,45 @@ def name_problems(name: str) -> list[str]:
     return []
 
 
+# --- Umgebungen und Ziel-Subscriptions ---------------------------------------------------------
+
+def environment_problems(environments: list[str]) -> list[str]:
+    if not environments or not all(isinstance(e, str) and ENVIRONMENT_PATTERN.fullmatch(e) for e in environments):
+        return ["environments: mindestens eine Umgebung, Kleinbuchstaben, Ziffern und Bindestriche, höchstens 20 Zeichen."]
+    if len(set(environments)) != len(environments):
+        return ["environments: jede Umgebung nur einmal."]
+    return []
+
+
+def target_problems(environments: list[str], targets: dict[str, str]) -> list[str]:
+    """environmentTargets (Umgebung -> Subscription-ID): leer heißt alle Umgebungen in der
+    Subscription der Scaffold-Identität. Sonst braucht jede gewählte Umgebung einen Eintrag; eine
+    fehlende bricht ab, bevor irgendetwas angelegt wird."""
+    problems = []
+    for env, subscription in targets.items():
+        if not ENVIRONMENT_PATTERN.fullmatch(env):
+            problems.append(f"environmentTargets: {clean(env)} ist kein gültiger Name einer Umgebung.")
+        elif not GUID_PATTERN.fullmatch(subscription):
+            problems.append(f"environmentTargets.{env}.subscriptionId: eine Subscription-ID (GUID), "
+                            "etwa 00000000-0000-0000-0000-000000000000.")
+    if targets and not problems:
+        unknown = [env for env in environments if env not in targets]
+        if unknown:
+            problems.append(f"Für die Umgebung(en) {', '.join(unknown)} ist keine Ziel-Subscription hinterlegt "
+                            f"(environmentTargets). Hinterlegt sind: {', '.join(targets)}. Eine davon wählen, oder "
+                            "ein Admin ergänzt environmentTargets in azure-pipelines.yml von seed-scaffold "
+                            "(Onboarding mit -EnvironmentTargets).")
+    return problems
+
+
+def environment_connection(name: str, env: str) -> str:
+    return f"sc-{name}-{env}"
+
+
+def environment_identity(name: str, env: str) -> str:
+    return f"id-{name}-{env}"
+
+
 # --- check -------------------------------------------------------------------------------------
 
 @dataclass
@@ -227,10 +286,14 @@ class CheckOptions:
     requester_id: str
     connections: list[str]
     auth: str = "jobToken"
+    environments: list[str] = field(default_factory=list)
+    targets: dict[str, str] = field(default_factory=dict)
 
 
 def input_problems(options: CheckOptions) -> list[str]:
     problems = name_problems(options.name)
+    environments = environment_problems(options.environments)
+    problems += environments or target_problems(options.environments, options.targets)
     if options.mode not in MODES:
         problems.append(f"mode: einer von {', '.join(MODES)}.")
     if not PROJECT_PATTERN.fullmatch(options.ado_project) or options.ado_project.startswith(("_", ".")):
@@ -343,6 +406,25 @@ def connection_problems(ado: AzureDevOps, central_id: str, target_id: str, names
     return problems
 
 
+def environment_connection_problems(ado: AzureDevOps, target_id: str, name: str, environments: list[str]) -> list[str]:
+    """Die Service Connections sc-<name>-<env> legt das Scaffold an. Gibt es eine schon, muss sie
+    eine Azure-Service-Connection per Workload Identity Federation sein (früherer Lauf); ob sie zur
+    Identität der Umgebung gehört, prüfen connection (migrate) bzw. Terraform (new)."""
+    problems = []
+    for env in environments:
+        connection = environment_connection(name, env)
+        endpoint = endpoint_named(ado, target_id, connection)
+        if not endpoint:
+            continue
+        scheme = (endpoint.get("authorization") or {}).get("scheme", "")
+        if str(endpoint.get("type", "")).lower() != "azurerm" or scheme != "WorkloadIdentityFederation":
+            problems.append(f"Im Zielprojekt heißt schon eine andere Service Connection {connection} "
+                            f"({clean(endpoint.get('type', '?'))}, {clean(scheme or '?')}); sie umbenennen oder löschen.")
+        else:
+            log(f"Service Connection {connection} gibt es schon (früherer Lauf).")
+    return problems
+
+
 def run_check(ado: AzureDevOps, options: CheckOptions, central_id: str) -> int:
     check_auth(options.auth)
     problems = input_problems(options)
@@ -362,10 +444,13 @@ def run_check(ado: AzureDevOps, options: CheckOptions, central_id: str) -> int:
     repo = check_repository(ado, project, options.repository, options.mode,
                             can_create=options.auth == "servicePrincipal")
     problems = connection_problems(ado, central_id, project["id"], options.connections)
+    problems += environment_connection_problems(ado, project["id"], options.name, options.environments)
     if problems:
         fail(*problems)
     branch = (repo or {}).get("defaultBranch") or "refs/heads/main"
     log(f"Repo {options.repository} ({branch}), Service Connections: {', '.join(options.connections) or '-'}")
+    log("Umgebungen: " + ", ".join(f"{env} ({options.targets.get(env, 'Subscription des Scaffolds')})"
+                                    for env in options.environments))
     set_variable("seedProjectId", project["id"])
     # Der Name aus der API darf in Skripte (Terraform-Werte): Azure DevOps lässt in Projektnamen
     # weder Anführungszeichen noch Steuerzeichen zu.
@@ -744,24 +829,26 @@ class ConnectionOptions:
     project_id: str
     name: str
     tenant_id: str
-    subscription_id: str
-    subscription_name: str
-    client_id: str
+    environments: list[str]
+    # Umgebung -> {clientId, subscriptionId, subscriptionName} aus identity (seedEnvironmentIdentities)
+    identities: dict[str, dict]
     allowed_branches: list[str]
     pipelines_version: str
     dry_run: bool = False
 
 
-def endpoint_body(project: dict, connection: str, options: ConnectionOptions) -> dict:
+def endpoint_body(project: dict, connection: str, options: ConnectionOptions, env: str) -> dict:
+    identity = options.identities[env]
     return {
         "name": connection,
         "type": "azurerm",
         "url": "https://management.azure.com/",
-        "description": f"Sentinel Seed: Projektidentität id-{options.name} (Workload Identity Federation)",
+        "description": f"Sentinel Seed: Projektidentität {environment_identity(options.name, env)} "
+                       "(Workload Identity Federation)",
         "authorization": {"scheme": "WorkloadIdentityFederation",
-                          "parameters": {"tenantid": options.tenant_id, "serviceprincipalid": options.client_id}},
-        "data": {"environment": "AzureCloud", "scopeLevel": "Subscription", "subscriptionId": options.subscription_id,
-                 "subscriptionName": options.subscription_name, "creationMode": "Manual"},
+                          "parameters": {"tenantid": options.tenant_id, "serviceprincipalid": identity["clientId"]}},
+        "data": {"environment": "AzureCloud", "scopeLevel": "Subscription", "subscriptionId": identity["subscriptionId"],
+                 "subscriptionName": identity["subscriptionName"], "creationMode": "Manual"},
         "isShared": False,
         "isReady": True,
         "serviceEndpointProjectReferences": [{"projectReference": {"id": project["id"], "name": project["name"]},
@@ -774,36 +861,59 @@ def template_entry(ref: str) -> dict:
             "repositoryRef": f"refs/tags/{ref}", "templatePath": WEB_APP_TEMPLATE}
 
 
-def run_connection(ado: AzureDevOps, options: ConnectionOptions) -> int:
-    problems = name_problems(options.name)
-    if not TEMPLATE_REF_PATTERN.fullmatch(options.pipelines_version):
-        problems.append("pipelinesVersion: ein Release-Tag von seed-pipelines, etwa v0.20.0.")
-    if not options.client_id or not options.tenant_id or not options.subscription_id:
-        problems.append("Client-ID, Tenant und Subscription der Projektidentität fehlen (Schritt identity).")
-    if problems:
-        fail(*problems)
-    connection = f"sc-{options.name}"
-    project = ado.request("GET", f"{ado.org}/_apis/projects/{q(options.project_id)}?{API}")
+def identity_problems(environments: list[str], identities: dict, tenant_id: str) -> list[str]:
+    """Werte aus dem Schritt identity (seedEnvironmentIdentities, seedTenantId)."""
+    problems = []
+    if not GUID_PATTERN.fullmatch(tenant_id or ""):
+        problems.append("Tenant der Projektidentitäten fehlt (Schritt identity, seedTenantId).")
+    for env in environments:
+        identity = identities.get(env)
+        if (not isinstance(identity, dict)
+                or not all(GUID_PATTERN.fullmatch(str(identity.get(key, ""))) for key in ("clientId", "subscriptionId"))
+                or not str(identity.get("subscriptionName", "")).strip()):
+            problems.append(f"Identität der Umgebung {env} fehlt oder ist unvollständig (Schritt identity, "
+                            "seedEnvironmentIdentities).")
+    return problems
+
+
+def pipeline_snippet(name: str, environments: list[str]) -> list[str]:
+    """Der Teil von azure-pipelines.yml, der zu den Service Connections je Umgebung passt."""
+    lines = ["extends:", "  template: templates/web-app.yml@seed", "  parameters:",
+             f"    project: {name}", f"    serviceConnection: {environment_connection(name, environments[0])}",
+             "    environments:"]
+    for env in environments:
+        lines += [f"      - name: {env}", f"        serviceConnection: {environment_connection(name, env)}"]
+    return lines
+
+
+def ensure_connection(ado: AzureDevOps, project: dict, options: ConnectionOptions, env: str) -> dict | None:
+    """Service Connection sc-<name>-<env> mit Branch-Prüfung und Required template; liefert Issuer
+    und Subject für das Federated Credential, im dryRun ohne Service Connection None."""
+    connection = environment_connection(options.name, env)
+    identity_name = environment_identity(options.name, env)
+    identity = options.identities[env]
     endpoint = endpoint_named(ado, project["id"], connection)
     if endpoint:
         principal = ((endpoint.get("authorization") or {}).get("parameters") or {}).get("serviceprincipalid", "")
-        if principal.lower() != options.client_id.lower():
-            fail(f"Service Connection {connection} gibt es schon, aber nicht für id-{options.name}. Sie umbenennen "
+        if principal.lower() != identity["clientId"].lower():
+            fail(f"Service Connection {connection} gibt es schon, aber nicht für {identity_name}. Sie umbenennen "
                  "oder löschen und den Lauf wiederholen.")
+        subscription = str((endpoint.get("data") or {}).get("subscriptionId", ""))
+        if subscription and subscription.lower() != identity["subscriptionId"].lower():
+            fail(f"Service Connection {connection} zeigt auf eine andere Subscription, als für {env} vorgesehen ist "
+                 "(environmentTargets). Sie löschen und den Lauf wiederholen.")
         log(f"Service Connection {connection}: vorhanden")
     elif options.dry_run:
         log(f"Service Connection {connection} würde angelegt (dryRun).")
-        return 0
+        return None
     else:
-        ado.request("POST", f"{ado.org}/_apis/serviceendpoint/endpoints?{API}", endpoint_body(project, connection, options))
+        ado.request("POST", f"{ado.org}/_apis/serviceendpoint/endpoints?{API}",
+                    endpoint_body(project, connection, options, env))
         endpoint = endpoint_named(ado, project["id"], connection)
         if not endpoint:
             fail(f"Service Connection {connection} ist nach dem Anlegen nicht zu sehen.")
         log(f"Service Connection {connection}: angelegt")
     parameters = (endpoint.get("authorization") or {}).get("parameters") or {}
-    set_variable("seedServiceConnectionId", endpoint["id"])
-    set_variable("seedFederationIssuer", parameters.get("workloadIdentityFederationIssuer", ""))
-    set_variable("seedFederationSubject", parameters.get("workloadIdentityFederationSubject", ""))
 
     checks_url = f"{ado.org}/{project['id']}/_apis/pipelines/checks/configurations"
     existing = (ado.request("GET", f"{checks_url}?resourceType=endpoint&resourceId={endpoint['id']}&$expand=settings&{API_PREVIEW}")
@@ -844,6 +954,30 @@ def run_connection(ado: AzureDevOps, options: ConnectionOptions) -> int:
         else:
             ado.request("POST", f"{checks_url}?{API_PREVIEW}", body)
         log(f"Required template an {connection}: {WEB_APP_TEMPLATE}@{options.pipelines_version}")
+    return {"issuer": parameters.get("workloadIdentityFederationIssuer", ""),
+            "subject": parameters.get("workloadIdentityFederationSubject", "")}
+
+
+def run_connection(ado: AzureDevOps, options: ConnectionOptions) -> int:
+    problems = name_problems(options.name) + environment_problems(options.environments)
+    if not TEMPLATE_REF_PATTERN.fullmatch(options.pipelines_version):
+        problems.append("pipelinesVersion: ein Release-Tag von seed-pipelines, etwa v0.20.0.")
+    if not problems:
+        problems += identity_problems(options.environments, options.identities, options.tenant_id)
+    if problems:
+        fail(*problems)
+    project = ado.request("GET", f"{ado.org}/_apis/projects/{q(options.project_id)}?{API}")
+    federation = {}
+    for env in options.environments:
+        result = ensure_connection(ado, project, options, env)
+        if result:
+            federation[env] = result
+    set_json_variable("seedFederation", federation)
+    # migrate schreibt keine Dateien: Die Person übernimmt die Namen per Pull Request.
+    log("")
+    log("In azure-pipelines.yml des Projekts übernehmen (migrate schreibt keine Dateien; übrige Parameter wie bisher):")
+    for line in pipeline_snippet(options.name, options.environments):
+        log(f"  {line}")
     return 0
 
 
@@ -869,6 +1003,8 @@ class ReserveOptions:
     requested_by: str
     build_id: str
     dry_run: bool
+    # environmentTargets: Umgebung -> Subscription-ID; leer: alle in der Subscription des Scaffolds
+    targets: dict[str, str] = field(default_factory=dict)
 
 
 class Storage:
@@ -917,13 +1053,28 @@ class Storage:
         fail(f"{blob} nicht schreibbar: {clean(result.stderr.strip())}")
 
 
-def resource_groups(runner: Runner, name: str, environments: list[str]) -> list[str]:
+def resource_groups(runner: Runner, name: str, environments: list[str], subscription: str | None = None) -> list[str]:
     names = json.dumps([f"rg-{name}-{env}" for env in environments]).replace('"', "'")
     query = f"[?tags.\"seed:project\"=='{name}' || contains({names}, name)].name"
-    result = runner(["group", "list", "--query", query, "-o", "tsv"])
+    args = ["group", "list", "--query", query, "-o", "tsv"]
+    if subscription:
+        args += ["--subscription", subscription]
+    result = runner(args)
     if result.returncode:
+        if subscription:
+            fail(f"Resource Groups in der Subscription {subscription} (environmentTargets) nicht lesbar: Die "
+                 "Scaffold-Identität braucht dort Reader. Onboarding mit -EnvironmentTargets ausführen "
+                 f"(onboarding/Initialize-SeedTenant.ps1 -CentralScaffold). {clean(result.stderr.strip())}")
         fail(f"Resource Groups nicht lesbar (Reader auf der Subscription?): {clean(result.stderr.strip())}")
     return [line for line in result.stdout.split() if line]
+
+
+def environments_by_subscription(environments: list[str], targets: dict[str, str]) -> dict[str | None, list[str]]:
+    """Umgebungen je Ziel-Subscription, in Reihenfolge; None ist die Subscription des Scaffolds."""
+    groups: dict[str | None, list[str]] = {}
+    for env in environments:
+        groups.setdefault(targets.get(env), []).append(env)
+    return groups
 
 
 def registry_owner(entry: str) -> dict:
@@ -936,6 +1087,7 @@ def registry_owner(entry: str) -> dict:
 
 def run_reserve(options: ReserveOptions, runner: Runner = az_runner) -> int:
     problems = name_problems(options.name)
+    problems += environment_problems(options.environments) or target_problems(options.environments, options.targets)
     if problems:
         fail(*problems)
     storage = Storage(runner, options.account, options.container)
@@ -959,7 +1111,8 @@ def run_reserve(options: ReserveOptions, runner: Runner = az_runner) -> int:
         taken.append(f"Terraform-State unter {options.name}/")
     if storage.exists(f"scaffold/{options.name}.tfstate"):
         taken.append(f"Scaffold-State scaffold/{options.name}.tfstate")
-    groups = resource_groups(runner, options.name, options.environments)
+    groups = [group for subscription, environments in environments_by_subscription(options.environments, options.targets).items()
+              for group in resource_groups(runner, options.name, environments, subscription)]
     if groups:
         taken.append("Resource Groups " + ", ".join(groups))
     if taken:
@@ -994,19 +1147,23 @@ def rbac_condition(role_ids: tuple[str, ...] | list[str]) -> str:
             f"(@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {{{ids}}}))")
 
 
-def blob_condition(prefixes: list[str]) -> str:
-    """Storage Blob Data Contributor nur für Blobs unter diesen Pfaden; auflisten darf die Identität
-    den ganzen Container (eine Liste nennt nur Namen), wie die Scaffold-Identität für scaffold/."""
+def blob_condition(paths: list[str], prefixes: list[str]) -> str:
+    """Storage Blob Data Contributor nur für genau diese Blobs und Blobs unter diesen Präfixen;
+    auflisten darf die Identität den ganzen Container (eine Liste nennt nur Namen), wie die
+    Scaffold-Identität für scaffold/."""
     blobs = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs"
-    paths = " OR ".join(f"(@Resource[{blobs}:path] StringStartsWith '{p}')" for p in prefixes)
+    allowed = ([f"(@Resource[{blobs}:path] StringEquals '{p}')" for p in paths]
+               + [f"(@Resource[{blobs}:path] StringStartsWith '{p}')" for p in prefixes])
     return (f"(((!(ActionMatches{{'{blobs}/read'}} AND NOT SubOperationMatches{{'Blob.List'}})) AND "
             f"(!(ActionMatches{{'{blobs}/write'}})) AND (!(ActionMatches{{'{blobs}/add/action'}})) AND "
-            f"(!(ActionMatches{{'{blobs}/delete'}}))) OR {paths})")
+            f"(!(ActionMatches{{'{blobs}/delete'}}))) OR {' OR '.join(allowed)})")
 
 
-def state_prefixes(name: str) -> list[str]:
-    # State unter <name>/<env>.tfstate, Pläne unter plans/<name>/<env>/ (web-app.yml).
-    return [f"{name}/", f"plans/{name}/"]
+def state_paths(name: str, env: str) -> tuple[list[str], list[str]]:
+    """Blobs der Projekt-Pipeline für eine Umgebung (web-app.yml): der State genau unter
+    <name>/<env>.tfstate (Sperre per Lease auf demselben Blob) und Pläne unter
+    plans/<name>/<env>/<BuildId>.tfplan. Der Schrägstrich am Präfix trennt dev von dev2."""
+    return [f"{name}/{env}.tfstate"], [f"plans/{name}/{env}/"]
 
 
 class Az:
@@ -1045,6 +1202,15 @@ class IdentityOptions:
     sso: bool = False
     dry_run: bool = False
     owner: str = ""
+    # environmentTargets: Umgebung -> Subscription-ID; leer: alle in der Subscription des Scaffolds
+    targets: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Target:
+    environment: str
+    subscription_id: str
+    subscription_name: str
 
 
 @dataclass
@@ -1053,10 +1219,17 @@ class RoleWanted:
     role_id: str
     title: str
     condition: str | None = None
+    # Subscription des Scopes, wenn sie nicht die der Anmeldung ist (environmentTargets)
+    subscription: str | None = None
+
+
+def subscription_args(subscription: str | None) -> list[str]:
+    return ["--subscription", subscription] if subscription else []
 
 
 def ensure_role(az: Az, principal_id: str, wanted: RoleWanted, dry_run: bool) -> None:
-    assignments = az.json("role", "assignment", "list", "--scope", wanted.scope, "--role", wanted.role_id) or []
+    extra = subscription_args(wanted.subscription)
+    assignments = az.json("role", "assignment", "list", "--scope", wanted.scope, "--role", wanted.role_id, *extra) or []
     mine = [a for a in assignments if a.get("principalId") == principal_id
             and str(a.get("scope", "")).lower() == wanted.scope.lower()]
     if mine and (mine[0].get("condition") or None) == wanted.condition:
@@ -1072,122 +1245,182 @@ def ensure_role(az: Az, principal_id: str, wanted: RoleWanted, dry_run: bool) ->
             path = os.path.join(work, "assignment.json")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(updated, handle)
-            az.run("role", "assignment", "update", "--role-assignment", f"@{path}")
+            az.run("role", "assignment", "update", "--role-assignment", f"@{path}", *extra)
         log(f"  [neu]   {wanted.title}: Bedingung aktualisiert")
         return
+    # Mit --subscription der Ziel-Subscription: az bildet aus einer Rollen-ID die Definition unter
+    # der Subscription seiner Anmeldung, und die muss zum Scope passen.
     args = ["role", "assignment", "create", "--assignee-object-id", principal_id, "--assignee-principal-type",
             "ServicePrincipal", "--role", wanted.role_id, "--scope", wanted.scope,
-            "--description", f"Sentinel Seed: {wanted.title}"]
+            "--description", f"Sentinel Seed: {wanted.title}", *extra]
     if wanted.condition:
         args += ["--condition", wanted.condition, "--condition-version", "2.0"]
     az.run(*args, retry_principal=True)
     log(f"  [neu]   {wanted.title}")
 
 
-def ensure_graph_role(az: Az, principal_id: str, dry_run: bool) -> None:
+def ensure_graph_role(az: Az, principal_id: str, dry_run: bool, label: str = "") -> None:
     graph = az.json("ad", "sp", "show", "--id", GRAPH_APP_ID)
     role = next((r for r in graph.get("appRoles") or [] if r.get("value") == GRAPH_OWNED_BY), None)
     if not role:
         fail(f"Graph-Rolle {GRAPH_OWNED_BY} nicht gefunden.")
     url = f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal_id}/appRoleAssignments"
     assigned = (az.json("rest", "--method", "get", "--url", url) or {}).get("value") or []
+    title = f"Graph {GRAPH_OWNED_BY}{label}"
     if any(a.get("appRoleId") == role["id"] and a.get("resourceId") == graph["id"] for a in assigned):
-        log(f"  [ok]    Graph {GRAPH_OWNED_BY}")
+        log(f"  [ok]    {title}")
         return
     if dry_run:
-        log(f"  [fehlt] Graph {GRAPH_OWNED_BY}")
+        log(f"  [fehlt] {title}")
         return
     body = json.dumps({"principalId": principal_id, "resourceId": graph["id"], "appRoleId": role["id"]})
     az.run("rest", "--method", "post", "--url", url, "--headers", "Content-Type=application/json", "--body", body,
            retry_principal=True)
-    log(f"  [neu]   Graph {GRAPH_OWNED_BY}")
+    log(f"  [neu]   {title}")
+
+
+ONBOARDING_HINT = "Onboarding mit -EnvironmentTargets ausführen (onboarding/Initialize-SeedTenant.ps1 -CentralScaffold)."
+
+
+def subscription_name(az: Az, subscription: str, env: str, tenant_id: str) -> str:
+    """Name einer Ziel-Subscription; Reader darauf gibt das Onboarding (-EnvironmentTargets)."""
+    result = az.runner(["rest", "--method", "get", "--url",
+                        f"https://management.azure.com/subscriptions/{subscription}?api-version=2022-12-01", "-o", "json"])
+    if result.returncode:
+        fail(f"Subscription {subscription} (environmentTargets, Umgebung {env}) ist für die Scaffold-Identität nicht "
+             f"lesbar. {ONBOARDING_HINT} ({clean(result.stderr.strip())})")
+    data = json.loads(result.stdout or "{}")
+    if str(data.get("tenantId", "")).lower() != tenant_id.lower():
+        fail(f"Subscription {subscription} (Umgebung {env}) liegt nicht im Tenant der Scaffold-Identität.")
+    if data.get("state") in ("Disabled", "Deleted"):
+        fail(f"Subscription {subscription} (Umgebung {env}) ist {clean(data.get('state'))}.")
+    return str(data.get("displayName") or subscription)
+
+
+def resolve_targets(az: Az, account: dict, environments: list[str], targets: dict[str, str]) -> list[Target]:
+    names: dict[str, str] = {}
+    result = []
+    for env in environments:
+        subscription = targets.get(env, account["id"])
+        if subscription.lower() == str(account["id"]).lower():
+            result.append(Target(env, account["id"], account["name"]))
+            continue
+        if subscription not in names:
+            names[subscription] = subscription_name(az, subscription, env, account["tenantId"])
+        result.append(Target(env, subscription, names[subscription]))
+    return result
+
+
+def lock_role(az: Az, targets: list[Target], home: str) -> str:
+    """Die Rolle für Löschsperren muss in jeder Ziel-Subscription zuweisbar sein (assignableScopes)."""
+    roles = az.json("role", "definition", "list", "--name", LOCK_ROLE_NAME, "--custom-role-only", "true") or []
+    if not roles:
+        fail(f"Rolle {LOCK_ROLE_NAME} fehlt: zuerst onboarding/Initialize-SeedTenant.ps1.")
+    scopes = [str(s).lower() for s in roles[0].get("assignableScopes") or []]
+    # Unter einer Management Group lässt sich die Subscription hier nicht prüfen; dann gilt sie.
+    broad = "/" in scopes or any(s.startswith("/providers/microsoft.management/managementgroups/") for s in scopes)
+    for target in targets:
+        if target.subscription_id.lower() == home.lower() or broad:
+            continue
+        if f"/subscriptions/{target.subscription_id.lower()}" not in scopes:
+            fail(f"Rolle {LOCK_ROLE_NAME} ist in der Subscription {target.subscription_id} (Umgebung "
+                 f"{target.environment}) nicht zuweisbar. {ONBOARDING_HINT}")
+    return roles[0]["name"]
+
+
+def ensure_identity(az: Az, options: IdentityOptions, env: str) -> dict | None:
+    identity_name = environment_identity(options.name, env)
+    identity = az.json("identity", "show", "--name", identity_name, "--resource-group", options.identity_resource_group,
+                       missing_ok=True)
+    if identity:
+        tags = identity.get("tags") or {}
+        if tags.get("seed:project") != options.name or tags.get("seed:environment") != env:
+            fail(f"{identity_name} gibt es schon, aber nicht für das Projekt {options.name} und die Umgebung {env} "
+                 "(Tags seed:project, seed:environment).")
+        log(f"  [ok]    Managed Identity {identity_name}")
+        return identity
+    if options.dry_run:
+        log(f"  [fehlt] Managed Identity {identity_name}")
+        return None
+    # Tags getrennt: az identity create (Azure CLI ab 2.9x, Shorthand-Syntax) nimmt Tag-Namen mit
+    # Doppelpunkt nicht mehr an; az resource tag versteht sie weiter.
+    identity = az.json("identity", "create", "--name", identity_name, "--resource-group", options.identity_resource_group,
+                       "--location", options.location)
+    tags = {"seed:project": options.name, "seed:environment": env, "seed:purpose": "project-identity"}
+    az.run("resource", "tag", "--ids", identity["id"], "--tags", *[f"{k}={v}" for k, v in tags.items()])
+    identity["tags"] = tags
+    log(f"  [neu]   Managed Identity {identity_name}")
+    return identity
+
+
+def ensure_group(az: Az, options: IdentityOptions, target: Target) -> dict:
+    env = target.environment
+    group_name = f"rg-{options.name}-{env}"
+    extra = subscription_args(target.subscription_id)
+    group = az.json("group", "show", "--name", group_name, *extra, missing_ok=True)
+    if group:
+        if (group.get("tags") or {}).get("seed:project") != options.name:
+            fail(f"Resource Group {group_name} gibt es schon, aber nicht für das Projekt {options.name} (Tag seed:project).")
+        log(f"  [ok]    Resource Group {group_name}")
+        return group
+    if options.dry_run:
+        log(f"  [fehlt] Resource Group {group_name}")
+        return {"id": f"/subscriptions/{target.subscription_id}/resourceGroups/{group_name}", "name": group_name}
+    # Tags wie im Modul core (seed-terraform); mit create_resource_group = false setzt core keine.
+    tags = [f"seed:project={options.name}", f"seed:environment={env}"]
+    if options.owner:
+        tags.append(f"owner={options.owner}")
+    group = az.json("group", "create", "--name", group_name, "--location", options.location, *extra, "--tags", *tags)
+    log(f"  [neu]   Resource Group {group_name}")
+    return group
 
 
 def run_identity(options: IdentityOptions, runner: Runner = az_runner, sleep: Callable[[float], None] = time.sleep) -> int:
     problems = name_problems(options.name)
     if options.owner and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", options.owner):
         problems.append("owner: eine E-Mail-Adresse, z. B. team@example.org, oder leer.")
-    if not options.environments or not all(ENVIRONMENT_PATTERN.fullmatch(e) for e in options.environments):
-        problems.append("environments: mindestens eine Umgebung, Kleinbuchstaben, Ziffern und Bindestriche, höchstens 20 Zeichen.")
+    problems += environment_problems(options.environments) or target_problems(options.environments, options.targets)
     if problems:
         fail(*problems)
     az = Az(runner, sleep)
     account = az.json("account", "show")
-    subscription = f"/subscriptions/{account['id']}"
-    identity_name = f"id-{options.name}"
-    log(f"Identität {identity_name} in {options.identity_resource_group}{' (dryRun)' if options.dry_run else ''}")
+    # Erst alles prüfen (Ziel-Subscriptions, Rolle für Löschsperren), dann anlegen.
+    targets = resolve_targets(az, account, options.environments, options.targets)
+    lock_role_id = lock_role(az, targets, account["id"])
+    container = (f"/subscriptions/{account['id']}/resourceGroups/{options.state_resource_group}/providers/"
+                 f"Microsoft.Storage/storageAccounts/{options.state_account}/blobServices/default/containers/{options.container}")
+    log(f"Identitäten je Umgebung in {options.identity_resource_group}{' (dryRun)' if options.dry_run else ''}")
 
-    identity = az.json("identity", "show", "--name", identity_name, "--resource-group", options.identity_resource_group,
-                       missing_ok=True)
-    if identity:
-        owner = (identity.get("tags") or {}).get("seed:project")
-        if owner != options.name:
-            fail(f"{identity_name} gibt es schon, aber nicht für das Projekt {options.name} (Tag seed:project).")
-        log(f"  [ok]    Managed Identity {identity_name}")
-    elif options.dry_run:
-        log(f"  [fehlt] Managed Identity {identity_name}")
-    else:
-        # Tags getrennt: az identity create (Azure CLI ab 2.9x, Shorthand-Syntax) nimmt Tag-Namen mit
-        # Doppelpunkt nicht mehr an; az resource tag versteht sie weiter.
-        identity = az.json("identity", "create", "--name", identity_name, "--resource-group", options.identity_resource_group,
-                           "--location", options.location)
-        az.run("resource", "tag", "--ids", identity["id"], "--tags", f"seed:project={options.name}",
-               "seed:purpose=project-identity")
-        identity["tags"] = {"seed:project": options.name, "seed:purpose": "project-identity"}
-        log(f"  [neu]   Managed Identity {identity_name}")
-
-    groups = []
-    for env in options.environments:
-        group_name = f"rg-{options.name}-{env}"
-        group = az.json("group", "show", "--name", group_name, missing_ok=True)
-        if group:
-            if (group.get("tags") or {}).get("seed:project") != options.name:
-                fail(f"Resource Group {group_name} gibt es schon, aber nicht für das Projekt {options.name} (Tag seed:project).")
-            log(f"  [ok]    Resource Group {group_name}")
-        elif options.dry_run:
-            log(f"  [fehlt] Resource Group {group_name}")
-            group = {"id": f"{subscription}/resourceGroups/{group_name}", "name": group_name}
-        else:
-            # Tags wie im Modul core (seed-terraform); mit create_resource_group = false setzt core keine.
-            tags = [f"seed:project={options.name}", f"seed:environment={env}"]
-            if options.owner:
-                tags.append(f"owner={options.owner}")
-            group = az.json("group", "create", "--name", group_name, "--location", options.location, "--tags", *tags)
-            log(f"  [neu]   Resource Group {group_name}")
-        groups.append(group)
-
-    if not identity:
-        log("  Rollen, State und Graph folgen, sobald es die Identität gibt.")
-        return 0
-    principal = identity["principalId"]
-    lock_roles = az.json("role", "definition", "list", "--name", LOCK_ROLE_NAME, "--custom-role-only", "true") or []
-    if not lock_roles:
-        fail(f"Rolle {LOCK_ROLE_NAME} fehlt: zuerst onboarding/Initialize-SeedTenant.ps1.")
-    lock_role = lock_roles[0]["name"]
-    wanted = []
-    for group in groups:
-        wanted += [
-            RoleWanted(group["id"], ROLE_CONTRIBUTOR, f"Contributor auf {group['name']}"),
+    identities = {}
+    for target in targets:
+        env = target.environment
+        log(f"Umgebung {env}: Subscription {clean(target.subscription_name)} ({target.subscription_id})")
+        identity = ensure_identity(az, options, env)
+        group = ensure_group(az, options, target)
+        if not identity:
+            log("  Rollen, State und Graph folgen, sobald es die Identität gibt.")
+            continue
+        principal = identity["principalId"]
+        sub = None if target.subscription_id.lower() == str(account["id"]).lower() else target.subscription_id
+        paths, prefixes = state_paths(options.name, env)
+        wanted = [
+            RoleWanted(group["id"], ROLE_CONTRIBUTOR, f"Contributor auf {group['name']}", subscription=sub),
             RoleWanted(group["id"], ROLE_RBAC_ADMIN, f"Role Based Access Control Administrator (nur Seed-Rollen) auf {group['name']}",
-                       rbac_condition(SEED_ASSIGNABLE_ROLES)),
-            RoleWanted(group["id"], lock_role, f"{LOCK_ROLE_NAME} auf {group['name']}"),
+                       rbac_condition(SEED_ASSIGNABLE_ROLES), subscription=sub),
+            RoleWanted(group["id"], lock_role_id, f"{LOCK_ROLE_NAME} auf {group['name']}", subscription=sub),
+            RoleWanted(container, ROLE_BLOB_DATA_CONTRIBUTOR,
+                       f"Storage Blob Data Contributor auf {options.container} (nur {', '.join(paths + prefixes)})",
+                       blob_condition(paths, prefixes)),
         ]
-    container = (f"{subscription}/resourceGroups/{options.state_resource_group}/providers/Microsoft.Storage/storageAccounts/"
-                 f"{options.state_account}/blobServices/default/containers/{options.container}")
-    prefixes = state_prefixes(options.name)
-    wanted.append(RoleWanted(container, ROLE_BLOB_DATA_CONTRIBUTOR,
-                             f"Storage Blob Data Contributor auf {options.container} (nur {', '.join(prefixes)})",
-                             blob_condition(prefixes)))
-    for role in wanted:
-        ensure_role(az, principal, role, options.dry_run)
-    if options.sso:
-        ensure_graph_role(az, principal, options.dry_run)
+        for role in wanted:
+            ensure_role(az, principal, role, options.dry_run)
+        if options.sso:
+            ensure_graph_role(az, principal, options.dry_run)
+        identities[env] = {"clientId": identity["clientId"], "principalId": principal,
+                           "subscriptionId": target.subscription_id, "subscriptionName": target.subscription_name}
 
-    set_variable("seedIdentityClientId", identity["clientId"])
-    set_variable("seedIdentityPrincipalId", principal)
+    set_json_variable("seedEnvironmentIdentities", identities)
     set_variable("seedTenantId", account["tenantId"])
-    set_variable("seedSubscriptionId", account["id"])
-    set_variable("seedSubscriptionName", account["name"])
     return 0
 
 
@@ -1195,35 +1428,51 @@ def run_identity(options: IdentityOptions, runner: Runner = az_runner, sleep: Ca
 class FederateOptions:
     name: str
     identity_resource_group: str
-    issuer: str
-    subject: str
+    environments: list[str]
+    # Umgebung -> {issuer, subject} der Service Connection sc-<name>-<env>
+    federation: dict[str, dict]
     dry_run: bool = False
 
 
+def federation_problems(environments: list[str], federation: dict) -> list[str]:
+    problems = []
+    for env in environments:
+        entry = federation.get(env)
+        issuer = str((entry or {}).get("issuer", "")) if isinstance(entry, dict) else ""
+        subject = str((entry or {}).get("subject", "")) if isinstance(entry, dict) else ""
+        if not issuer.startswith("https://") or re.search(r"\s", issuer):
+            problems.append(f"issuer für {env}: https-URL aus der Service Connection (Terraform-Ausgabe "
+                            "workload_identity_federation bzw. scaffold.py connection).")
+        if not subject or re.search(r"[\s\x00-\x1f]", subject) or len(subject) > 600:
+            problems.append(f"subject für {env}: aus der Service Connection (Terraform-Ausgabe "
+                            "workload_identity_federation bzw. scaffold.py connection).")
+    return problems
+
+
 def run_federate(options: FederateOptions, runner: Runner = az_runner) -> int:
-    problems = name_problems(options.name)
-    if not options.issuer.startswith("https://") or re.search(r"\s", options.issuer):
-        problems.append("issuer: https-URL aus der Service Connection (Terraform-Ausgabe workload_identity_federation_issuer).")
-    if not options.subject or re.search(r"[\s\x00-\x1f]", options.subject) or len(options.subject) > 600:
-        problems.append("subject: aus der Service Connection (Terraform-Ausgabe workload_identity_federation_subject).")
+    problems = name_problems(options.name) + environment_problems(options.environments)
+    if not problems:
+        problems += federation_problems(options.environments, options.federation)
     if problems:
         fail(*problems)
     az = Az(runner)
-    identity_name = f"id-{options.name}"
-    credential = f"ado-sc-{options.name}"
-    existing = az.json("identity", "federated-credential", "list", "--identity-name", identity_name,
-                       "--resource-group", options.identity_resource_group) or []
-    if any(c.get("subject") == options.subject and c.get("issuer") == options.issuer for c in existing):
-        log(f"  [ok]    Federated Credential an {identity_name}")
-        return 0
-    named = any(c.get("name") == credential for c in existing)
-    if options.dry_run:
-        log(f"  [fehlt] Federated Credential {credential} an {identity_name}")
-        return 0
-    az.run("identity", "federated-credential", "update" if named else "create", "--name", credential,
-           "--identity-name", identity_name, "--resource-group", options.identity_resource_group,
-           "--issuer", options.issuer, "--subject", options.subject, "--audiences", FEDERATION_AUDIENCE)
-    log(f"  [neu]   Federated Credential {credential} an {identity_name}")
+    for env in options.environments:
+        identity_name = environment_identity(options.name, env)
+        credential = f"ado-{environment_connection(options.name, env)}"
+        issuer, subject = options.federation[env]["issuer"], options.federation[env]["subject"]
+        existing = az.json("identity", "federated-credential", "list", "--identity-name", identity_name,
+                           "--resource-group", options.identity_resource_group) or []
+        if any(c.get("subject") == subject and c.get("issuer") == issuer for c in existing):
+            log(f"  [ok]    Federated Credential an {identity_name}")
+            continue
+        named = any(c.get("name") == credential for c in existing)
+        if options.dry_run:
+            log(f"  [fehlt] Federated Credential {credential} an {identity_name}")
+            continue
+        az.run("identity", "federated-credential", "update" if named else "create", "--name", credential,
+               "--identity-name", identity_name, "--resource-group", options.identity_resource_group,
+               "--issuer", issuer, "--subject", subject, "--audiences", FEDERATION_AUDIENCE)
+        log(f"  [neu]   Federated Credential {credential} an {identity_name}")
     return 0
 
 
@@ -1244,6 +1493,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     check.add_argument("--requester-id", default=os.environ.get("BUILD_REQUESTEDFORID", ""))
     check.add_argument("--connection", action="append", default=[], help="Name einer Service Connection (mehrfach)")
     check.add_argument("--auth", default=auth_default)
+    check.add_argument("--environments-json", default="[]")
+    check.add_argument("--environment-targets-json", default="{}", help="environmentTargets: {env: {subscriptionId}}")
 
     create = sub.add_parser("create-project", help="Azure-DevOps-Projekt anlegen (createProject)")
     create.add_argument("--ado-project", required=True)
@@ -1262,6 +1513,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     reserve.add_argument("--project-name", required=True)
     reserve.add_argument("--repository", default="")
     reserve.add_argument("--environments-json", default="[]")
+    reserve.add_argument("--environment-targets-json", default="{}")
     reserve.add_argument("--requested-by", default=os.environ.get("BUILD_REQUESTEDFOR", ""))
     reserve.add_argument("--build-id", default=os.environ.get("BUILD_BUILDID", ""))
     reserve.add_argument("--dry-run", action="store_true")
@@ -1271,14 +1523,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     identity.add_argument("--name", required=True)
     identity.add_argument("--identity-resource-group", default="rg-seed-identities")
     identity.add_argument("--environments-json", default="[]")
+    identity.add_argument("--environment-targets-json", default="{}")
     identity.add_argument("--location", default="westeurope")
     identity.add_argument("--state-resource-group", default="")
     identity.add_argument("--storage-account", default="")
     identity.add_argument("--container", default="")
     identity.add_argument("--sso", default="false")
     identity.add_argument("--owner", default="", help="E-Mail für den Tag owner der Resource Groups")
-    identity.add_argument("--issuer", default="")
-    identity.add_argument("--subject", default="")
+    identity.add_argument("--federation-json", default="{}", help="identity federate: {env: {issuer, subject}}")
     identity.add_argument("--dry-run", action="store_true")
 
     fill = sub.add_parser("fill", help="seed-template am Tag als einen Commit nach main")
@@ -1289,13 +1541,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     fill.add_argument("--auth", default=auth_default)
     fill.add_argument("--dry-run", action="store_true")
 
-    connection = sub.add_parser("connection", help="Service Connection sc-<name> mit Prüfungen (migrate)")
+    connection = sub.add_parser("connection", help="Service Connections sc-<name>-<env> mit Prüfungen (migrate)")
     connection.add_argument("--project-id", required=True)
     connection.add_argument("--name", required=True)
     connection.add_argument("--tenant-id", default="")
-    connection.add_argument("--subscription-id", default="")
-    connection.add_argument("--subscription-name", default="")
-    connection.add_argument("--client-id", default="")
+    connection.add_argument("--environments-json", default="[]")
+    connection.add_argument("--identities-json", default="{}", help="seedEnvironmentIdentities aus identity")
     connection.add_argument("--default-branch", default="main")
     connection.add_argument("--pipelines-version", required=True)
     connection.add_argument("--dry-run", action="store_true")
@@ -1313,6 +1564,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--project-id", required=True)
     run.add_argument("--pipeline-id", required=True)
     run.add_argument("--authorize", action="append", default=[], help="Service Connection im Zielprojekt (mehrfach)")
+    run.add_argument("--name", default="", help="mit --environments-json: sc-<name>-<env> je Umgebung berechtigen")
+    run.add_argument("--environments-json", default="[]")
     run.add_argument("--no-start", action="store_true")
     return parser.parse_args(argv)
 
@@ -1327,6 +1580,30 @@ def environments_from_json(text: str) -> list[str]:
     return data
 
 
+def json_object(text: str, what: str) -> dict:
+    """Ein JSON-Objekt aus einer Umgebungsvariablen; eine nicht gesetzte Pipeline-Variable bleibt
+    als "$(name)" stehen und gilt als fehlend."""
+    if not text or text.startswith("$("):
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError as error:
+        fail(f"{what} ist kein JSON: {error}")
+    if not isinstance(data, dict):
+        fail(f"{what}: erwartet ein Objekt.")
+    return data
+
+
+def targets_from_json(text: str) -> dict[str, str]:
+    """environmentTargets ({dev: {subscriptionId: ...}}) als Umgebung -> Subscription-ID."""
+    targets = {}
+    for env, entry in json_object(text, "environmentTargets").items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("subscriptionId"), str):
+            fail(f"environmentTargets.{clean(env)}: erwartet {{subscriptionId: <GUID>}}.")
+        targets[str(env)] = entry["subscriptionId"].strip()
+    return targets
+
+
 def main(argv: list[str], ado_factory: Callable[[], AzureDevOps] = AzureDevOps.from_environment,
          runner: Runner = az_runner, git: GitRunner = git_runner) -> int:
     args = parse_args(argv)
@@ -1334,15 +1611,16 @@ def main(argv: list[str], ado_factory: Callable[[], AzureDevOps] = AzureDevOps.f
         return run_reserve(ReserveOptions(
             args.name, args.mode, args.storage_account, args.container, args.project_id, args.project_name,
             args.repository, environments_from_json(args.environments_json), args.requested_by, args.build_id,
-            args.dry_run), runner)
+            args.dry_run, targets_from_json(args.environment_targets_json)), runner)
     if args.command == "identity":
         if args.action == "federate":
-            return run_federate(FederateOptions(args.name, args.identity_resource_group, args.issuer, args.subject,
-                                                args.dry_run), runner)
+            return run_federate(FederateOptions(args.name, args.identity_resource_group,
+                                                environments_from_json(args.environments_json),
+                                                json_object(args.federation_json, "federation"), args.dry_run), runner)
         return run_identity(IdentityOptions(
             args.name, environments_from_json(args.environments_json), args.location, args.identity_resource_group,
             args.state_resource_group, args.storage_account, args.container, args.sso.lower() == "true",
-            args.dry_run, args.owner), runner)
+            args.dry_run, args.owner, targets_from_json(args.environment_targets_json)), runner)
     check_auth(getattr(args, "auth", "jobToken"))
     if args.command == "fill":
         problems = template_url_problems(args.template_url)
@@ -1360,17 +1638,24 @@ def main(argv: list[str], ado_factory: Callable[[], AzureDevOps] = AzureDevOps.f
     if args.command == "connection":
         branch = args.default_branch if args.default_branch.startswith("refs/") else f"refs/heads/{args.default_branch}"
         return run_connection(ado, ConnectionOptions(
-            args.project_id, args.name, args.tenant_id, args.subscription_id, args.subscription_name, args.client_id,
-            [branch, "refs/tags/v*"], args.pipelines_version, args.dry_run))
+            args.project_id, args.name, args.tenant_id, environments_from_json(args.environments_json),
+            json_object(args.identities_json, "seedEnvironmentIdentities"), [branch, "refs/tags/v*"],
+            args.pipelines_version, args.dry_run))
     if args.command == "run":
-        return run_first_run(ado, args.project_id, args.pipeline_id, args.authorize, start=not args.no_start)
+        environments = environments_from_json(args.environments_json)
+        problems = (name_problems(args.name) + environment_problems(environments)) if environments else []
+        if problems:
+            fail(*problems)
+        authorize = [environment_connection(args.name, env) for env in environments] + args.authorize
+        return run_first_run(ado, args.project_id, args.pipeline_id, authorize, start=not args.no_start)
     central_id = os.environ.get("SYSTEM_TEAMPROJECTID", "")
     if not central_id:
         fail("SYSTEM_TEAMPROJECTID fehlt.")
     if args.command == "check":
         return run_check(ado, CheckOptions(args.name, args.mode, args.ado_project, args.repository,
                                            args.allowed_projects, args.member_group, args.requester_id,
-                                           args.connection, args.auth), central_id)
+                                           args.connection, args.auth, environments_from_json(args.environments_json),
+                                           targets_from_json(args.environment_targets_json)), central_id)
     return run_share(ado, central_id, args.project_id, args.connection)
 
 

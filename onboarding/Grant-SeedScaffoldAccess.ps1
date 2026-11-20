@@ -26,8 +26,8 @@
          Agent-Queues des Projekts: Rolle User (eine neue Pipeline-Definition braucht "Use" an
          ihrer Standard-Queue)
       4. Environments: Rolle Creator (wer ein Environment anlegt, wird dessen Administrator)
-      5. Service Connections: Rolle Creator (nötig, um die Service Connection sc-<name> des
-         Projekts anzulegen und die GitHub-Service-Connection ins Projekt zu teilen; wer anlegt
+      5. Service Connections: Rolle Creator (nötig, um die Service Connections sc-<name>-<env>
+         des Projekts anzulegen und die GitHub-Service-Connection ins Projekt zu teilen; wer anlegt
          oder teilt, wird dort Administrator und darf die neue Pipeline berechtigen)
     Mitglieder aufnehmen (contributors, projectAdministrators des Scaffolds) kann die Gruppe nicht;
     in vorhandenen Projekten ist die startende Person schon Contributor (das prüft das Scaffold),

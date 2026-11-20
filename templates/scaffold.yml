@@ -2,21 +2,26 @@
 #
 # Legt Seed-Projekte in Azure DevOps und Azure an: auf Wunsch das Azure-DevOps-Projekt, das Repo
 # mit seed-template an einem Tag, project.yaml und azure-pipelines.yml, Environments mit
-# Freigaben, Pipeline, Branch-Policies und Git-Rechte; in Azure eine eigene Identität je Projekt
-# (id-<name>) mit Rechten nur auf rg-<name>-<env> und dem State unter <name>/, und im Projekt die
-# Service Connection sc-<name> für diese Identität. Grundlage ist das Terraform-Modul
-# seed-terraform//ado-project ab v0.20.0; ein erneuter Lauf ändert nur, was fehlt.
+# Freigaben, Pipeline, Branch-Policies und Git-Rechte; in Azure je Projekt und Umgebung eine
+# eigene Identität (id-<name>-<env>) mit Rechten nur auf rg-<name>-<env> und dem State dieser
+# Umgebung, und im Projekt je Umgebung die Service Connection sc-<name>-<env> für diese Identität.
+# environmentTargets legt fest, in welcher Subscription die Resource Group einer Umgebung liegt.
+# Grundlage ist das Terraform-Modul seed-terraform//ado-project ab v0.21.0; ein erneuter Lauf
+# ändert nur, was fehlt.
 #
 # Das Scaffold ist ein Makler: Es führt nie Code aus dem Zielrepo oder aus seed-template aus,
 # und es berechtigt die neue Pipeline erst, wenn Policies, Prüfungen und ein bekannter Inhalt
 # stehen. Reihenfolge (README, Scaffold):
-#   1 prüfen            Eingaben, Zielprojekt, Mitgliedschaft, Repo, Name (scaffold.py check, reserve)
-#   2 identity          id-<name>, Resource Groups, Rollen, State-Pfad, Graph (nur sso)
+#   1 prüfen            Eingaben, Umgebungen und environmentTargets, Zielprojekt, Mitgliedschaft,
+#                       Repo, Name (scaffold.py check, reserve)
+#   2 identity          je Umgebung id-<name>-<env>, Resource Group in der Ziel-Subscription,
+#                       Rollen, State-Pfad, Graph (nur sso)
 #   3 fill              seed-template am Tag templateRef als ein Commit nach main
-#   4 Terraform         ado-project: sc-<name> mit Prüfungen, Environments, Policies, Git-Rechte;
-#                       danach identity federate mit Issuer und Subject von sc-<name>
+#   4 Terraform         ado-project: sc-<name>-<env> je Umgebung mit Prüfungen, Environments,
+#                       Policies, Git-Rechte; danach identity federate je Umgebung mit Issuer und
+#                       Subject der Service Connection
 #   5 verify            main enthält nur den Scaffold-Commit und Commits von Terraform
-#   6 run               Pipeline für sc-<name> und GitHub berechtigen, ersten Lauf starten
+#   6 run               Pipeline für sc-<name>-<env> und GitHub berechtigen, ersten Lauf starten
 #
 # Modi:
 #   createProject       legt das Azure-DevOps-Projekt adoProject an und nimmt die startende Person
@@ -25,7 +30,8 @@
 #                       servicePrincipal: weiter wie new, im selben Lauf.
 #   new                 vorhandenes Projekt mit initialisiertem Repo (nur README, LICENSE, .gitignore)
 #   migrate             vorhandenes Repo einrichten wie onboarding/Initialize-SeedProject.ps1, mit
-#                       eigener Identität und Service Connection; keine Dateien
+#                       eigener Identität und Service Connection je Umgebung; keine Dateien (das
+#                       Log nennt den Ausschnitt für azure-pipelines.yml)
 #   enableBranchPolicy  nach dem Umschalten: Branch-Policies (PR-Validierung, Reviewer)
 # dryRun prüft nur.
 #
@@ -39,8 +45,8 @@
 #                        Azure DevOps Benutzer mit Zugriffsstufe Basic ist; legt auch Repos an.
 #   pat                  bis v0.19.0; bricht mit einem Hinweis ab.
 #
-# Eingaben der startenden Person (name, adoProject, repository, Listen) erreichen Skripte nur
-# über die Umgebung, nie als Text im Skript.
+# Eingaben der startenden Person (name, adoProject, repository, Listen) und environmentTargets
+# erreichen Skripte nur über die Umgebung, nie als Text im Skript.
 
 parameters:
   - name: name
@@ -63,6 +69,14 @@ parameters:
   - name: environments
     type: object
     default: [dev]
+  # Ziel-Subscription je Umgebung, fest in der zentralen Pipeline-Datei (Onboarding
+  # -EnvironmentTargets), nicht beim Start: {dev: {subscriptionId: <GUID>}, prod: {...}}. Die
+  # Resource Group rg-<name>-<env> und die Rollen der Identität dieser Umgebung entstehen dort.
+  # Leer: alle Umgebungen in der Subscription der Scaffold-Identität. Nicht leer: Eine gewählte
+  # Umgebung ohne Eintrag bricht im Prüfschritt ab, bevor etwas angelegt wird.
+  - name: environmentTargets
+    type: object
+    default: {}
   # Principal Names (E-Mail) der Personen, die Infrastruktur-Änderungen freigeben.
   - name: approvers
     type: object
@@ -158,10 +172,10 @@ parameters:
     default: v0.19.0
   - name: terraformModuleVersion
     type: string
-    default: v0.20.0
+    default: v0.21.0
   - name: pipelinesVersion
     type: string
-    default: v0.21.1
+    default: v0.22.0
   - name: terraformVersion
     type: string
     default: '1.15.3'
@@ -219,7 +233,7 @@ stages:
                 displayName: Service Connection prüfen
           - ${{ if ne(parameters.serviceConnection, '') }}:
               - bash: |
-                  echo "##vso[task.logissue type=warning]serviceConnection wird ab v0.20.0 nicht mehr genutzt: Jedes Projekt bekommt eine eigene Service Connection sc-<name>."
+                  echo "##vso[task.logissue type=warning]serviceConnection wird ab v0.20.0 nicht mehr genutzt: Jedes Projekt bekommt je Umgebung eine eigene Service Connection sc-<name>-<env>."
                 displayName: Hinweis serviceConnection
           - ${{ if and(parameters.mcp, not(parameters.sso)) }}:
               - bash: |
@@ -252,7 +266,8 @@ stages:
               python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" check \
                 --name "$SEED_NAME" --mode "$SEED_MODE" --ado-project "$SEED_ADO_PROJECT" \
                 --repository "$SEED_REPOSITORY" --allowed-projects "$SEED_ALLOWED_PROJECTS" \
-                --member-group "$SEED_MEMBER_GROUP" --connection "$SEED_GITHUB_CONNECTION"
+                --member-group "$SEED_MEMBER_GROUP" --connection "$SEED_GITHUB_CONNECTION" \
+                --environments-json "$SEED_ENVIRONMENTS" --environment-targets-json "$SEED_ENVIRONMENT_TARGETS"
             displayName: Zielprojekt, Person und Repo prüfen
             env:
               SEED_AZDO_TOKEN: $(seedAzdoToken)
@@ -264,6 +279,8 @@ stages:
               SEED_ALLOWED_PROJECTS: ${{ parameters.allowedProjects }}
               SEED_MEMBER_GROUP: ${{ parameters.memberGroup }}
               SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
+              SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+              SEED_ENVIRONMENT_TARGETS: ${{ convertToJson(parameters.environmentTargets) }}
 
           # --- createProject: Projekt anlegen (Weg J endet hier mit dem Hinweis) ------------------
           - ${{ if eq(parameters.mode, 'createProject') }}:
@@ -291,6 +308,7 @@ stages:
                   SEED_PROJECT_NAME: $(seedProjectName)
                   SEED_REPOSITORY: $(seedRepository)
                   SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+                  SEED_ENVIRONMENT_TARGETS: ${{ convertToJson(parameters.environmentTargets) }}
                   SEED_STORAGE_ACCOUNT: ${{ parameters.terraformState.storageAccount }}
                   SEED_CONTAINER: ${{ parameters.terraformState.container }}
                   SEED_DRY_RUN: ${{ lower(parameters.dryRun) }}
@@ -302,7 +320,7 @@ stages:
                     set -euo pipefail
                     args=(--name "$SEED_NAME" --mode "$SEED_MODE" --project-id "$SEED_PROJECT_ID"
                           --project-name "$SEED_PROJECT_NAME" --repository "$SEED_REPOSITORY"
-                          --environments-json "$SEED_ENVIRONMENTS"
+                          --environments-json "$SEED_ENVIRONMENTS" --environment-targets-json "$SEED_ENVIRONMENT_TARGETS"
                           --storage-account "$SEED_STORAGE_ACCOUNT" --container "$SEED_CONTAINER")
                     if [ "$SEED_DRY_RUN" = true ]; then args+=(--dry-run); fi
                     python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" reserve "${args[@]}"
@@ -311,10 +329,11 @@ stages:
           - ${{ if or(eq(parameters.mode, 'new'), and(eq(parameters.mode, 'createProject'), eq(parameters.azureDevOpsAuth, 'servicePrincipal'), not(parameters.dryRun))) }}:
               # 2. Identität des Projekts in Azure
               - task: AzureCLI@2
-                displayName: Projektidentität anlegen
+                displayName: Projektidentitäten je Umgebung anlegen
                 env:
                   SEED_NAME: ${{ parameters.name }}
                   SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+                  SEED_ENVIRONMENT_TARGETS: ${{ convertToJson(parameters.environmentTargets) }}
                   SEED_SSO: ${{ lower(parameters.sso) }}
                   SEED_LOCATION: ${{ parameters.location }}
                   SEED_IDENTITY_RESOURCE_GROUP: ${{ parameters.identityResourceGroup }}
@@ -329,6 +348,7 @@ stages:
                   inlineScript: |
                     set -euo pipefail
                     args=(--name "$SEED_NAME" --environments-json "$SEED_ENVIRONMENTS" --sso "$SEED_SSO"
+                          --environment-targets-json "$SEED_ENVIRONMENT_TARGETS"
                           --location "$SEED_LOCATION" --identity-resource-group "$SEED_IDENTITY_RESOURCE_GROUP"
                           --state-resource-group "$SEED_STATE_RESOURCE_GROUP"
                           --storage-account "$SEED_STORAGE_ACCOUNT" --container "$SEED_CONTAINER")
@@ -368,7 +388,8 @@ stages:
                       SEED_PROJECT_ID: $(seedProjectId)
                       SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
 
-                  # 4. Terraform: Service Connection sc-<name> mit Prüfungen, Environments, Policies
+                  # 4. Terraform: Service Connection sc-<name>-<env> je Umgebung mit Prüfungen,
+                  # Environments, Policies
                   - template: steps/terraform-install.yml
                     parameters:
                       version: ${{ parameters.terraformVersion }}
@@ -416,16 +437,18 @@ stages:
                         fi
                         terraform apply -auto-approve
                         echo "##vso[task.setvariable variable=pipelineId]$(terraform output -raw pipeline_id)"
-                        echo "##vso[task.setvariable variable=seedFederationIssuer]$(terraform output -raw workload_identity_federation_issuer)"
-                        echo "##vso[task.setvariable variable=seedFederationSubject]$(terraform output -raw workload_identity_federation_subject)"
+                        # Issuer und Subject je Umgebung als JSON in einer Zeile; % als \u0025, weil der
+                        # Agent %-Folgen im Wert eines Logging-Befehls zurückübersetzt.
+                        federation="$(terraform output -json workload_identity_federation | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), separators=(",", ":")).replace("%", "\\u0025"))')"
+                        echo "##vso[task.setvariable variable=seedFederation]$federation"
                         echo "Repo: $(terraform output -raw repository_url)"
                   - task: AzureCLI@2
-                    displayName: Federated Credential für sc-${{ parameters.name }}
+                    displayName: Federated Credentials je Umgebung
                     env:
                       SEED_NAME: ${{ parameters.name }}
+                      SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
                       SEED_IDENTITY_RESOURCE_GROUP: ${{ parameters.identityResourceGroup }}
-                      SEED_ISSUER: $(seedFederationIssuer)
-                      SEED_SUBJECT: $(seedFederationSubject)
+                      SEED_FEDERATION: $(seedFederation)
                     inputs:
                       azureSubscription: ${{ coalesce(parameters.scaffoldServiceConnection, parameters.stateServiceConnection) }}
                       scriptType: bash
@@ -434,7 +457,7 @@ stages:
                         set -euo pipefail
                         python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" identity federate \
                           --name "$SEED_NAME" --identity-resource-group "$SEED_IDENTITY_RESOURCE_GROUP" \
-                          --issuer "$SEED_ISSUER" --subject "$SEED_SUBJECT"
+                          --environments-json "$SEED_ENVIRONMENTS" --federation-json "$SEED_FEDERATION"
 
                   # 5. Inhalt prüfen, bevor die Pipeline die Service Connection bekommt
                   - bash: |
@@ -451,8 +474,10 @@ stages:
                   # 6. Berechtigen und ersten Lauf starten
                   - bash: |
                       set -euo pipefail
+                      # Service Connections sc-<name>-<env> je Umgebung und die für GitHub
                       args=(--project-id "$SEED_PROJECT_ID" --pipeline-id "$SEED_PIPELINE_ID"
-                            --authorize "sc-$SEED_NAME" --authorize "$SEED_GITHUB_CONNECTION")
+                            --name "$SEED_NAME" --environments-json "$SEED_ENVIRONMENTS"
+                            --authorize "$SEED_GITHUB_CONNECTION")
                       if [ "$SEED_START" != true ]; then args+=(--no-start); fi
                       python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" run "${args[@]}"
                       if [ "$SEED_START" = true ]; then
@@ -462,6 +487,7 @@ stages:
                     env:
                       SEED_AZDO_TOKEN: $(seedAzdoToken)
                       SEED_NAME: ${{ parameters.name }}
+                      SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
                       SEED_PROJECT_ID: $(seedProjectId)
                       SEED_PIPELINE_ID: $(pipelineId)
                       SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
@@ -470,10 +496,11 @@ stages:
           # --- migrate und enableBranchPolicy: wie onboarding/Initialize-SeedProject.ps1 -----------
           - ${{ if in(parameters.mode, 'migrate', 'enableBranchPolicy') }}:
               - task: AzureCLI@2
-                displayName: Projektidentität anlegen
+                displayName: Projektidentitäten je Umgebung anlegen
                 env:
                   SEED_NAME: ${{ parameters.name }}
                   SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
+                  SEED_ENVIRONMENT_TARGETS: ${{ convertToJson(parameters.environmentTargets) }}
                   SEED_SSO: ${{ lower(parameters.sso) }}
                   SEED_LOCATION: ${{ parameters.location }}
                   SEED_IDENTITY_RESOURCE_GROUP: ${{ parameters.identityResourceGroup }}
@@ -488,6 +515,7 @@ stages:
                   inlineScript: |
                     set -euo pipefail
                     args=(--name "$SEED_NAME" --environments-json "$SEED_ENVIRONMENTS" --sso "$SEED_SSO"
+                          --environment-targets-json "$SEED_ENVIRONMENT_TARGETS"
                           --location "$SEED_LOCATION" --identity-resource-group "$SEED_IDENTITY_RESOURCE_GROUP"
                           --state-resource-group "$SEED_STATE_RESOURCE_GROUP"
                           --storage-account "$SEED_STORAGE_ACCOUNT" --container "$SEED_CONTAINER")
@@ -503,33 +531,33 @@ stages:
                       SEED_AZDO_TOKEN: $(seedAzdoToken)
                       SEED_PROJECT_ID: $(seedProjectId)
                       SEED_GITHUB_CONNECTION: ${{ parameters.githubConnection }}
-                  # Ohne Terraform (es schriebe Dateien): Service Connection sc-<name> per API, mit
-                  # Branch-Prüfung auf den Default-Branch und Required template am Tag pipelinesVersion.
+                  # Ohne Terraform (es schriebe Dateien): je Umgebung die Service Connection
+                  # sc-<name>-<env> per API, mit Branch-Prüfung auf den Default-Branch und Required
+                  # template am Tag pipelinesVersion. Am Ende nennt das Log den Ausschnitt für
+                  # azure-pipelines.yml des Projekts.
                   - bash: |
                       set -euo pipefail
                       python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" connection \
                         --project-id "$SEED_PROJECT_ID" --name "$SEED_NAME" --tenant-id "$SEED_TENANT_ID" \
-                        --subscription-id "$SEED_SUBSCRIPTION_ID" --subscription-name "$SEED_SUBSCRIPTION_NAME" \
-                        --client-id "$SEED_IDENTITY_CLIENT_ID" --default-branch "$SEED_DEFAULT_BRANCH" \
-                        --pipelines-version "$SEED_PIPELINES_VERSION"
-                    displayName: Service Connection sc-${{ parameters.name }}
+                        --environments-json "$SEED_ENVIRONMENTS" --identities-json "$SEED_ENVIRONMENT_IDENTITIES" \
+                        --default-branch "$SEED_DEFAULT_BRANCH" --pipelines-version "$SEED_PIPELINES_VERSION"
+                    displayName: Service Connections je Umgebung
                     env:
                       SEED_AZDO_TOKEN: $(seedAzdoToken)
                       SEED_PROJECT_ID: $(seedProjectId)
                       SEED_NAME: ${{ parameters.name }}
+                      SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
                       SEED_TENANT_ID: $(seedTenantId)
-                      SEED_SUBSCRIPTION_ID: $(seedSubscriptionId)
-                      SEED_SUBSCRIPTION_NAME: $(seedSubscriptionName)
-                      SEED_IDENTITY_CLIENT_ID: $(seedIdentityClientId)
+                      SEED_ENVIRONMENT_IDENTITIES: $(seedEnvironmentIdentities)
                       SEED_DEFAULT_BRANCH: $(seedDefaultBranch)
                       SEED_PIPELINES_VERSION: ${{ parameters.pipelinesVersion }}
                   - task: AzureCLI@2
-                    displayName: Federated Credential für sc-${{ parameters.name }}
+                    displayName: Federated Credentials je Umgebung
                     env:
                       SEED_NAME: ${{ parameters.name }}
+                      SEED_ENVIRONMENTS: ${{ convertToJson(parameters.environments) }}
                       SEED_IDENTITY_RESOURCE_GROUP: ${{ parameters.identityResourceGroup }}
-                      SEED_ISSUER: $(seedFederationIssuer)
-                      SEED_SUBJECT: $(seedFederationSubject)
+                      SEED_FEDERATION: $(seedFederation)
                     inputs:
                       azureSubscription: ${{ coalesce(parameters.scaffoldServiceConnection, parameters.stateServiceConnection) }}
                       scriptType: bash
@@ -538,19 +566,25 @@ stages:
                         set -euo pipefail
                         python3 "$(Pipeline.Workspace)/seed/scripts/scaffold/scaffold.py" identity federate \
                           --name "$SEED_NAME" --identity-resource-group "$SEED_IDENTITY_RESOURCE_GROUP" \
-                          --issuer "$SEED_ISSUER" --subject "$SEED_SUBJECT"
+                          --environments-json "$SEED_ENVIRONMENTS" --federation-json "$SEED_FEDERATION"
               - pwsh: |
+                  # Je Umgebung sc-<name>-<env> (scaffold.py connection); die erste gilt als
+                  # serviceConnection, alle bekommen die Pipeline-Berechtigung.
+                  $environments = [string[]] @($env:SEED_ENVIRONMENTS | ConvertFrom-Json)
+                  $connections = [ordered] @{}
+                  foreach ($environment in $environments) { $connections[$environment] = "sc-$($env:SEED_NAME)-$environment" }
                   $arguments = @{
                       AzureDevOpsOrganization = $env:SYSTEM_COLLECTIONURI.TrimEnd('/')
                       AzureDevOpsProject      = $env:SEED_PROJECT_ID
                       Repository              = $env:SEED_REPOSITORY
                       SeedProjectName         = $env:SEED_NAME
                       DefaultBranch           = $env:SEED_DEFAULT_BRANCH
-                      Environments            = [string[]] @($env:SEED_ENVIRONMENTS | ConvertFrom-Json)
+                      Environments            = $environments
                       Approvers               = [string[]] @($env:SEED_APPROVERS | ConvertFrom-Json)
                       ApproverGroups          = [string[]] @($env:SEED_APPROVER_GROUPS | ConvertFrom-Json)
                       AppApprovalEnvironments = [string[]] @($env:SEED_APP_APPROVAL_ENVIRONMENTS | ConvertFrom-Json)
-                      ServiceConnectionName   = "sc-$($env:SEED_NAME)"
+                      ServiceConnectionName   = $connections[$environments[0]]
+                      EnvironmentServiceConnections = $connections
                       GitHubConnectionName    = $env:SEED_GITHUB_CONNECTION
                       MinReviewers            = [int] $env:SEED_MIN_REVIEWERS
                       Pool                    = $env:SEED_PROJECT_POOL
