@@ -1,6 +1,7 @@
 # Sentinel Seed: zentrales Scaffold. Legt Azure-DevOps-Projekte und Seed-Projekte an und richtet
-# vorhandene Repos ein, ohne Admin-Rechte der startenden Person. Jedes Seed-Projekt bekommt eine
-# eigene Identität in Azure mit Rechten nur auf seine Resource Groups.
+# vorhandene Repos ein, ohne Admin-Rechte der startenden Person. Jedes Seed-Projekt bekommt je
+# Umgebung eine eigene Identität in Azure mit Rechten nur auf die Resource Group dieser Umgebung,
+# in der Subscription aus environmentTargets.
 # Angelegt vom Tenant-Onboarding (onboarding/Initialize-SeedTenant.ps1 -CentralScaffold).
 #
 # Neues Azure-DevOps-Projekt: mode createProject, adoProject = Name des neuen Projekts. Danach im
@@ -45,7 +46,7 @@ parameters:
   - name: environments
     displayName: Umgebungen in Deploy-Reihenfolge
     type: object
-    default: [dev]
+    default: __ENVIRONMENTS__
   - name: approvers
     displayName: Freigabe für Infrastruktur-Änderungen (E-Mail-Adressen; leer und ohne Gruppe = keine Freigabe)
     type: object
@@ -104,6 +105,10 @@ extends:
     approverGroups: __APPROVER_GROUPS__
     # Projektadministratoren neuer Projekte (Principal Names, E-Mail); Standard niemand aus dem Team.
     projectAdministrators: __PROJECT_ADMINISTRATORS__
+    # Ziel-Subscription je Umgebung (Onboarding -EnvironmentTargets), etwa
+    # { dev: { subscriptionId: '<GUID>' }, prod: { subscriptionId: '<GUID>' } }. Leer: alle
+    # Umgebungen in der Subscription der Scaffold-Identität. Eine Umgebung ohne Eintrag bricht ab.
+    environmentTargets: __ENVIRONMENT_TARGETS__
     pipelinesVersion: __SEED_PIPELINES_VERSION__
     templateRef: __TEMPLATE_REF__
     githubConnection: __GITHUB_CONNECTION__

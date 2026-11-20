@@ -40,6 +40,10 @@
            - Storage Blob Data Contributor auf dem State-Container, per Bedingung nur für Blobs
              unter scaffold/ (Registry und eigener State)
            - Microsoft Graph Application.Read.All und AppRoleAssignment.ReadWrite.All
+         Mit -EnvironmentTargets (Ziel-Subscription je Umgebung) in jeder weiteren Subscription
+         dieselben Rechte zum Anlegen: Reader, "Sentinel Seed Resource Group Creator" und Role Based
+         Access Control Administrator mit derselben Bedingung; beide eigenen Rollen werden dort
+         zuweisbar (assignableScopes). Identitäten und State bleiben in -SubscriptionId.
          Service Connection (-ScaffoldConnectionName) nur für seed-scaffold, mit Branch-Prüfung
          (main) und Required template (templates/scaffold.yml am Tag). Die Build-Service-Identität
          dieses Projekts bekommt die Rolle Administrator an der GitHub-Service-Connection (sie
@@ -127,8 +131,22 @@
     Scaffold-Identität ist Benutzer in Azure DevOps mit Zugriffsstufe Basic; README, Weg S).
 
 .PARAMETER IdentityResourceGroup
-    Nur mit -CentralScaffold: Resource Group für die Identitäten der Projekte (id-<name>), Standard
-    rg-seed-identities. Die Scaffold-Identität ist dort Managed Identity Contributor.
+    Nur mit -CentralScaffold: Resource Group für die Identitäten der Projekte (id-<name>-<env>, eine
+    je Umgebung), Standard rg-seed-identities. Die Scaffold-Identität ist dort Managed Identity
+    Contributor.
+
+.PARAMETER EnvironmentTargets
+    Nur mit -CentralScaffold: Ziel-Subscription je Umgebung, etwa
+    ([ordered]@{ dev = '00000000-0000-0000-0000-000000000000'; prod = '11111111-1111-1111-1111-111111111111' }).
+    Die Resource Group rg-<name>-<env> einer Umgebung entsteht in ihrer Subscription. Die
+    Reihenfolge ist die Deploy-Reihenfolge; mit mehr als einer Umgebung deshalb [ordered]@{...}.
+    Das Skript gibt der Scaffold-Identität in jeder weiteren Subscription Reader, die Rolle zum
+    Anlegen von Resource Groups und Role Based Access Control Administrator (Bedingung wie in
+    -SubscriptionId) und macht dort die Rollen für Löschsperren und Resource Groups zuweisbar.
+    In die neue azure-pipelines.yml von seed-scaffold kommen environmentTargets und als
+    Standard der Umgebungen die Schlüssel; eine vorhandene Datei ändert es nicht und nennt die
+    Zeilen. Leer (Standard): alle Umgebungen in -SubscriptionId. Alle Subscriptions im selben
+    Tenant; das Konto braucht dort Owner (oder User Access Administrator).
 
 .PARAMETER ProjectAdministrators
     Nur mit -CentralScaffold: Principal Names (E-Mail), die in jedem neuen Projekt
@@ -191,7 +209,7 @@ param(
     [string] $StateStorageAccount = '',
     [string] $StateContainer = 'tfstate',
     [string[]] $Approvers = @(),
-    [string] $SeedPipelinesVersion = 'v0.21.1',
+    [string] $SeedPipelinesVersion = 'v0.22.0',
     [string[]] $PowerPlatformEnvironmentUrl = @(),
     [string[]] $AllowedBranches = @('main'),
     [string[]] $TemplateRefs = @('refs/tags/v*'),
@@ -213,6 +231,7 @@ param(
     [string] $IdentityResourceGroup = 'rg-seed-identities',
     [string[]] $ProjectAdministrators = @(),
     [ValidatePattern('^v\d+\.\d+\.\d+$')] [string] $TemplateRef = 'v0.19.0',
+    [System.Collections.IDictionary] $EnvironmentTargets = @{},
     [switch] $DryRun
 )
 
@@ -227,6 +246,19 @@ if ($CentralScaffold -and $SeedPipelinesVersion -match '^v(\d+)\.(\d+)\.' -and [
 $RequiredTemplateRefs = @($RequiredTemplateRefs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
         ForEach-Object { if ($_ -like 'refs/*') { $_ } else { "refs/tags/$_" } })
 if ($PSBoundParameters.ContainsKey('RequiredTemplateRefs') -and -not $RequiredTemplateRefs) { throw 'RequiredTemplateRefs: mindestens ein Ref.' }
+# Ziel-Subscription je Umgebung (zentrales Scaffold): Namen wie in scaffold.py, IDs als GUID.
+if ($EnvironmentTargets.Count) {
+    if (-not $CentralScaffold) { throw '-EnvironmentTargets nur mit -CentralScaffold.' }
+    if ($EnvironmentTargets.Count -gt 1 -and $EnvironmentTargets -isnot [System.Collections.Specialized.OrderedDictionary]) {
+        throw '-EnvironmentTargets: mit mehr als einer Umgebung als [ordered]@{ dev = ''<id>''; prod = ''<id>'' }, die Reihenfolge ist die Deploy-Reihenfolge.'
+    }
+    foreach ($environment in $EnvironmentTargets.Keys) {
+        if ("$environment" -cnotmatch '^[a-z0-9][a-z0-9-]{0,19}$') { throw "-EnvironmentTargets: $environment ist kein gültiger Name einer Umgebung (Kleinbuchstaben, Ziffern, Bindestriche, höchstens 20 Zeichen)." }
+        if ("$($EnvironmentTargets[$environment])" -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            throw "-EnvironmentTargets: $environment braucht eine Subscription-ID (GUID)."
+        }
+    }
+}
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
@@ -241,6 +273,9 @@ if (-not $StateStorageAccount) {
     $StateStorageAccount = "stseedtf$($hash.Substring(0, 8))"
 }
 $StateContainerScope = "$Subscription/resourceGroups/$StateResourceGroup/providers/Microsoft.Storage/storageAccounts/$StateStorageAccount/blobServices/default/containers/$StateContainer"
+# Weitere Subscriptions aus -EnvironmentTargets (ohne -SubscriptionId), je einmal
+$TargetSubscriptionIds = @($EnvironmentTargets.Values | ForEach-Object { "$_".ToLower() } | Where-Object { $_ -ne $SubscriptionId.ToLower() } | Select-Object -Unique)
+$TargetScopes = @($TargetSubscriptionIds | ForEach-Object { "/subscriptions/$_" })
 
 # Rollen, die Seed-Module vergeben dürfen: der Function-Identität (core, storage, keyvault,
 # monitoring), der Pipeline-Identität auf dem eigenen Key Vault und Personen, die Secrets setzen.
@@ -279,7 +314,7 @@ $ScaffoldGraphRoles = @('Application.Read.All', 'AppRoleAssignment.ReadWrite.All
 # Role Based Access Control Administrator der Scaffold-Identität: nur die Rollen, die eine
 # Projektidentität bekommt, und nur an Service Principals (Managed Identities). Dass es Identitäten
 # aus -IdentityResourceGroup sind, lässt sich als Bedingung nicht ausdrücken; das stellt
-# scaffold.py sicher, das nur id-<name> aus dieser Resource Group berechtigt.
+# scaffold.py sicher, das nur id-<name>-<env> aus dieser Resource Group berechtigt.
 function Get-ScaffoldRbacCondition([string[]] $RoleIds) {
     $ids = $RoleIds -join ', '
     "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR " +
@@ -616,6 +651,36 @@ function Invoke-Arm([string] $Method, [string] $Url, [string] $BodyFile) {
     Invoke-RestMethod @request
 }
 
+# Eigene Rolle zuweisbar machen: Fehlen Subscriptions in ihren assignableScopes, kommen sie dazu
+# (Definition sonst unverändert); gibt es sie nicht, entsteht sie mit $Create. Liefert die Rolle.
+function Set-RoleScopes([object] $Role, [string] $RoleName, [string[]] $Scopes, [scriptblock] $Create, [string] $FileName) {
+    if (-not $Role) {
+        return Invoke-Step "Rolle $RoleName" { $null } $Create
+    }
+    $current = @($Role.properties.assignableScopes)
+    $absent = @($Scopes | Where-Object { $scope = $_; -not ($current | Where-Object { $_ -eq $scope -or $_ -eq '/' }) })
+    if (-not $absent) {
+        Write-Host "  [ok]    Rolle $RoleName"
+        return $Role
+    }
+    if ($DryRun) {
+        Write-Host "  [alt]   Rolle ${RoleName}: $($absent -join ', ') wird in assignableScopes ergänzt" -ForegroundColor Yellow
+        $missing.Add("Rolle $RoleName (assignableScopes)")
+        return $Role
+    }
+    $definition = $Role.properties
+    $file = Save-Json @{ properties = @{
+            roleName         = $definition.roleName
+            description      = $definition.description
+            type             = $definition.type
+            permissions      = $definition.permissions
+            assignableScopes = @($current) + $absent
+        } } $FileName
+    Invoke-Arm put "https://management.azure.com$($Role.id)?api-version=2022-04-01" $file | Out-Null
+    Write-Host "  [neu]   Rolle ${RoleName}: $($absent -join ', ') in assignableScopes ergänzt" -ForegroundColor Green
+    $Role
+}
+
 # Eigene Rollen sind im Tenant eindeutig benannt, sichtbar aber nur unter ihren assignableScopes.
 # Deshalb in allen Subscriptions des Tenants suchen, die das Konto sieht, die Ziel-Subscription zuerst.
 function Find-CustomRole([string] $RoleName) {
@@ -658,6 +723,14 @@ try {
 
     Write-Host "Sentinel Seed Onboarding$(if ($DryRun) { ' (DryRun, keine Änderungen)' })"
     Write-Host "  Tenant $tenantId, Subscription $subscriptionName, Azure DevOps $Org/$AzureDevOpsProject"
+    # Ziel-Subscriptions vor jeder Änderung: lesbar für dieses Konto und im selben Tenant
+    foreach ($targetId in $TargetSubscriptionIds) {
+        $target = Get-OrNull { Invoke-Arm get "https://management.azure.com/subscriptions/$($targetId)?api-version=2022-12-01" }
+        if (-not $target) { throw "-EnvironmentTargets: Subscription $targetId ist für dieses Konto nicht lesbar." }
+        if ($target.tenantId -ne $tenantId) { throw "-EnvironmentTargets: Subscription $targetId liegt nicht im Tenant $tenantId." }
+        $environmentsThere = @($EnvironmentTargets.Keys | Where-Object { "$($EnvironmentTargets[$_])".ToLower() -eq $targetId })
+        Write-Host "  Ziel-Subscription $($target.displayName) für $($environmentsThere -join ', ')"
+    }
     Write-Host ''
 
     # --- 1. Deployment-Identität ----------------------------------------------------
@@ -719,8 +792,10 @@ try {
             return
         }
         Invoke-Step $Assignment.Name { $existing } {
+            # Die Definition unter der Subscription des Scopes, auch in einer Ziel-Subscription.
+            $definitionScope = if ($Assignment.Scope -match '^(/subscriptions/[^/]+)') { $Matches[1] } else { $Subscription }
             $properties = @{
-                roleDefinitionId = "$Subscription/providers/Microsoft.Authorization/roleDefinitions/$($Assignment.RoleId)"
+                roleDefinitionId = "$definitionScope/providers/Microsoft.Authorization/roleDefinitions/$($Assignment.RoleId)"
                 principalId      = $principalId
                 principalType    = 'ServicePrincipal'
                 description      = "Sentinel Seed: $($Assignment.Name)"
@@ -738,41 +813,22 @@ try {
 
     # Die Rolle gibt es im Tenant nur einmal. Ist sie schon für eine andere Subscription angelegt,
     # kommt diese Subscription in ihre assignableScopes; neu angelegt wird sie nur, wenn sie fehlt.
-    $lockRole = Find-CustomRole $LockRoleName
-    $lockScopes = if ($lockRole) { @($lockRole.properties.assignableScopes) } else { @() }
-    if ($lockRole -and -not ($lockScopes | Where-Object { $_ -eq $Subscription -or $_ -eq '/' })) {
-        if ($DryRun) {
-            Write-Host "  [alt]   Rolle ${LockRoleName}: Subscription wird in assignableScopes ergänzt" -ForegroundColor Yellow
-            $missing.Add("Rolle $LockRoleName (assignableScopes)")
-        } else {
-            # Definition unverändert zurückschreiben, nur mit der zusätzlichen Subscription.
-            $definition = $lockRole.properties
-            $file = Save-Json @{ properties = @{
-                    roleName         = $definition.roleName
-                    description      = $definition.description
-                    type             = $definition.type
-                    permissions      = $definition.permissions
-                    assignableScopes = @($lockScopes) + $Subscription
-                } } 'lock-role-scopes.json'
-            Invoke-Arm put "https://management.azure.com$($lockRole.id)?api-version=2022-04-01" $file | Out-Null
-            Write-Host "  [neu]   Rolle ${LockRoleName}: Subscription in assignableScopes ergänzt" -ForegroundColor Green
+    # Mit -EnvironmentTargets auch in den Ziel-Subscriptions: Die Projektidentitäten bekommen die
+    # Rolle dort auf ihren Resource Groups.
+    $lockRole = Set-RoleScopes (Find-CustomRole $LockRoleName) $LockRoleName (@($Subscription) + $TargetScopes) {
+        $file = Save-Json @{
+            Name             = $LockRoleName
+            Description      = 'Sentinel Seed: Löschsperren lesen, setzen und entfernen (Modul storage).'
+            Actions          = @('Microsoft.Authorization/locks/read', 'Microsoft.Authorization/locks/write', 'Microsoft.Authorization/locks/delete')
+            NotActions       = @()
+            AssignableScopes = @($Subscription) + $TargetScopes
+        } 'lock-role.json'
+        try {
+            az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+        } catch {
+            throw "Rolle $LockRoleName ließ sich nicht anlegen. Gibt es sie schon unter einer Subscription, die dieses Konto nicht sieht? Dann dort Leserechte geben und neu starten. ($_)"
         }
-    } else {
-        $lockRole = Invoke-Step "Rolle $LockRoleName" { $lockRole } {
-            $file = Save-Json @{
-                Name             = $LockRoleName
-                Description      = 'Sentinel Seed: Löschsperren lesen, setzen und entfernen (Modul storage).'
-                Actions          = @('Microsoft.Authorization/locks/read', 'Microsoft.Authorization/locks/write', 'Microsoft.Authorization/locks/delete')
-                NotActions       = @()
-                AssignableScopes = @($Subscription)
-            } 'lock-role.json'
-            try {
-                az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
-            } catch {
-                throw "Rolle $LockRoleName ließ sich nicht anlegen. Gibt es sie schon unter einer Subscription, die dieses Konto nicht sieht? Dann dort Leserechte geben und neu starten. ($_)"
-            }
-        }
-    }
+    } 'lock-role-scopes.json'
     if ($lockRole) {
         # Eine neue oder erweiterte Rollendefinition kennt Azure nicht sofort überall; deshalb
         # einige Versuche, zusammen bis zu zwei Minuten.
@@ -957,34 +1013,17 @@ try {
                 $true
             } | Out-Null
             # Eigene Rolle: nur Resource Groups lesen und anlegen. Wie die Rolle für Löschsperren im
-            # Tenant eindeutig; fehlt diese Subscription in ihren assignableScopes, kommt sie dazu.
-            $rgRole = Find-CustomRole $ResourceGroupCreatorRoleName
-            $rgScopes = if ($rgRole) { @($rgRole.properties.assignableScopes) } else { @() }
-            if ($rgRole -and -not ($rgScopes | Where-Object { $_ -eq $Subscription -or $_ -eq '/' })) {
-                if ($DryRun) {
-                    Write-Host "  [alt]   Rolle ${ResourceGroupCreatorRoleName}: Subscription wird in assignableScopes ergänzt" -ForegroundColor Yellow
-                    $missing.Add("Rolle $ResourceGroupCreatorRoleName (assignableScopes)")
-                } else {
-                    $definition = $rgRole.properties
-                    $file = Save-Json @{ properties = @{
-                            roleName = $definition.roleName; description = $definition.description; type = $definition.type
-                            permissions = $definition.permissions; assignableScopes = @($rgScopes) + $Subscription
-                        } } 'rg-role-scopes.json'
-                    Invoke-Arm put "https://management.azure.com$($rgRole.id)?api-version=2022-04-01" $file | Out-Null
-                    Write-Host "  [neu]   Rolle ${ResourceGroupCreatorRoleName}: Subscription in assignableScopes ergänzt" -ForegroundColor Green
-                }
-            } else {
-                $rgRole = Invoke-Step "Rolle $ResourceGroupCreatorRoleName" { $rgRole } {
-                    $file = Save-Json @{
-                        Name             = $ResourceGroupCreatorRoleName
-                        Description      = 'Sentinel Seed: Resource Groups lesen und anlegen (zentrales Scaffold).'
-                        Actions          = @('Microsoft.Resources/subscriptions/resourceGroups/read', 'Microsoft.Resources/subscriptions/resourceGroups/write')
-                        NotActions       = @()
-                        AssignableScopes = @($Subscription)
-                    } 'rg-role.json'
-                    az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
-                }
-            }
+            # Tenant eindeutig; mit -EnvironmentTargets auch in den Ziel-Subscriptions zuweisbar.
+            $rgRole = Set-RoleScopes (Find-CustomRole $ResourceGroupCreatorRoleName) $ResourceGroupCreatorRoleName (@($Subscription) + $TargetScopes) {
+                $file = Save-Json @{
+                    Name             = $ResourceGroupCreatorRoleName
+                    Description      = 'Sentinel Seed: Resource Groups lesen und anlegen (zentrales Scaffold).'
+                    Actions          = @('Microsoft.Resources/subscriptions/resourceGroups/read', 'Microsoft.Resources/subscriptions/resourceGroups/write')
+                    NotActions       = @()
+                    AssignableScopes = @($Subscription) + $TargetScopes
+                } 'rg-role.json'
+                az role definition create --role-definition "@$file" -o json | ConvertFrom-Json
+            } 'rg-role-scopes.json'
             if ($scaffoldIdentity) {
                 $rgRoleId = if ($rgRole.name) { $rgRole.name } else { $null }
                 $lockRoleId = if ($lockRole.name) { $lockRole.name } else { $null }
@@ -1009,6 +1048,20 @@ try {
                 } else {
                     Write-Host "  [fehlt] Role Based Access Control Administrator für $ScaffoldIdentityName (nach der Rolle $LockRoleName)" -ForegroundColor Yellow
                     $missing.Add("Role Based Access Control Administrator für $ScaffoldIdentityName")
+                }
+                # Ziel-Subscriptions (-EnvironmentTargets): dieselben Rechte zum Anlegen von Resource
+                # Groups und Rollen; Managed Identities und State bleiben in -SubscriptionId.
+                foreach ($targetScope in $TargetScopes) {
+                    $scaffoldRoles += @{ Scope = $targetScope; RoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+                        Name = "Reader auf $targetScope (Namensprüfung) für $ScaffoldIdentityName" }
+                    if ($rgRoleId) {
+                        $scaffoldRoles += @{ Scope = $targetScope; RoleId = $rgRoleId; Name = "$ResourceGroupCreatorRoleName auf $targetScope für $ScaffoldIdentityName" }
+                    }
+                    if ($lockRoleId) {
+                        $scaffoldRoles += @{ Scope = $targetScope; RoleId = $RbacAdministrator
+                            Condition = Get-ScaffoldRbacCondition @($ContributorRole, $RbacAdministrator, $BlobDataContributor, $lockRoleId)
+                            Name = "Role Based Access Control Administrator (nur Rollen der Projektidentitäten) auf $targetScope für $ScaffoldIdentityName" }
+                    }
                 }
                 foreach ($role in $scaffoldRoles) {
                     # Nach Principal-ID filtern statt --assignee: Das sucht im Verzeichnis, und eine
@@ -1128,6 +1181,12 @@ try {
             az repos create --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json
         }
         if ($repo) {
+            # Umgebungen und Ziel-Subscriptions (-EnvironmentTargets) als YAML; Namen und IDs sind geprüft.
+            $environmentsYaml = if ($EnvironmentTargets.Count) { '[' + (@($EnvironmentTargets.Keys) -join ', ') + ']' } else { '[dev]' }
+            $targetsYaml = if ($EnvironmentTargets.Count) {
+                '{ ' + ((@($EnvironmentTargets.Keys) | ForEach-Object { "${_}: { subscriptionId: '$($EnvironmentTargets[$_])' }" }) -join ', ') + ' }'
+            } else { '{}' }
+            $pipelineFile = @{ Created = $false }
             Invoke-Step 'azure-pipelines.yml in seed-scaffold' {
                 (Invoke-AzDevOps get "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/refs?filter=heads/main&api-version=7.1" $null).count -gt 0
             } {
@@ -1151,7 +1210,10 @@ try {
                     Replace('__STATE_RESOURCE_GROUP__', $StateResourceGroup).
                     Replace('__STATE_STORAGE_ACCOUNT__', $StateStorageAccount).
                     Replace('__STATE_CONTAINER__', $StateContainer).
-                    Replace('__POOL__', $Pool)
+                    Replace('__POOL__', $Pool).
+                    Replace('__ENVIRONMENTS__', $environmentsYaml).
+                    Replace('__ENVIRONMENT_TARGETS__', $targetsYaml)
+                $pipelineFile.Created = $true
                 Invoke-AzDevOps post "$Org/$($project.id)/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1" @{
                     refUpdates = @(@{ name = 'refs/heads/main'; oldObjectId = '0000000000000000000000000000000000000000' })
                     commits    = @(@{
@@ -1161,6 +1223,12 @@ try {
                 } | Out-Null
                 $true
             } | Out-Null
+            # Eine vorhandene Datei ändert das Skript nicht (sie gehört den Admins, mit Review).
+            if ($EnvironmentTargets.Count -and -not $pipelineFile.Created) {
+                Write-Host '  [info]  azure-pipelines.yml in seed-scaffold besteht schon. Für -EnvironmentTargets dort unter extends.parameters ergänzen:'
+                Write-Host "            environmentTargets: $targetsYaml"
+                Write-Host "          und beim Startparameter environments: default: $environmentsYaml"
+            }
         }
         $pipeline = Invoke-Step 'Pipeline seed-scaffold' {
             az pipelines list --org $Org --project $AzureDevOpsProject --name seed-scaffold -o json | ConvertFrom-Json | Select-Object -First 1
@@ -1352,6 +1420,9 @@ try {
     }
     Write-Host "  serviceConnection: $ServiceConnectionName"
     Write-Host "  terraformState: resourceGroup $StateResourceGroup, storageAccount $StateStorageAccount, container $StateContainer"
+    if ($EnvironmentTargets.Count) {
+        Write-Host "Zentrales Scaffold, Ziel-Subscription je Umgebung: $((@($EnvironmentTargets.Keys) | ForEach-Object { "$_ $($EnvironmentTargets[$_])" }) -join ', ')"
+    }
 }
 finally {
     if ($previousSubscription -and $previousSubscription -ne $SubscriptionId) {
