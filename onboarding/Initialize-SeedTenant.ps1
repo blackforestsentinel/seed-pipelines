@@ -154,7 +154,7 @@
     und Freigaben seines Projekts aufheben.
 
 .PARAMETER TemplateRef
-    Nur mit -CentralScaffold: Tag von seed-template, das neue Projekte bekommen, Standard v0.19.0.
+    Nur mit -CentralScaffold: Tag von seed-template, das neue Projekte bekommen, Standard v0.20.0.
 
 .PARAMETER AllowedProjects
     Nur mit -CentralScaffold: regulärer Ausdruck, den der ganze Name eines Zielprojekts
@@ -230,7 +230,7 @@ param(
     [ValidateSet('jobToken', 'servicePrincipal')] [string] $AzureDevOpsAuth = 'jobToken',
     [string] $IdentityResourceGroup = 'rg-seed-identities',
     [string[]] $ProjectAdministrators = @(),
-    [ValidatePattern('^v\d+\.\d+\.\d+$')] [string] $TemplateRef = 'v0.19.0',
+    [ValidatePattern('^v\d+\.\d+\.\d+$')] [string] $TemplateRef = 'v0.20.0',
     [System.Collections.IDictionary] $EnvironmentTargets = @{},
     [switch] $DryRun
 )

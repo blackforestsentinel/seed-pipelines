@@ -80,7 +80,7 @@ class OrderTests(unittest.TestCase):
         self.assertNotIn("SeedScaffoldPat", SCAFFOLD)
 
     def test_versionen(self):
-        for name, version in (("terraformModuleVersion", "v0.21.0"), ("pipelinesVersion", "v0.22.0"), ("templateRef", "v0.19.0")):
+        for name, version in (("terraformModuleVersion", "v0.21.0"), ("pipelinesVersion", "v0.22.0"), ("templateRef", "v0.20.0")):
             with self.subTest(name=name):
                 self.assertIn(f"  - name: {name}\n    type: string\n    default: {version}\n", SCAFFOLD)
 

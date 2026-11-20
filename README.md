@@ -21,7 +21,7 @@ resources:
     - repository: seed
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.19.0
+      ref: refs/tags/v0.22.0
       endpoint: github-blackforestsentinel
 
 extends:
@@ -631,7 +631,7 @@ Hat die Static Web App eigene Domains (`hosting.customDomains`, Modul `core` aus
 [`onboarding/Initialize-SeedTenant.ps1`](onboarding/Initialize-SeedTenant.ps1) richtet einmal je Subscription und Azure-DevOps-Projekt alles ein, was Seed-Projekte brauchen. Es läuft mit dem `az`-Login einer Person, die Owner der Subscription, Global Administrator (oder Privileged Role Administrator) und Projektadministrator in Azure DevOps ist. Jeder Schritt prüft zuerst und legt nur an, was fehlt; mit `-DryRun` zeigt das Skript nur an, was fehlt.
 
 ```powershell
-git clone --branch v0.19.0 https://github.com/blackforestsentinel/seed-pipelines.git
+git clone --branch v0.22.0 https://github.com/blackforestsentinel/seed-pipelines.git
 cd seed-pipelines
 ./onboarding/Initialize-SeedTenant.ps1 -SubscriptionId <id> `
   -AzureDevOpsOrganization https://dev.azure.com/<org> -AzureDevOpsProject <projekt> `
@@ -661,10 +661,10 @@ Das Verbot trifft auch jede weitere Identität, der „Create tag“ in den Zugr
 **Versionswechsel mit Required template:** Die Prüfung kennt nur die Tags, die sie nennt. Vor dem Merge eines Pull Requests, der `ref` eines Projekts auf einen neuen Tag hebt, den Tag deshalb ergänzen, sonst scheitert der erste Lauf auf `main` an der Prüfung (PR-Läufe nicht, sie nutzen die Service Connection nicht):
 
 ```powershell
-# ergänzt v0.19.0, vorhandene Tags bleiben
-./onboarding/Initialize-SeedTenant.ps1 <Parameter wie beim Onboarding> -SeedPipelinesVersion v0.19.0 -DryRun
+# ergänzt v0.22.0, vorhandene Tags bleiben
+./onboarding/Initialize-SeedTenant.ps1 <Parameter wie beim Onboarding> -SeedPipelinesVersion v0.22.0 -DryRun
 # bzw. für ein migriertes Projekt
-./onboarding/Initialize-SeedProject.ps1 <Parameter wie beim Einrichten> -RequiredTemplateRefs v0.18.1,v0.19.0 -DryRun
+./onboarding/Initialize-SeedProject.ps1 <Parameter wie beim Einrichten> -RequiredTemplateRefs v0.21.1,v0.22.0 -DryRun
 ```
 
 Ohne `-DryRun` wiederholen, dann mergen. Sind alle Projekte umgestellt, entfernt ein Lauf mit `-RequiredTemplateRefs <neuer Tag>` die alten. Von Hand geht es auch: Service Connection, „Approvals and checks“, „Required template“, Eintrag mit dem neuen Ref ergänzen.
@@ -868,7 +868,7 @@ resources:
     - repository: seed                    # Name fest: das Template checkt das Repo aus
       type: github
       name: blackforestsentinel/seed-pipelines
-      ref: refs/tags/v0.19.0
+      ref: refs/tags/v0.22.0
       endpoint: github-blackforestsentinel
 
 extends:
